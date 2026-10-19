@@ -1,0 +1,143 @@
+{
+  "id": "nick_assignment_test-aHcamDKt",
+  "inputType": {
+    "dataType": "object",
+    "name": "Input",
+    "label": "输入",
+    "properties": {
+      "name": {
+        "dataType": "string",
+        "label": "name",
+        "name": "name",
+        "default": "",
+        "required": false
+      },
+      "age": {
+        "dataType": "integer",
+        "label": "age",
+        "name": "age",
+        "default": "",
+        "required": false,
+        "ref": ""
+      },
+      "hobbies": {
+        "dataType": "array",
+        "label": "hobbies",
+        "name": "hobbies",
+        "default": "",
+        "required": false,
+        "ref": "",
+        "itemType": {
+          "dataType": "string"
+        }
+      },
+      "family": {
+        "dataType": "object",
+        "label": "family",
+        "name": "family",
+        "default": "",
+        "required": false,
+        "ref": "",
+        "properties": {}
+      }
+    }
+  },
+  "outputType": {
+    "dataType": "object",
+    "properties": {},
+    "name": "Output",
+    "label": "输出"
+  },
+  "nodes": [
+    {
+      "type": "start",
+      "name": "开始",
+      "id": "node_x1ctUMRb",
+      "next": "node_UTnCBqRl"
+    },
+    {
+      "type": "assignment",
+      "name": "赋值",
+      "upstreamOutput": [
+        {
+          "upstream": "node_x1ctUMRb",
+          "value": {
+            "upper_name": "$F.upper($INPUT.name)",
+            "double_age": "$F.mul($INPUT.age, 2)",
+            "first_hobby": "$F.getListItem($INPUT.hobbies, 0)",
+            "brothers": "$F.keys($INPUT.family)",
+            "name": "$F.upper($GLOBAL.name)"
+          }
+        }
+      ],
+      "outputType": {
+        "dataType": "object",
+        "name": "output",
+        "label": "输出",
+        "properties": {
+          "upper_name": {
+            "dataType": "string",
+            "label": "upper_name",
+            "name": "upper_name",
+            "default": "",
+            "required": false
+          },
+          "double_age": {
+            "dataType": "integer",
+            "label": "double_age",
+            "name": "double_age",
+            "default": "",
+            "required": false,
+            "ref": ""
+          },
+          "first_hobby": {
+            "dataType": "string",
+            "label": "first_hobby",
+            "name": "first_hobby",
+            "default": "",
+            "required": false
+          },
+          "brothers": {
+            "dataType": "array",
+            "label": "brothers",
+            "name": "brothers",
+            "default": "",
+            "required": false,
+            "ref": "",
+            "itemType": {
+              "dataType": "string"
+            }
+          }
+        }
+      },
+      "id": "node_UTnCBqRl",
+      "next": "node_sKZpNPU7"
+    },
+    {
+      "type": "end",
+      "name": "结束",
+      "output": "$NODE.node_UTnCBqRl",
+      "resultType": "success",
+      "id": "node_sKZpNPU7"
+    }
+  ],
+  "external": {
+    "version": "2.1.0",
+    "envProperty": {
+      "dataType": "object",
+      "name": "global",
+      "label": "全局变量",
+      "properties": {}
+    }
+  },
+  "context": {
+    "global": {
+      "__ENVCONF__": {
+        "formal": {
+          "name": "nick"
+        }
+      },
+      "__ENVNAME__": "formal"
+    }
+  }
+}

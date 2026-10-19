@@ -1,0 +1,88 @@
+linters-settings:
+  funlen:
+    lines: 80
+    statements: 80
+  goconst:
+    min-len: 2
+    min-occurrences: 2
+  gocyclo:
+    min-complexity: 20
+  goimports:
+    local-prefixes: git.woa.com/thor-family/loki/go-loki/pkg,git.woa.com/thor-family/loki/go-loki/internal,git.woa.com/thor-family/loki/go-loki/e2e
+  golint:
+    #min-confidence: 0
+  govet:
+    check-shadowing: true
+  lll:
+    line-length: 120
+  errcheck:
+    check-type-assertions: true
+  gocritic:
+    enabled-checks:
+      - nestingReduce
+    settings:
+      nestingReduce:
+        bodyWidth: 5
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - typecheck
+    - unused
+    - gofmt
+    - goimports
+    - revive
+    - misspell
+    - unconvert
+    - unparam
+    - depguard
+    - exportloopref
+    - funlen
+    - gocyclo
+    - lll
+    - gocheckcompilerdirectives
+
+run:
+  go: "1.19"
+  concurrency: 16
+  timeout: 10m
+  issue-exit-code: 1
+  tests: true
+  modules-download-mode: readonly
+  skip-files:
+    - .*.pb.go
+    - .*.y.go
+    - .*.rl.go
+
+issues:
+  exclude-use-default: true
+
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - funlen # test file exclude
+    - linters:
+        - staticcheck
+      text: "SA6002: argument should be pointer-like to avoid allocations"
+    - linters:
+        - lll
+      source: "^//go:generate " # Exclude lll issues for long lines with go:generate
+
+  max-same-issues: 0
+  new: false
+  max-issues-per-linter: 0
+
+output:
+  format: colored-line-number
+  sort-results: true
+  print-issued-lines: true
+  print-linter-name: true
+
+
+service:
+  golangci-lint-version: 1.51.2

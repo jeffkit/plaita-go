@@ -1,0 +1,42 @@
+{
+  "id": "subtract-flow",
+  "name": "Subtract Flow",
+  "runtime": "go",
+  "version": "v1.0.0",
+  "inputType": {
+    "dataType": "object",
+    "properties": {
+      "a": {
+        "dataType": "integer"
+      },
+      "b": {
+        "dataType": "integer"
+      }
+    }
+  },
+  "outputType": {
+    "dataType": "float"
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "type": "start",
+      "next": "addition"
+    },
+    {
+      "id": "subtract",
+      "type": "assignment",
+      "next": "end",
+      "outputType": {
+        "dataType": "float"
+      },
+      "output": "$F.subtract($INPUT.a, $INPUT.b)"
+    },
+    {
+      "id": "end",
+      "type": "end",
+      "resultType": "success",
+      "output": "$NODE.subtract"
+    }
+  ]
+}

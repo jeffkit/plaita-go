@@ -1,0 +1,286 @@
+{
+  "id": "cover_searchable-1YMGFaMN",
+  "inputType": {
+    "dataType": "object",
+    "name": "input",
+    "label": "入参",
+    "required": false,
+    "properties": {
+      "checkup_state": {
+        "dataType": "integer",
+        "label": "专辑状态",
+        "name": "checkup_state",
+        "default": "",
+        "required": true,
+        "ref": ""
+      },
+      "positive_content": {
+        "dataType": "integer",
+        "label": "正片标识",
+        "name": "positive_content",
+        "default": "",
+        "required": true,
+        "ref": ""
+      },
+      "is_search": {
+        "dataType": "integer",
+        "label": "是否可搜",
+        "name": "is_search",
+        "default": "",
+        "required": false,
+        "ref": ""
+      },
+      "playright": {
+        "dataType": "string",
+        "label": "可播放平台",
+        "name": "playright",
+        "default": "",
+        "required": false,
+        "ref": ""
+      },
+      "data_flag": {
+        "dataType": "integer",
+        "label": "播控规则开关",
+        "name": "data_flag",
+        "default": "",
+        "required": false,
+        "ref": ""
+      },
+      "search_show_style": {
+        "dataType": "integer",
+        "label": "搜索展现样式",
+        "name": "search_show_style",
+        "default": "",
+        "required": false,
+        "ref": ""
+      },
+      "ip_online_status": {
+        "dataType": "integer",
+        "label": "IP实时状态",
+        "name": "ip_online_status",
+        "default": "",
+        "required": false,
+        "ref": ""
+      },
+      "doc_checkup_state": {
+        "dataType": "integer",
+        "label": "专辑资料状态",
+        "name": "doc_checkup_state",
+        "default": "",
+        "required": false,
+        "ref": ""
+      }
+    }
+  },
+  "outputType": {
+    "dataType": "object",
+    "name": "output",
+    "label": "返回值",
+    "required": false,
+    "properties": {
+      "code": {
+        "dataType": "integer",
+        "name": "code",
+        "label": "返回码",
+        "default": "",
+        "required": false,
+        "ref": ""
+      },
+      "msg": {
+        "dataType": "string",
+        "name": "msg",
+        "label": "返回信息",
+        "default": "",
+        "required": false,
+        "ref": ""
+      }
+    }
+  },
+  "nodes": [
+    {
+      "type": "start",
+      "name": "开始",
+      "id": "node-RdMLqpD_",
+      "next": "node-all0Q2f9"
+    },
+    {
+      "type": "switch",
+      "name": "是否可搜",
+      "branches": [
+        {
+          "name": "branch-1-Uj9eSDa",
+          "label": "可搜",
+          "desc": "可搜",
+          "priority": 2,
+          "isDefault": false,
+          "condition": {
+            "relation": "and",
+            "conditions": [
+              {
+                "field": "$INPUT.positive_content",
+                "operator": "eq",
+                "value": 1543606
+              },
+              {
+                "field": "$INPUT.is_search",
+                "operator": "ne",
+                "value": 1543607
+              },
+              {
+                "field": "$INPUT.playright",
+                "operator": "ne",
+                "value": ""
+              },
+              {
+                "field": "$NODE.node-all0Q2f9.data_flag",
+                "operator": "ne",
+                "value": 1
+              },
+              {
+                "field": "$INPUT.search_show_style",
+                "operator": "eq",
+                "value": 8202217
+              },
+              {
+                "relation": "or",
+                "conditions": [
+                  {
+                    "field": "$INPUT.checkup_state",
+                    "operator": "eq",
+                    "value": 4
+                  },
+                  {
+                    "relation": "and",
+                    "conditions": [
+                      {
+                        "field": "$INPUT.doc_checkup_state",
+                        "operator": "eq",
+                        "value": 4
+                      },
+                      {
+                        "field": "$INPUT.ip_online_status",
+                        "operator": "in",
+                        "value": [
+                          8377973,
+                          8377974
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "next": "node-r4QJPWhl"
+        },
+        {
+          "name": "default",
+          "label": "不可搜",
+          "isDefault": true,
+          "priority": 1,
+          "desc": "不可搜",
+          "next": "node-8bBhLIZX"
+        }
+      ],
+      "id": "node-n0u_uoIG",
+      "typeName": "枚举节点(switch)",
+      "desc": "",
+      "metadata": {
+        "test_val1": "123",
+        "test_val2": "456",
+        "test_val3": "789"
+      },
+      "external": {
+        "metadata": {
+          "test_val1": "123",
+          "test_val2": "456",
+          "test_val3": "789"
+        }
+      }
+    },
+    {
+      "type": "end",
+      "name": "结束",
+      "output": {
+        "code": -1,
+        "msg": "不可搜"
+      },
+      "resultType": "success",
+      "id": "node-8bBhLIZX"
+    },
+    {
+      "type": "end",
+      "name": "结束",
+      "output": {
+        "code": 0,
+        "msg": "可搜"
+      },
+      "resultType": "success",
+      "id": "node-r4QJPWhl"
+    },
+    {
+      "type": "code",
+      "name": "代码",
+      "language": "go",
+      "code": "import (\n\t\"context\"\n\t\"errors\"\n\t\"fmt\"\n)\n\n\tfunc parseInput(input any) (int, error) {\n\t\tif v, ok := input.(int); ok {\n\t\t\treturn v, nil\n\t\t}\n\t\treturn 0, errors.New(\"invalid input\")\n\t}\n\n\tfunc run(_ context.Context, input any) (any, error) {\n\t\tfg, err := parseInput(input)\n\t\tif err != nil {\n\t\t\treturn nil, err\n\t\t}\n\treturn fg&0x01, nil\n}",
+      "input": {
+        "data_flag": "$INPUT.data_flag"
+      },
+      "inputType": {
+        "dataType": "object",
+        "name": "input",
+        "label": "输入",
+        "ref": "",
+        "properties": {
+          "data_flag": {
+            "dataType": "integer",
+            "label": "播控开关",
+            "name": "data_flag",
+            "default": "",
+            "required": false,
+            "ref": ""
+          }
+        }
+      },
+      "outputType": {
+        "dataType": "object",
+        "name": "output",
+        "label": "输出",
+        "ref": "",
+        "properties": {
+          "data_flag": {
+            "dataType": "integer",
+            "label": "播控开关计算值",
+            "name": "data_flag",
+            "default": "",
+            "required": false,
+            "ref": ""
+          }
+        }
+      },
+      "errorHandler": {
+        "retryTimes": 0,
+        "strategy": "abort"
+      },
+      "id": "node-all0Q2f9",
+      "next": "node-n0u_uoIG"
+    }
+  ],
+  "external": {
+    "version": "2.1.0",
+    "envProperty": {
+      "dataType": "object",
+      "name": "global",
+      "label": "全局变量",
+      "properties": {}
+    }
+  },
+  "context": {
+    "global": {
+      "__ENVCONF__": {
+        "formal": {}
+      },
+      "__ENVNAME__": "formal"
+    }
+  }
+}

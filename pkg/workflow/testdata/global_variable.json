@@ -1,0 +1,37 @@
+{
+  "id": "test global variable",
+  "name": "test global variable",
+  "outputType": {
+    "dataType": "string"
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "type": "start",
+      "next": "end"
+    },
+    {
+      "id": "end",
+      "type": "end",
+      "resultType": "success",
+      "output": "$GLOBAL.name"
+    }
+  ],
+  "context": {
+    "global": {
+      "__ENVCONF__": {
+        "production": {
+          "name": "production"
+        },
+        "test": {
+          "name": "test"
+        },
+        "development": {
+          "name": "development"
+        }
+      },
+      "__ENVNAME__": "",
+      "name": "default"
+    }
+  }
+}

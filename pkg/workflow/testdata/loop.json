@@ -1,0 +1,160 @@
+{
+  "id": "yX5FrZZH",
+  "inputType": {
+    "dataType": "array",
+    "name": "aa",
+    "label": "aa",
+    "required": false,
+    "itemType": {
+      "dataType": "object",
+      "properties": {
+        "name": {
+          "dataType": "string",
+          "name": "name",
+          "label": "name",
+          "default": "",
+          "required": false
+        }
+      }
+    }
+  },
+  "outputType": {
+    "dataType": "object",
+    "name": "some",
+    "required": false,
+    "properties": {
+      "go": {
+        "dataType": "string",
+        "name": "go",
+        "label": "go",
+        "default": "",
+        "required": false
+      }
+    }
+  },
+  "nodes": [
+    {
+      "type": "start",
+      "name": "开始",
+      "id": "node-HY70Of3K",
+      "next": "node-VyjpFRS4"
+    },
+    {
+      "type": "loop",
+      "name": "循环",
+      "collection": "$INPUT",
+      "itemType": {
+        "dataType": "object",
+        "name": "",
+        "label": "",
+        "required": false,
+        "properties": {
+          "name": {
+            "dataType": "string",
+            "name": "name",
+            "label": "name",
+            "default": "",
+            "required": false
+          }
+        }
+      },
+      "condition": {
+        "relation": "and",
+        "conditions": [
+          {
+            "field": "$LOOP-INDEX",
+            "operator": "lt",
+            "value": 3
+          }
+        ]
+      },
+      "childFlow": {
+        "id": "2C8ChOh8",
+        "inputType": {
+          "dataType": "object",
+          "properties": {
+            "item": {
+              "dataType": "object",
+              "name": "item",
+              "label": "循环元素",
+              "properties": {
+                "name": {
+                  "dataType": "string",
+                  "name": "name",
+                  "label": "name",
+                  "default": "",
+                  "required": false
+                }
+              }
+            },
+            "index": {
+              "dataType": "integer",
+              "name": "index",
+              "label": "循环索引"
+            },
+            "result": {
+              "dataType": "object",
+              "name": "result",
+              "label": "循环结果",
+              "properties": {
+                "aa": {
+                  "dataType": "string",
+                  "name": "aa",
+                  "label": "aa",
+                  "default": "",
+                  "required": false
+                }
+              }
+            }
+          }
+        },
+        "outputType": {
+          "dataType": "object",
+          "name": "",
+          "label": "",
+          "required": false,
+          "properties": {
+            "aa": {
+              "dataType": "string",
+              "name": "aa",
+              "label": "aa",
+              "default": "",
+              "required": false
+            }
+          }
+        },
+        "nodes": [
+          {
+            "type": "start",
+            "name": "开始",
+            "id": "node-SSsZNfRQ",
+            "next": "node--lK3uoV2"
+          },
+          {
+            "type": "end",
+            "name": "结束",
+            "output": {
+              "aa": "$INPUT.item.name"
+            },
+            "resultType": "success",
+            "id": "node--lK3uoV2"
+          }
+        ]
+      },
+      "output": {
+        "aa": "$LOOP-RESULT.aa"
+      },
+      "id": "node-VyjpFRS4",
+      "next": "node-vg2WUH07"
+    },
+    {
+      "type": "end",
+      "name": "结束",
+      "resultType": "success",
+      "id": "node-vg2WUH07",
+      "output": {
+        "go": "$NODE.node-VyjpFRS4.aa"
+      }
+    }
+  ]
+}

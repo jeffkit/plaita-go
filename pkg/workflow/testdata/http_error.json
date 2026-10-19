@@ -1,0 +1,120 @@
+{
+  "id": "nick-http-test-ibnhoTFJ",
+  "inputType": {
+    "dataType": "object",
+    "name": "Input",
+    "label": "输入",
+    "properties": {
+      "title": {
+        "dataType": "string",
+        "label": "名称",
+        "name": "title",
+        "default": "",
+        "required": false
+      }
+    }
+  },
+  "outputType": {
+    "dataType": "object",
+    "properties": {},
+    "name": "Output",
+    "label": "输出"
+  },
+  "nodes": [{
+    "type": "start",
+    "name": "开始",
+    "id": "node_3i2gyNQU",
+    "typeName": "开始节点(start)",
+    "desc": "",
+    "metadata": {},
+    "external": {
+      "metadata": {}
+    },
+    "next": "node_MCVVuSoM"
+  }, {
+    "type": "http",
+    "name": "HTTP",
+    "url": "https://invalid-url",
+    "method": "GET",
+    "query": {},
+    "body": {},
+    "headers": {},
+    "outputType": {
+      "dataType": "object",
+      "properties": {
+        "title": {
+          "dataType": "string",
+          "label": "title",
+          "name": "title",
+          "default": "",
+          "required": false
+        }
+      }
+    },
+    "output": "$RESPONSE.data",
+    "bodyType": {
+      "dataType": "object",
+      "ref": "",
+      "properties": {}
+    },
+    "contentType": "application/json",
+    "timeout": "PT5S",
+    "errorHandler": {
+      "retryTimes": 0,
+      "strategy": "continue"
+    },
+    "delegate": {
+      "name": "",
+      "params": {},
+      "property": {
+        "dataType": "object",
+        "properties": {}
+      }
+    },
+    "addressing": {
+      "name": "",
+      "params": {},
+      "property": {
+        "dataType": "object",
+        "properties": {}
+      }
+    },
+    "id": "node_MCVVuSoM",
+    "typeName": "http节点(http)",
+    "desc": "",
+    "metadata": {},
+    "external": {
+      "metadata": {}
+    },
+    "next": "node_GchUhENN"
+  }, {
+    "type": "end",
+    "name": "结束",
+    "output": "$F.abs($ERROR.node_MCVVuSoM.info.code)",
+    "resultType": "success",
+    "id": "node_GchUhENN",
+    "typeName": "结束节点(end)",
+    "desc": "",
+    "metadata": {},
+    "external": {
+      "metadata": {}
+    }
+  }],
+  "external": {
+    "version": "2.1.0",
+    "envProperty": {
+      "dataType": "object",
+      "name": "global",
+      "label": "全局变量",
+      "properties": {}
+    }
+  },
+  "context": {
+    "global": {
+      "__ENVCONF__": {
+        "formal": {}
+      },
+      "__ENVNAME__": "formal"
+    }
+  }
+}

@@ -1,0 +1,175 @@
+{
+  "id": "cover_searchable-6viLveZF",
+  "inputType": {
+    "dataType": "object",
+    "name": "input",
+    "label": "\\u5165\\u53c2",
+    "required": false,
+    "properties": {
+      "checkup_state": {
+        "dataType": "integer",
+        "name": "checkup_state",
+        "label": "\\u4e13\\u8f91\\u72b6\\u6001",
+        "default": "",
+        "required": true,
+        "ref": ""
+      },
+      "positive_content": {
+        "dataType": "integer",
+        "name": "positive_content",
+        "label": "\\u6b63\\u7247\\u6807\\u8bc6",
+        "default": "",
+        "required": true,
+        "ref": ""
+      },
+      "is_search": {
+        "dataType": "integer",
+        "name": "is_search",
+        "label": "\\u662f\\u5426\\u53ef\\u641c",
+        "default": "",
+        "required": false,
+        "ref": ""
+      },
+      "playright": {
+        "dataType": "string",
+        "name": "playright",
+        "label": "\\u53ef\\u64ad\\u653e\\u5e73\\u53f0",
+        "default": "",
+        "required": false,
+        "ref": ""
+      },
+      "data_flag": {
+        "dataType": "string",
+        "name": "data_flag",
+        "label": "\\u64ad\\u63a7\\u89c4\\u5219\\u5f00\\u5173",
+        "default": "",
+        "required": false,
+        "ref": ""
+      }
+    }
+  },
+  "outputType": {
+    "dataType": "object",
+    "name": "output",
+    "label": "\\u8fd4\\u56de\\u503c",
+    "required": false,
+    "properties": {
+      "code": {
+        "dataType": "integer",
+        "name": "code",
+        "label": "\\u8fd4\\u56de\\u7801",
+        "default": "",
+        "required": false,
+        "ref": ""
+      },
+      "msg": {
+        "dataType": "string",
+        "name": "msg",
+        "label": "\\u8fd4\\u56de\\u4fe1\\u606f",
+        "default": "",
+        "required": false,
+        "ref": ""
+      }
+    }
+  },
+  "nodes": [
+    {
+      "type": "start",
+      "name": "\\u5f00\\u59cb",
+      "id": "node-RdMLqpD_",
+      "next": "node-n0u_uoIG"
+    },
+    {
+      "type": "switch",
+      "name": "\\u662f\\u5426\\u53ef\\u641c",
+      "branches": [
+        {
+          "name": "default",
+          "label": "\\u4e0d\\u53ef\\u641c",
+          "isDefault": true,
+          "priority": 999,
+          "desc": "\\u4e0d\\u53ef\\u641c",
+          "next": "node-8bBhLIZX"
+        },
+        {
+          "name": "branch-1-Uj9eSDa",
+          "label": "\\u53ef\\u641c",
+          "desc": "\\u53ef\\u641c",
+          "priority": 1,
+          "isDefault": false,
+          "condition": {
+            "relation": "and",
+            "conditions": [
+              {
+                "field": "$INPUT.checkup_state",
+                "operator": "eq",
+                "value": 4
+              },
+              {
+                "field": "$INPUT.positive_content",
+                "operator": "eq",
+                "value": 1543606
+              },
+              {
+                "field": "$INPUT.is_search",
+                "operator": "ne",
+                "value": 1543607
+              },
+              {
+                "field": "$INPUT.playright",
+                "operator": "ne",
+                "value": ""
+              },
+              {
+                "field": "$INPUT.data_flag",
+                "operator": "gt",
+                "value": "0"
+              }
+            ]
+          },
+          "next": "node-r4QJPWhl"
+        }
+      ],
+      "id": "node-n0u_uoIG",
+      "typeName": "\\u679a\\u4e3e\\u8282\\u70b9(switch)",
+      "desc": ""
+    },
+    {
+      "type": "end",
+      "name": "\\u7ed3\\u675f",
+      "output": {
+        "code": -1,
+        "msg": "\\u4e0d\\u53ef\\u641c"
+      },
+      "resultType": "success",
+      "id": "node-8bBhLIZX"
+    },
+    {
+      "type": "end",
+      "name": "\\u7ed3\\u675f",
+      "output": {
+        "code": 0,
+        "msg": "\\u53ef\\u641c"
+      },
+      "resultType": "success",
+      "id": "node-r4QJPWhl"
+    }
+  ],
+  "external": {
+    "version": "2.1.0",
+    "envProperty": {
+      "dataType": "object",
+      "name": "global",
+      "label": "\\u5168\\u5c40\\u53d8\\u91cf",
+      "properties": {}
+    }
+  },
+  "context": {
+    "global": {
+      "__ENVCONF__": {
+        "formal": {}
+      },
+      "__ENVNAME__": "formal"
+    }
+  }
+}
