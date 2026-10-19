@@ -282,6 +282,10 @@ func (f *fakeDocker) handleExec(w http.ResponseWriter, r *http.Request) {
 		state.started = true
 		f.mu.Unlock()
 
+		// A real daemon drains the request body before hijacking; skipping
+		// this leaves the POST body unread in the server buffer and the
+		// close RSTs the client's body write (broken pipe under CI timing).
+		_, _ = io.Copy(io.Discard, r.Body)
 		hijacker, ok := w.(http.Hijacker)
 		if !ok {
 			http.Error(w, "hijack unsupported", http.StatusInternalServerError)
