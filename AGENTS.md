@@ -74,6 +74,25 @@ make test   # 已封装代理
 | —（plaita-nodes 仓：decision/agent/gate/rate_limit/report/hitl/hitl_await 等） | — | 缺：decision 已在拒载清单带提示 |
 | trpc / mdb（前身引擎特有） | 已删 | 不移植（公司内网设施） |
 
+### plaita-nodes 22 节点全量盘点（2026-10-19 清点）
+
+| 节点 | Go 状态 | 说明 |
+|---|---|---|
+| agentrun | ✅ 已落地 | spawn 路径 + recursive-direct；**workspace 沙箱分支待做**（见下） |
+| gate / rate_limit / report | ❌ 拒载 | 管线控制原子，纯引擎逻辑，**Wave 2** |
+| hitl / hitl_await | ❌ 拒载 | 需外部 resume 协议 + 挂起恢复，依赖 worker 层，**Wave 3** |
+| decision | ❌ 拒载 | 结构化决策（LLM/规则），依赖 agent/LLM 布线，**Wave 3** |
+| llm | ❌ 拒载 | 同上 |
+| notify / feishu_webhook / dingtalk_webhook / slack_webhook / wecom_webhook / generic_webhook / email_send | ❌ 拒载 | 通知/外发族，纯 HTTP 逻辑，**Wave 2**（按生产使用面挑） |
+| api_request / parse_json | ❌ 拒载 | 通用 HTTP/JSON 处理，**Wave 2** |
+| capture | ❌ 拒载 | 观测捕获，随事件落盘层，**Wave 3** |
+| sql_query | ❌ 拒载 | 依赖驱动选型，按需 |
+| git_publish / github_comment / writefile | ❌ 拒载 | 文件系统/远端写操作，需沙箱/宿主工作区约定，**Wave 2-3** |
+
+### 沙箱支持（已拍板：要支持，2026-10-19）
+
+agentrun `workspace=` 分支从「拒载」改为「计划支持」。**对齐生产契约**（plaita-nodes `_execute_sandboxed`）：workspace 名 → `.plaita/sandboxes.json` 注册表（fail-closed 不自动建）→ driver → 沙箱内 agentproc → env 白名单 + envfile(0600) 注入 → lease/ensure/释放（成功 kill / 失败 pause 分流）。**Go 实现取形**：Docker driver 优先（本地Mac/容器宿主，docker API），AGS 经 E2B 兼容 HTTP API 接（不移植 4300 行 driver，调用其服务面）。顺序在 worker 主线之后（沙箱 lease 与 worker 的执行租约同族，一起设计）。
+
 ## 表达式对齐（已落地 2026-10-19，golden 45/45 绿）
 
 变量根一致：`INPUT/NODE/PARENT/GLOBAL/ENV`（引擎另有 `ERROR/NULL/EMPTYSTRING`，保留）。
