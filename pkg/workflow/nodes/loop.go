@@ -4,8 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-
-	"github.com/spf13/cast"
+	"log"
+	"reflect"
+	"strings"
 
 	"github.com/jeffkit/plaita-go/internal/runtime"
 	"github.com/jeffkit/plaita-go/internal/types"
@@ -54,7 +55,63 @@ func (c loopCollection) Elements(ctx context.Context) ([]any, error) {
 		return nil, err
 	}
 
-	return cast.ToSliceE(v)
+	return coerceLoopCollection(v)
+}
+
+// coerceLoopCollection ports plaita loop._coerce_collection（issue #27）：
+//   - 字符串先按 JSON 数组字面量解析（"[1,2,3]" → 3 个元素；字段描述宣称
+//     "也可为字面量数组"，而表达式引擎不解析数组字面量、原样返回字符串）；
+//   - 不是 JSON 数组的普通字符串按单元素集合处理（不再 cast 报错，也不再
+//     逐字符迭代），并打 warning 便于作者发现；
+//   - nil → 空集合；slice/array → 逐元素；map → Python list(dict) 语义取键；
+//   - 其余不可迭代标量对齐 Python 的 TypeError，返回错误。
+func coerceLoopCollection(v any) ([]any, error) {
+	switch t := v.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		stripped := strings.TrimSpace(t)
+		if strings.HasPrefix(stripped, "[") {
+			var parsed any
+			if err := json.Unmarshal([]byte(stripped), &parsed); err == nil {
+				if arr, ok := parsed.([]any); ok {
+					return arr, nil
+				}
+			}
+		}
+		logged := t
+		if len(logged) >= 80 {
+			logged = logged[:77] + "..."
+		}
+		log.Printf("loop collection 表达式求值为普通字符串，按单元素集合处理（不逐字符迭代）: %q", logged)
+		return []any{t}, nil
+	case []any:
+		return t, nil
+	case map[string]any:
+		keys := make([]any, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		return keys, nil
+	}
+
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Slice, reflect.Array:
+		out := make([]any, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			out[i] = rv.Index(i).Interface()
+		}
+		return out, nil
+	case reflect.Map:
+		keys := make([]any, 0, rv.Len())
+		for _, key := range rv.MapKeys() {
+			keys = append(keys, key.Interface())
+		}
+		return keys, nil
+	default:
+		return nil, fmt.Errorf("loop collection: %T is not iterable", v)
+	}
 }
 
 // IsArray returns true if the collection is an array.

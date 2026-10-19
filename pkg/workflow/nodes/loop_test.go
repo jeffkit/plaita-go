@@ -180,3 +180,88 @@ func TestLoop_UnmarshalJSON(t *testing.T) {
 		})
 	}
 }
+
+// TestLoopCollection_Elements：collection 归一对齐 Python loop._coerce_collection
+// （issue #27）：JSON 数组字符串按数组解析、普通字符串按单元素集合、nil 空集合、
+// 不可迭代标量报错。
+func TestLoopCollection_Elements(t *testing.T) {
+	ctx := runtime.WithWorkflowRuntimeContext(context.Background(), &runtime.Context{})
+
+	t.Run("json array string parses as array", func(t *testing.T) {
+		got, err := loopCollection{expr: "[1,2,3]"}.Elements(ctx)
+		require.NoError(t, err)
+		require.Equal(t, []any{float64(1), float64(2), float64(3)}, got)
+	})
+	t.Run("json array string with spaces parses as array", func(t *testing.T) {
+		got, err := loopCollection{expr: " [1, 2] "}.Elements(ctx)
+		require.NoError(t, err)
+		require.Equal(t, []any{float64(1), float64(2)}, got)
+	})
+	t.Run("plain string is a single-element collection", func(t *testing.T) {
+		got, err := loopCollection{expr: "abc"}.Elements(ctx)
+		require.NoError(t, err)
+		require.Equal(t, []any{"abc"}, got)
+	})
+	t.Run("broken json array falls back to single element", func(t *testing.T) {
+		got, err := loopCollection{expr: "[1,2"}.Elements(ctx)
+		require.NoError(t, err)
+		require.Equal(t, []any{"[1,2"}, got)
+	})
+	t.Run("nil expression result is an empty collection", func(t *testing.T) {
+		got, err := loopCollection{expr: "$NULL"}.Elements(ctx)
+		require.NoError(t, err)
+		require.Nil(t, got)
+	})
+	t.Run("array passthrough", func(t *testing.T) {
+		got, err := loopCollection{array: []any{1, 2, 3}}.Elements(ctx)
+		require.NoError(t, err)
+		require.Equal(t, []any{1, 2, 3}, got)
+	})
+	t.Run("map value iterates keys like Python list(dict)", func(t *testing.T) {
+		got, err := loopCollection{expr: "$INPUT.m"}.Elements(runtime.WithWorkflowRuntimeContext(context.Background(),
+			&runtime.Context{WorkflowInput: map[string]any{"m": map[string]any{"a": 1, "b": 2}}}))
+		require.NoError(t, err)
+		require.Len(t, got, 2)
+	})
+	t.Run("non-iterable scalar errors like Python TypeError", func(t *testing.T) {
+		_, err := loopCollection{expr: "$INPUT.n"}.Elements(runtime.WithWorkflowRuntimeContext(context.Background(),
+			&runtime.Context{WorkflowInput: map[string]any{"n": 3.0}}))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "not iterable")
+	})
+}
+
+// TestLoop_Execute_StringCollections：issue #27 实测矩阵走整节点执行路径。
+func TestLoop_Execute_StringCollections(t *testing.T) {
+	newLoop := func(expr string) *Loop {
+		return &Loop{
+			Child: Child{
+				BaseNode: BaseNode{ID: "loop"},
+				ChildFlow: &workflow.Workflow{
+					ID: "workflow",
+					Nodes: workflow.Nodes{
+						&Start{BaseNode{ID: "start", Next: "end"}},
+						&End{BaseNode: BaseNode{ID: "end", Output: "$INPUT.item"}},
+					},
+				},
+			},
+			Collection: loopCollection{expr: expr},
+		}
+	}
+
+	t.Run("json array string iterates 3 times, result is last item", func(t *testing.T) {
+		got, err := newLoop("[1,2,3]").Execute(runtime.WithWorkflowRuntimeContext(context.Background(), &runtime.Context{}))
+		require.NoError(t, err)
+		require.Equal(t, float64(3), got.Result)
+	})
+	t.Run("plain string iterates once, result is the string", func(t *testing.T) {
+		got, err := newLoop("abc").Execute(runtime.WithWorkflowRuntimeContext(context.Background(), &runtime.Context{}))
+		require.NoError(t, err)
+		require.Equal(t, "abc", got.Result)
+	})
+	t.Run("nil collection iterates zero times, result is nil", func(t *testing.T) {
+		got, err := newLoop("$NULL").Execute(runtime.WithWorkflowRuntimeContext(context.Background(), &runtime.Context{}))
+		require.NoError(t, err)
+		require.Nil(t, got.Result)
+	})
+}
