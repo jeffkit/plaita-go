@@ -2,6 +2,7 @@ package nodes
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -10,6 +11,107 @@ import (
 
 	"github.com/go-redis/redismock/v8"
 )
+
+// TestRedisNode_ExpressionFields pins issue #14: target/command/arguments
+// all go through plaita expression evaluation (Python evaluates all three),
+// and a dynamic target must not fail at Validate time.
+func TestRedisNode_ExpressionFields(t *testing.T) {
+	client, mock := redismock.NewClientMock()
+
+	// Validate must not parse an expression target as a URL (it is resolved
+	// at execute time).
+	node := &RedisNode{
+		BaseNode:  BaseNode{ID: "redis", Next: "end"},
+		Target:    "$INPUT.redisUrl",
+		Command:   "$INPUT.cmd",
+		Arguments: "$NODE.up.key",
+	}
+	if err := node.Validate(); err != nil {
+		t.Fatalf("Validate with expression target: %v", err)
+	}
+
+	node.client = client
+	node.Arguments = "$INPUT.args"
+	mock.ExpectGet("expr_key").SetVal("expr_value")
+	got, err := node.Execute(runtime.WithWorkflowRuntimeContext(context.Background(), &runtime.Context{
+		WorkflowInput: map[string]any{
+			"redisUrl": "redis://root:123456@localhost:6379/1",
+			"cmd":      "get",
+			"args":     "expr_key",
+		},
+		ExecuteNodeResults: map[string]any{
+			"up": map[string]any{"key": "ignored"},
+		},
+	}))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if got.Result != "expr_value" {
+		t.Errorf("Result = %v, want expr_value", got.Result)
+	}
+}
+
+// TestRedisNode_NonStringFieldRejected pins the fail-loud rule: a field that
+// evaluates to a non-string must error, not be stringified into the command.
+func TestRedisNode_NonStringFieldRejected(t *testing.T) {
+	client, _ := redismock.NewClientMock()
+	node := &RedisNode{
+		BaseNode:  BaseNode{ID: "redis"},
+		Target:    "redis://root:123456@localhost:6379",
+		Command:   "$INPUT.cmd",
+		Arguments: "k",
+		client:    client,
+	}
+	_, err := node.Execute(runtime.WithWorkflowRuntimeContext(context.Background(), &runtime.Context{
+		WorkflowInput: map[string]any{"cmd": 42},
+	}))
+	if err == nil || !reflect.DeepEqual(err.Error(), "Redis node: command must evaluate to a string, got int") {
+		t.Errorf("err = %v, want non-string command error", err)
+	}
+}
+
+// TestRedisNode_ClientCachePerTarget pins the bounded per-target LRU
+// (plaita #81): same evaluated target reuses one client, distinct targets
+// get distinct clients, the cache never exceeds redisClientCacheMax.
+func TestRedisNode_ClientCachePerTarget(t *testing.T) {
+	node := &RedisNode{BaseNode: BaseNode{ID: "redis"}}
+	first, err := node.clientFor("redis://root:123456@localhost:6379/1")
+	if err != nil {
+		t.Fatalf("clientFor: %v", err)
+	}
+	second, err := node.clientFor("redis://root:123456@localhost:6379/1")
+	if err != nil {
+		t.Fatalf("clientFor: %v", err)
+	}
+	if first != second {
+		t.Errorf("same target must reuse the client")
+	}
+	for i := 0; i < redisClientCacheMax+2; i++ {
+		if _, err := node.clientFor(fmt.Sprintf("redis://root:123456@localhost:637%d", i%10)); err != nil {
+			t.Fatalf("clientFor %d: %v", i, err)
+		}
+	}
+	if len(node.clients) != redisClientCacheMax {
+		t.Errorf("cache size = %d, want %d", len(node.clients), redisClientCacheMax)
+	}
+}
+
+// TestRedisNode_ValidateDoesNotBuildClient pins that load-time validation no
+// longer dials/constructs a client from the raw target (#14: Validate used to
+// url.Parse the target, breaking expression targets).
+func TestRedisNode_ValidateDoesNotBuildClient(t *testing.T) {
+	node := &RedisNode{
+		BaseNode: BaseNode{ID: "redis"},
+		Target:   "$INPUT.redisUrl",
+		Command:  "get",
+	}
+	if err := node.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if node.client != nil || len(node.clients) != 0 {
+		t.Errorf("Validate must not construct clients")
+	}
+}
 
 func TestRedisNode_Execute(t *testing.T) {
 	client, mock := redismock.NewClientMock()

@@ -143,13 +143,21 @@ func Run(ctx context.Context, spec *AgentSpec, opts RunOptions) (*RunResult, err
 // buffered output (documented os/exec pitfall).
 func readPlain(ctx context.Context, cmd *exec.Cmd, stdout interface{ Read([]byte) (int, error) }, opts RunOptions) (*RunResult, error) {
 	var body strings.Builder
+	var details []string
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 0, 64*1024), 32*1024*1024)
 		for scanner.Scan() {
-			body.Write(scanner.Bytes())
+			line := scanner.Bytes()
+			// details=true on this path means the recursive CLI was switched
+			// to --output-format stream-json: the lines ARE the event stream
+			// the observations parser consumes (plaita-nodes parity).
+			if opts.CollectDetails {
+				details = append(details, string(line))
+			}
+			body.Write(line)
 			body.WriteByte('\n')
 		}
 	}()
@@ -163,7 +171,7 @@ func readPlain(ctx context.Context, cmd *exec.Cmd, stdout interface{ Read([]byte
 
 	waitErr := cmd.Wait()
 
-	res := &RunResult{SessionID: opts.SessionID}
+	res := &RunResult{SessionID: opts.SessionID, Details: details}
 	obj := extractRecursiveResult(body.String())
 	if v, ok := obj["session_id"].(string); ok && v != "" && res.SessionID == "" {
 		res.SessionID = v
