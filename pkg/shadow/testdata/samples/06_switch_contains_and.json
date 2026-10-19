@@ -1,0 +1,71 @@
+{
+  "name": "06_switch_contains_and",
+  "description": "switch 条件组 and + contains（列表元素 / 字符串子串）",
+  "input": {
+    "tags": [
+      "alpha",
+      "beta"
+    ],
+    "text": "hello world"
+  },
+  "expect": "both",
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s06_switch_contains",
+    "inputType": {
+      "dataType": "object"
+    },
+    "nodes": [
+      {
+        "type": "start",
+        "id": "start",
+        "next": "sw"
+      },
+      {
+        "type": "switch",
+        "id": "sw",
+        "branches": [
+          {
+            "name": "both",
+            "priority": 10,
+            "isDefault": false,
+            "condition": {
+              "relation": "and",
+              "conditions": [
+                {
+                  "field": "$INPUT.tags",
+                  "operator": "contains",
+                  "value": "beta"
+                },
+                {
+                  "field": "$INPUT.text",
+                  "operator": "contains",
+                  "value": "world"
+                }
+              ]
+            },
+            "next": "end_hit"
+          },
+          {
+            "name": "default",
+            "priority": 0,
+            "isDefault": true,
+            "next": "end_miss"
+          }
+        ]
+      },
+      {
+        "type": "end",
+        "id": "end_hit",
+        "resultType": "success",
+        "output": "both"
+      },
+      {
+        "type": "end",
+        "id": "end_miss",
+        "resultType": "success",
+        "output": "miss"
+      }
+    ]
+  }
+}

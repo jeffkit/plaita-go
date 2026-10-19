@@ -1,0 +1,59 @@
+{
+  "name": "07_loop_double",
+  "description": "loop 逐元素执行 inline 子流程，取末次子结果（plaita 语义）",
+  "input": {
+    "items": [
+      1,
+      2,
+      3,
+      4
+    ]
+  },
+  "expect": 8,
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s07_loop_double",
+    "inputType": {
+      "dataType": "object"
+    },
+    "nodes": [
+      {
+        "type": "start",
+        "id": "start",
+        "next": "loop"
+      },
+      {
+        "type": "loop",
+        "id": "loop",
+        "collection": "$INPUT.items",
+        "childFlow": {
+          "runtime": "python",
+          "flow_id": "shadow_s07_loop_child",
+          "inputType": {
+            "dataType": "object"
+          },
+          "nodes": [
+            {
+              "type": "start",
+              "id": "start",
+              "next": "end"
+            },
+            {
+              "type": "end",
+              "id": "end",
+              "resultType": "success",
+              "output": "$F.mul($INPUT.item, 2)"
+            }
+          ]
+        },
+        "next": "end"
+      },
+      {
+        "type": "end",
+        "id": "end",
+        "resultType": "success",
+        "output": "$NODE.loop"
+      }
+    ]
+  }
+}

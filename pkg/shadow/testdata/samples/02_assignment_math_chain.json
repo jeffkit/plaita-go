@@ -1,0 +1,57 @@
+{
+  "name": "02_assignment_math_chain",
+  "description": "两级 assignment 数值运算链（$F.mul/sub/add/div），下游引用 $NODE 嵌套字段",
+  "input": {
+    "a": 7,
+    "b": 4
+  },
+  "expect": {
+    "x": 28,
+    "y": 3,
+    "sum": 31,
+    "half": 3.5
+  },
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s02_assignment_math",
+    "inputType": {
+      "dataType": "object"
+    },
+    "nodes": [
+      {
+        "type": "start",
+        "id": "start",
+        "next": "a1"
+      },
+      {
+        "type": "assignment",
+        "id": "a1",
+        "output": {
+          "x": "$F.mul($INPUT.a, $INPUT.b)",
+          "y": "$F.sub($INPUT.a, $INPUT.b)"
+        },
+        "next": "a2"
+      },
+      {
+        "type": "assignment",
+        "id": "a2",
+        "output": {
+          "sum": "$F.add($NODE.a1.x, $NODE.a1.y)",
+          "half": "$F.div($INPUT.a, 2)"
+        },
+        "next": "end"
+      },
+      {
+        "type": "end",
+        "id": "end",
+        "resultType": "success",
+        "output": {
+          "x": "$NODE.a1.x",
+          "y": "$NODE.a1.y",
+          "sum": "$NODE.a2.sum",
+          "half": "$NODE.a2.half"
+        }
+      }
+    ]
+  }
+}

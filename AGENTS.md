@@ -22,6 +22,8 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
   pkg/delegate, pkg/discovery/           http 节点的委托与寻址（polaris 已删，仅 domain/noop）
   pkg/worker/       runtime worker MVP（2026-10-19）：Streams 取单/租约 Lua/状态写回/事件/取消/心跳
   cmd/plaita-worker/  worker 入口（env 配置，影子键前缀可覆写）
+  pkg/shadow/       M2 双跑对账 harness（Python sidecar / Go 节点轨迹+值比对 / 16 纯计算样本）
+  cmd/shadow-compare/  对账 CLI（样本集或 -flow 单流程），一致率报告 docs/SHADOW_REPORT.md
   pkg/llm/          LLM provider 链（OpenAI/Anthropic 兼容）
   docs/WORKER_PROTOCOL.md  worker 协议权威文档（田野调查，实现与影子对账的验收基准）
 规划中：

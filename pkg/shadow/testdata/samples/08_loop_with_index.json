@@ -1,0 +1,58 @@
+{
+  "name": "08_loop_with_index",
+  "description": "loop 子流程同时使用 $INPUT.item 与 $INPUT.index（索引从 0 起）",
+  "input": {
+    "items": [
+      5,
+      6,
+      7
+    ]
+  },
+  "expect": 72,
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s08_loop_index",
+    "inputType": {
+      "dataType": "object"
+    },
+    "nodes": [
+      {
+        "type": "start",
+        "id": "start",
+        "next": "loop"
+      },
+      {
+        "type": "loop",
+        "id": "loop",
+        "collection": "$INPUT.items",
+        "childFlow": {
+          "runtime": "python",
+          "flow_id": "shadow_s08_loop_child",
+          "inputType": {
+            "dataType": "object"
+          },
+          "nodes": [
+            {
+              "type": "start",
+              "id": "start",
+              "next": "end"
+            },
+            {
+              "type": "end",
+              "id": "end",
+              "resultType": "success",
+              "output": "$F.add($F.mul($INPUT.item, 10), $INPUT.index)"
+            }
+          ]
+        },
+        "next": "end"
+      },
+      {
+        "type": "end",
+        "id": "end",
+        "resultType": "success",
+        "output": "$NODE.loop"
+      }
+    ]
+  }
+}

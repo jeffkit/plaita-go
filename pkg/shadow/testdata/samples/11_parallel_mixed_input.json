@@ -1,0 +1,95 @@
+{
+  "name": "11_parallel_mixed_input",
+  "description": "parallel 分支输入：一路显式表达式 input，一路继承父 $INPUT",
+  "input": {
+    "x": 6
+  },
+  "expect": {
+    "explicit": 18,
+    "inherit": 7
+  },
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s11_parallel_mixed_input",
+    "inputType": {
+      "dataType": "object"
+    },
+    "nodes": [
+      {
+        "type": "start",
+        "id": "start",
+        "next": "p"
+      },
+      {
+        "type": "parallel",
+        "id": "p",
+        "branches": [
+          {
+            "name": "explicit",
+            "input": {
+              "v": "$F.mul($INPUT.x, 3)"
+            },
+            "flow": {
+              "runtime": "python",
+              "flow_id": "shadow_s11_branch_explicit",
+              "inputType": {
+                "dataType": "object"
+              },
+              "nodes": [
+                {
+                  "type": "start",
+                  "id": "start",
+                  "next": "end"
+                },
+                {
+                  "type": "end",
+                  "id": "end",
+                  "resultType": "success",
+                  "output": "$INPUT.v"
+                }
+              ]
+            }
+          },
+          {
+            "name": "inherit",
+            "flow": {
+              "runtime": "python",
+              "flow_id": "shadow_s11_branch_inherit",
+              "inputType": {
+                "dataType": "object"
+              },
+              "nodes": [
+                {
+                  "type": "start",
+                  "id": "start",
+                  "next": "end"
+                },
+                {
+                  "type": "end",
+                  "id": "end",
+                  "resultType": "success",
+                  "output": "$F.add($INPUT.x, 1)"
+                }
+              ]
+            }
+          }
+        ],
+        "mode": "thread",
+        "joinBranches": [
+          "explicit",
+          "inherit"
+        ],
+        "next": "end"
+      },
+      {
+        "type": "end",
+        "id": "end",
+        "resultType": "success",
+        "output": {
+          "explicit": "$NODE.p.explicit",
+          "inherit": "$NODE.p.inherit"
+        }
+      }
+    ]
+  }
+}

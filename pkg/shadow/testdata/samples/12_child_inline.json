@@ -1,0 +1,56 @@
+{
+  "name": "12_child_inline",
+  "description": "inline child 节点：输入表达式注入 + 子流程 $INPUT.who",
+  "input": {
+    "name": "plaita"
+  },
+  "expect": "hello plaita",
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s12_child_inline",
+    "inputType": {
+      "dataType": "object"
+    },
+    "nodes": [
+      {
+        "type": "start",
+        "id": "start",
+        "next": "c"
+      },
+      {
+        "type": "child",
+        "id": "c",
+        "input": {
+          "who": "$INPUT.name"
+        },
+        "childFlow": {
+          "runtime": "python",
+          "flow_id": "shadow_s12_child",
+          "inputType": {
+            "dataType": "object"
+          },
+          "nodes": [
+            {
+              "type": "start",
+              "id": "start",
+              "next": "end"
+            },
+            {
+              "type": "end",
+              "id": "end",
+              "resultType": "success",
+              "output": "$F.concat(\"hello \", $INPUT.who)"
+            }
+          ]
+        },
+        "next": "end"
+      },
+      {
+        "type": "end",
+        "id": "end",
+        "resultType": "success",
+        "output": "$NODE.c"
+      }
+    ]
+  }
+}

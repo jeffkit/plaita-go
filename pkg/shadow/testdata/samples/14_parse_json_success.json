@@ -1,0 +1,52 @@
+{
+  "name": "14_parse_json_success",
+  "description": "parse_json 成功路径：末行 JSON 提取 + verdict 白名单 + join_fields 平铺",
+  "input": {
+    "text": "分析完成\n{\"verdict\": \"ok\", \"tags\": [\"alpha\", 2, true], \"score\": 0.5}\n"
+  },
+  "expect": {
+    "verdict": "ok",
+    "tags": [
+      "alpha",
+      2,
+      true
+    ],
+    "score": 0.5,
+    "parse_ok": true,
+    "parse_error": "",
+    "tags_str": "alpha; 2; True"
+  },
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s14_parse_json_success",
+    "inputType": {
+      "dataType": "object"
+    },
+    "nodes": [
+      {
+        "type": "start",
+        "id": "start",
+        "next": "pj"
+      },
+      {
+        "type": "parse_json",
+        "id": "pj",
+        "text": "$INPUT.text",
+        "choices": [
+          "ok",
+          "bad"
+        ],
+        "join_fields": [
+          "tags"
+        ],
+        "next": "end"
+      },
+      {
+        "type": "end",
+        "id": "end",
+        "resultType": "success",
+        "output": "$NODE.pj"
+      }
+    ]
+  }
+}

@@ -1,0 +1,86 @@
+{
+  "name": "13_child_with_loop",
+  "description": "嵌套组合：child -> loop -> inline 子流程，结果逐层回传",
+  "input": {
+    "rows": [
+      2,
+      3,
+      4
+    ]
+  },
+  "expect": 16,
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s13_child_loop",
+    "inputType": {
+      "dataType": "object"
+    },
+    "nodes": [
+      {
+        "type": "start",
+        "id": "start",
+        "next": "c"
+      },
+      {
+        "type": "child",
+        "id": "c",
+        "input": {
+          "rows": "$INPUT.rows"
+        },
+        "childFlow": {
+          "runtime": "python",
+          "flow_id": "shadow_s13_child",
+          "inputType": {
+            "dataType": "object"
+          },
+          "nodes": [
+            {
+              "type": "start",
+              "id": "start",
+              "next": "inner_loop"
+            },
+            {
+              "type": "loop",
+              "id": "inner_loop",
+              "collection": "$INPUT.rows",
+              "childFlow": {
+                "runtime": "python",
+                "flow_id": "shadow_s13_inner",
+                "inputType": {
+                  "dataType": "object"
+                },
+                "nodes": [
+                  {
+                    "type": "start",
+                    "id": "start",
+                    "next": "end"
+                  },
+                  {
+                    "type": "end",
+                    "id": "end",
+                    "resultType": "success",
+                    "output": "$F.mul($INPUT.item, $INPUT.item)"
+                  }
+                ]
+              },
+              "next": "end"
+            },
+            {
+              "type": "end",
+              "id": "end",
+              "resultType": "success",
+              "output": "$NODE.inner_loop"
+            }
+          ]
+        },
+        "next": "end"
+      },
+      {
+        "type": "end",
+        "id": "end",
+        "resultType": "success",
+        "output": "$NODE.c"
+      }
+    ]
+  }
+}

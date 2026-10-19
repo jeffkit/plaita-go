@@ -1,0 +1,74 @@
+{
+  "name": "05_switch_default",
+  "description": "switch 条件全部不命中时走 default 分支",
+  "input": {
+    "score": 42
+  },
+  "expect": "low",
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s05_switch_default",
+    "inputType": {
+      "dataType": "object"
+    },
+    "nodes": [
+      {
+        "type": "start",
+        "id": "start",
+        "next": "sw"
+      },
+      {
+        "type": "switch",
+        "id": "sw",
+        "branches": [
+          {
+            "name": "high",
+            "priority": 10,
+            "isDefault": false,
+            "condition": {
+              "field": "$INPUT.score",
+              "operator": "gte",
+              "value": 90
+            },
+            "next": "end_high"
+          },
+          {
+            "name": "mid",
+            "priority": 5,
+            "isDefault": false,
+            "condition": {
+              "field": "$INPUT.score",
+              "operator": "gte",
+              "value": 60
+            },
+            "next": "end_mid"
+          },
+          {
+            "name": "default",
+            "priority": 0,
+            "isDefault": true,
+            "next": "end_low"
+          }
+        ]
+      },
+      {
+        "type": "end",
+        "id": "end_high",
+        "resultType": "success",
+        "output": "high"
+      },
+      {
+        "type": "end",
+        "id": "end_mid",
+        "resultType": "success",
+        "output": "mid"
+      },
+      {
+        "type": "end",
+        "id": "end_low",
+        "resultType": "success",
+        "output": "low"
+      }
+    ]
+  }
+}

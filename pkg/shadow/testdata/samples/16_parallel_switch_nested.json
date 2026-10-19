@@ -1,0 +1,121 @@
+{
+  "name": "16_parallel_switch_nested",
+  "description": "嵌套组合：parallel 两分支，一路 switch 分类、一路平方计算，join 后汇总",
+  "input": {
+    "x": 7
+  },
+  "expect": {
+    "label": "big",
+    "square": 49
+  },
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s16_parallel_switch",
+    "inputType": {
+      "dataType": "object"
+    },
+    "nodes": [
+      {
+        "type": "start",
+        "id": "start",
+        "next": "p"
+      },
+      {
+        "type": "parallel",
+        "id": "p",
+        "branches": [
+          {
+            "name": "classify",
+            "flow": {
+              "runtime": "python",
+              "flow_id": "shadow_s16_branch_classify",
+              "inputType": {
+                "dataType": "object"
+              },
+              "nodes": [
+                {
+                  "type": "start",
+                  "id": "start",
+                  "next": "sw"
+                },
+                {
+                  "type": "switch",
+                  "id": "sw",
+                  "branches": [
+                    {
+                      "name": "big",
+                      "priority": 10,
+                      "isDefault": false,
+                      "condition": {
+                        "field": "$INPUT.x",
+                        "operator": "gte",
+                        "value": 5
+                      },
+                      "next": "end_big"
+                    },
+                    {
+                      "name": "default",
+                      "priority": 0,
+                      "isDefault": true,
+                      "next": "end_small"
+                    }
+                  ]
+                },
+                {
+                  "type": "end",
+                  "id": "end_big",
+                  "resultType": "success",
+                  "output": "big"
+                },
+                {
+                  "type": "end",
+                  "id": "end_small",
+                  "resultType": "success",
+                  "output": "small"
+                }
+              ]
+            }
+          },
+          {
+            "name": "calc",
+            "flow": {
+              "runtime": "python",
+              "flow_id": "shadow_s16_branch_calc",
+              "inputType": {
+                "dataType": "object"
+              },
+              "nodes": [
+                {
+                  "type": "start",
+                  "id": "start",
+                  "next": "end"
+                },
+                {
+                  "type": "end",
+                  "id": "end",
+                  "resultType": "success",
+                  "output": "$F.mul($INPUT.x, $INPUT.x)"
+                }
+              ]
+            }
+          }
+        ],
+        "mode": "thread",
+        "joinBranches": [
+          "classify",
+          "calc"
+        ],
+        "next": "end"
+      },
+      {
+        "type": "end",
+        "id": "end",
+        "resultType": "success",
+        "output": {
+          "label": "$NODE.p.classify",
+          "square": "$NODE.p.calc"
+        }
+      }
+    ]
+  }
+}

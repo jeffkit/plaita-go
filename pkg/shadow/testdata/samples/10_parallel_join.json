@@ -1,0 +1,89 @@
+{
+  "name": "10_parallel_join",
+  "description": "parallel 两分支并发 + join，分支未声明 input 时继承父 $INPUT",
+  "input": {
+    "x": 5
+  },
+  "expect": {
+    "a": 10,
+    "b": 15
+  },
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s10_parallel_join",
+    "inputType": {
+      "dataType": "object"
+    },
+    "nodes": [
+      {
+        "type": "start",
+        "id": "start",
+        "next": "p"
+      },
+      {
+        "type": "parallel",
+        "id": "p",
+        "branches": [
+          {
+            "name": "a",
+            "flow": {
+              "runtime": "python",
+              "flow_id": "shadow_s10_branch_a",
+              "inputType": {
+                "dataType": "object"
+              },
+              "nodes": [
+                {
+                  "type": "start",
+                  "id": "start",
+                  "next": "end"
+                },
+                {
+                  "type": "end",
+                  "id": "end",
+                  "resultType": "success",
+                  "output": "$F.mul($INPUT.x, 2)"
+                }
+              ]
+            }
+          },
+          {
+            "name": "b",
+            "flow": {
+              "runtime": "python",
+              "flow_id": "shadow_s10_branch_b",
+              "inputType": {
+                "dataType": "object"
+              },
+              "nodes": [
+                {
+                  "type": "start",
+                  "id": "start",
+                  "next": "end"
+                },
+                {
+                  "type": "end",
+                  "id": "end",
+                  "resultType": "success",
+                  "output": "$F.add($INPUT.x, 10)"
+                }
+              ]
+            }
+          }
+        ],
+        "mode": "thread",
+        "joinBranches": [
+          "a",
+          "b"
+        ],
+        "next": "end"
+      },
+      {
+        "type": "end",
+        "id": "end",
+        "resultType": "success",
+        "output": "$NODE.p"
+      }
+    ]
+  }
+}

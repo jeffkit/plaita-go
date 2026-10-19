@@ -1,0 +1,41 @@
+{
+  "name": "01_assignment_concat",
+  "description": "assignment 对象输出 + $F.concat/$F.add，end 直接引用 $NODE",
+  "input": {
+    "name": "plaita",
+    "n": 3
+  },
+  "expect": {
+    "greeting": "hello plaita",
+    "count": 4
+  },
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s01_assignment_concat",
+    "inputType": {
+      "dataType": "object"
+    },
+    "nodes": [
+      {
+        "type": "start",
+        "id": "start",
+        "next": "greet"
+      },
+      {
+        "type": "assignment",
+        "id": "greet",
+        "output": {
+          "greeting": "$F.concat(\"hello \", $INPUT.name)",
+          "count": "$F.add($INPUT.n, 1)"
+        },
+        "next": "end"
+      },
+      {
+        "type": "end",
+        "id": "end",
+        "resultType": "success",
+        "output": "$NODE.greet"
+      }
+    ]
+  }
+}

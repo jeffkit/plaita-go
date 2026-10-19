@@ -1,0 +1,54 @@
+{
+  "name": "09_loop_empty",
+  "description": "空集合 loop：两侧都返回 None（末次结果为空）",
+  "input": {
+    "items": []
+  },
+  "expect": null,
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s09_loop_empty",
+    "inputType": {
+      "dataType": "object"
+    },
+    "nodes": [
+      {
+        "type": "start",
+        "id": "start",
+        "next": "loop"
+      },
+      {
+        "type": "loop",
+        "id": "loop",
+        "collection": "$INPUT.items",
+        "childFlow": {
+          "runtime": "python",
+          "flow_id": "shadow_s09_loop_child",
+          "inputType": {
+            "dataType": "object"
+          },
+          "nodes": [
+            {
+              "type": "start",
+              "id": "start",
+              "next": "end"
+            },
+            {
+              "type": "end",
+              "id": "end",
+              "resultType": "success",
+              "output": "$INPUT.item"
+            }
+          ]
+        },
+        "next": "end"
+      },
+      {
+        "type": "end",
+        "id": "end",
+        "resultType": "success",
+        "output": "$NODE.loop"
+      }
+    ]
+  }
+}
