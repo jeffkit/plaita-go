@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/jeffkit/plaita-go/pkg/duration"
-	"github.com/jeffkit/plaita-go/pkg/workflow"
 )
 
 // normalizeDoc rewrites a deployment-form flow document in place into the
@@ -41,17 +40,15 @@ func normalizeDoc(doc map[string]any, sc scope) error {
 		}
 	}
 
-	// $ENV allowlist: plaita 0.5.0 allowlist model (fail-closed). The engine
-	// carries it as Workflow.ExposeEnv; illegal entries ("*", blank,
-	// whitespace-padded, non-string) are rejected at load — earlier than
-	// Python, which raises at run time.
+	// exposeEnv: plaita emits expose_env (model_dump) and exposeEnv (deploy
+	// camel). Fold to the contract spelling and pass through at doc top level —
+	// the engine restricts $ENV to this allowlist (workflow.Workflow.ExposeEnv).
+	// Invalid entries are rejected at load (fail-closed), the rules of plaita's
+	// _safe_environment pulled forward from runtime to build time.
 	foldKey(doc, "expose_env", "exposeEnv")
 	if v, ok := doc["exposeEnv"]; ok {
-		list, err := asStringList(v)
-		if err != nil {
-			return fmt.Errorf("ir: flow %q: exposeEnv: %v", doc["id"], err)
-		}
-		if err := workflow.ValidateExposeEnv(list); err != nil {
+		if err := validateExposeEnv(v); err != nil {
+
 			return fmt.Errorf("ir: flow %q: %v", doc["id"], err)
 		}
 	}
@@ -357,6 +354,7 @@ func normalizeCondition(c map[string]any) error {
 }
 
 func translateParallel(n map[string]any) error {
+	foldKey(n, "join_branches", "joinBranches")
 	// mode: plaita thread/process/coroutine all map onto goroutine execution;
 	// pass known values, stash unknown ones.
 	if m, ok := n["mode"].(string); ok {
@@ -573,22 +571,31 @@ func normalizeProperty(p map[string]any) error {
 	return nil
 }
 
-// asStringList converts a JSON-decoded array of strings; non-string entries
-// are rejected (plaita expose_env raises on non-str entries too).
-func asStringList(v any) ([]string, error) {
+// validateExposeEnv enforces plaita _safe_environment's entry rules at load
+// time: an array of exact environment variable names — no wildcards, no blank
+// or whitespace-padded entries (Python raises ValueError at runtime; this
+// engine rejects the flow earlier).
+func validateExposeEnv(v any) error {
 	l, ok := v.([]any)
 	if !ok {
-		return nil, fmt.Errorf("must be an array of strings, got %T", v)
+		return fmt.Errorf("exposeEnv must be an array of environment variable names, got %T", v)
 	}
-	out := make([]string, 0, len(l))
+	var bad []string
 	for _, item := range l {
-		s, ok := item.(string)
-		if !ok {
-			return nil, fmt.Errorf("must be an array of strings, got element %T", item)
+		s, isStr := item.(string)
+		switch {
+		case !isStr:
+			bad = append(bad, fmt.Sprint(item))
+		case s == "" || strings.TrimSpace(s) != s || strings.Contains(s, "*"):
+			bad = append(bad, s)
 		}
-		out = append(out, s)
 	}
-	return out, nil
+	if len(bad) > 0 {
+		return fmt.Errorf("exposeEnv contains invalid entries %q: no wildcards, no blank or "+
+			"whitespace-padded keys; list exact environment variable names", bad)
+	}
+	return nil
+
 }
 
 // normalizeTimeout converts plaita timeout spellings to ISO 8601.
