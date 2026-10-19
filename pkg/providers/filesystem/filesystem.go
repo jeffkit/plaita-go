@@ -19,7 +19,7 @@ import (
 type fileSystemWorkflowProvider struct {
 	mutex sync.RWMutex
 
-	flows       map[workflow.ID]map[workflow.Version]workflow.Workflow
+	flows       map[workflow.ID]map[workflow.Version]*workflow.Workflow
 	flowDirPath string
 }
 
@@ -51,7 +51,7 @@ func NewWorkflowProvider(opts ...ProviderOption) (providers.WorkflowProvider, er
 
 	fp := &fileSystemWorkflowProvider{
 		flowDirPath: o.dirPath,
-		flows:       make(map[workflow.ID]map[workflow.Version]workflow.Workflow),
+		flows:       make(map[workflow.ID]map[workflow.Version]*workflow.Workflow),
 	}
 	if err := fp.loadFlowsFromDirectory(); err != nil {
 		return nil, err
@@ -108,7 +108,7 @@ func (fp *fileSystemWorkflowProvider) GetWorkflow(
 		return nil, fmt.Errorf("workflow not found for id: %s and version: %s", id, version)
 	}
 
-	return &wf, nil
+	return wf, nil
 }
 
 func (fp *fileSystemWorkflowProvider) setWorkflow(wf *workflow.Workflow) error {
@@ -121,10 +121,10 @@ func (fp *fileSystemWorkflowProvider) setWorkflow(wf *workflow.Workflow) error {
 
 	versionWorkflows, ok := fp.flows[wf.ID]
 	if !ok {
-		versionWorkflows = make(map[workflow.Version]workflow.Workflow)
+		versionWorkflows = make(map[workflow.Version]*workflow.Workflow)
 		fp.flows[wf.ID] = versionWorkflows
 	}
 
-	versionWorkflows[wf.Version] = *wf
+	versionWorkflows[wf.Version] = wf
 	return nil
 }

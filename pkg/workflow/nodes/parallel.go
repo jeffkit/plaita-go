@@ -43,8 +43,8 @@ var supportedParallelModels = []ParallelModel{
 // ParallelBranch represents a branch of a parallel node
 type ParallelBranch struct {
 	Branch
-	Flow  workflow.Workflow `json:"flow"`
-	Input map[string]any    `json:"input,omitempty"`
+	Flow  *workflow.Workflow `json:"flow"`
+	Input map[string]any     `json:"input,omitempty"`
 }
 
 // Validate validates the parallel branch
@@ -57,10 +57,10 @@ func (pb *ParallelBranch) Validate() error {
 // Parallel represents a parallel node
 type Parallel struct {
 	BaseNode
-	Branches      []ParallelBranch `json:"branches"`
-	IsConditional bool             `json:"isConditional"`
-	Mode          ParallelModel    `json:"mode,omitempty"`
-	JoinBranches  []string         `json:"joinBranches,omitempty"`
+	Branches      []*ParallelBranch `json:"branches"`
+	IsConditional bool              `json:"isConditional"`
+	Mode          ParallelModel     `json:"mode,omitempty"`
+	JoinBranches  []string          `json:"joinBranches,omitempty"`
 }
 
 // Validate validates the parallel node
@@ -84,11 +84,11 @@ func (p *Parallel) Execute(ctx context.Context) (*workflow.ExecuteResult, error)
 		return nil, err
 	}
 
-	p.backgroundExecBranches(ctx, lo.Filter(branches, func(item ParallelBranch, _ int) bool {
+	p.backgroundExecBranches(ctx, lo.Filter(branches, func(item *ParallelBranch, _ int) bool {
 		return !lo.Contains(p.JoinBranches, item.Name)
 	}))
 
-	joinBranches := lo.Filter(branches, func(item ParallelBranch, _ int) bool {
+	joinBranches := lo.Filter(branches, func(item *ParallelBranch, _ int) bool {
 		if len(p.JoinBranches) == 0 {
 			return true
 		}
@@ -98,19 +98,20 @@ func (p *Parallel) Execute(ctx context.Context) (*workflow.ExecuteResult, error)
 	return &workflow.ExecuteResult{Result: results, NextNode: p.Next}, err
 }
 
-func (p *Parallel) execJoinBranches(ctx context.Context, joinBranches []ParallelBranch) (map[string]any, error) {
-	results, err := iter.MapErr(joinBranches, func(pb *ParallelBranch) (any, error) {
+func (p *Parallel) execJoinBranches(ctx context.Context, joinBranches []*ParallelBranch) (map[string]any, error) {
+	results, err := iter.MapErr(joinBranches, func(pb **ParallelBranch) (any, error) {
+		br := *pb
 		branchCtx := runtime.CloneContext(ctx)
-		if pb.Flow.Timeout.IsZero() {
-			pb.Flow.Timeout = p.Timeout
+		if br.Flow.Timeout.IsZero() {
+			br.Flow.Timeout = p.Timeout
 		}
 
 		// plaita semantics: a branch without an explicit input inherits the
 		// parent workflow input ($INPUT stays visible inside the branch).
 		var subWorkflowInput any
-		if pb.Input != nil {
+		if br.Input != nil {
 			var err error
-			subWorkflowInput, err = expression.Eval(branchCtx, pb.Input)
+			subWorkflowInput, err = expression.Eval(branchCtx, br.Input)
 			if err != nil {
 				return nil, err
 			}
@@ -118,7 +119,7 @@ func (p *Parallel) execJoinBranches(ctx context.Context, joinBranches []Parallel
 		if subWorkflowInput == nil {
 			subWorkflowInput = runtime.WorkflowRuntimeContext(ctx).WorkflowInput
 		}
-		return pb.Flow.Execute(branchCtx, subWorkflowInput)
+		return br.Flow.Execute(branchCtx, subWorkflowInput)
 	})
 
 	execResult := make(map[string]any)
@@ -157,30 +158,31 @@ func (e *execFuture) set(key string, v any, err error) {
 	}
 }
 
-func (p *Parallel) backgroundExecBranches(ctx context.Context, branches []ParallelBranch) *execFuture {
+func (p *Parallel) backgroundExecBranches(ctx context.Context, branches []*ParallelBranch) *execFuture {
 	future := newExecFuture()
 	go func() {
-		iter.ForEach(branches, func(pb *ParallelBranch) {
-			ctx = runtime.CloneContext(ctx)
-			subWorkflowInput, err := expression.Eval(ctx, pb.Input)
+		iter.ForEach(branches, func(pbRef **ParallelBranch) {
+			pb := *pbRef
+			branchCtx := runtime.CloneContext(ctx)
+			subWorkflowInput, err := expression.Eval(branchCtx, pb.Input)
 			if err != nil {
 				future.set(pb.Name, nil, err)
 				return
 			}
 
-			result, err := pb.Flow.Execute(ctx, subWorkflowInput)
+			result, err := pb.Flow.Execute(branchCtx, subWorkflowInput)
 			future.set(pb.Name, result, err)
 		})
 	}()
 	return future
 }
 
-func (p *Parallel) matchConditionBranches(ctx context.Context) ([]ParallelBranch, error) {
+func (p *Parallel) matchConditionBranches(ctx context.Context) ([]*ParallelBranch, error) {
 	if !p.IsConditional {
 		return p.Branches, nil
 	}
 
-	var bs []ParallelBranch
+	var bs []*ParallelBranch
 	for _, b := range p.Branches {
 		match, _, err := b.MatchContext(ctx)
 		if err != nil {

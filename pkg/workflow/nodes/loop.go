@@ -87,12 +87,10 @@ func (l *Loop) UnmarshalJSON(data []byte) error {
 		lc.expr = t
 	}
 
-	*l = Loop{
-		Child:      t.Child,
-		Collection: lc,
-		Condition:  t.Condition,
-		ItemType:   t.ItemType,
-	}
+	l.Child = t.Child
+	l.Collection = lc
+	l.Condition = t.Condition
+	l.ItemType = t.ItemType
 	return nil
 }
 

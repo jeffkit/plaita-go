@@ -27,10 +27,10 @@ func TestParallel_Execute(t *testing.T) {
 			},
 			parallelNode: &Parallel{
 				BaseNode: BaseNode{ID: "parallel", Next: "end"},
-				Branches: []ParallelBranch{
+				Branches: []*ParallelBranch{
 					{
 						Branch: Branch{Name: "branch1"},
-						Flow: workflow.Workflow{
+						Flow: &workflow.Workflow{
 							ID: "simple-workflow-1",
 							Nodes: []workflow.Node{
 								&Start{BaseNode{ID: "start", Next: "sleep"}},
@@ -48,7 +48,7 @@ func TestParallel_Execute(t *testing.T) {
 					},
 					{
 						Branch: Branch{Name: "branch2"},
-						Flow: workflow.Workflow{
+						Flow: &workflow.Workflow{
 							ID: "simple-workflow-2",
 							Nodes: []workflow.Node{
 								&Start{BaseNode{ID: "start", Next: "sleep"}},
@@ -68,7 +68,7 @@ func TestParallel_Execute(t *testing.T) {
 					},
 					{
 						Branch: Branch{Name: "branch3"},
-						Flow: workflow.Workflow{
+						Flow: &workflow.Workflow{
 							ID: "simple-workflow-3",
 							Nodes: []workflow.Node{
 								&Start{BaseNode{ID: "start", Next: "sleep"}},
@@ -106,7 +106,7 @@ func TestParallel_Execute(t *testing.T) {
 			},
 			parallelNode: &Parallel{
 				BaseNode: BaseNode{Next: "end"},
-				Branches: []ParallelBranch{
+				Branches: []*ParallelBranch{
 					{
 						Branch: Branch{
 							Name: "branch1",
@@ -119,7 +119,7 @@ func TestParallel_Execute(t *testing.T) {
 								},
 							},
 						},
-						Flow: workflow.Workflow{
+						Flow: &workflow.Workflow{
 							ID: "simple-workflow",
 							Nodes: []workflow.Node{
 								&Start{BaseNode{ID: "start", Next: "sleep"}},
@@ -149,7 +149,7 @@ func TestParallel_Execute(t *testing.T) {
 								},
 							},
 						},
-						Flow: workflow.Workflow{
+						Flow: &workflow.Workflow{
 							ID: "simple-workflow",
 							Nodes: []workflow.Node{
 								&Start{BaseNode{ID: "start", Next: "sleep"}},
@@ -179,7 +179,7 @@ func TestParallel_Execute(t *testing.T) {
 								},
 							},
 						},
-						Flow: workflow.Workflow{
+						Flow: &workflow.Workflow{
 							ID: "simple-workflow",
 							Nodes: []workflow.Node{
 								&Start{BaseNode{ID: "start", Next: "sleep"}},
@@ -217,7 +217,7 @@ func TestParallel_Execute(t *testing.T) {
 			},
 			parallelNode: &Parallel{
 				BaseNode: BaseNode{Next: "end"},
-				Branches: []ParallelBranch{
+				Branches: []*ParallelBranch{
 					{
 						Branch: Branch{
 							Name: "branch1",
@@ -230,7 +230,7 @@ func TestParallel_Execute(t *testing.T) {
 								},
 							},
 						},
-						Flow: workflow.Workflow{
+						Flow: &workflow.Workflow{
 							ID: "simple-workflow",
 							Nodes: []workflow.Node{
 								&Start{BaseNode{ID: "start", Next: "sleep"}},
@@ -258,7 +258,7 @@ func TestParallel_Execute(t *testing.T) {
 								},
 							},
 						},
-						Flow: workflow.Workflow{
+						Flow: &workflow.Workflow{
 							ID: "simple-workflow",
 							Nodes: []workflow.Node{
 								&Start{BaseNode{ID: "start", Next: "sleep"}},
@@ -288,7 +288,7 @@ func TestParallel_Execute(t *testing.T) {
 								},
 							},
 						},
-						Flow: workflow.Workflow{
+						Flow: &workflow.Workflow{
 							ID: "simple-workflow",
 							Nodes: []workflow.Node{
 								&Start{BaseNode{ID: "start", Next: "sleep"}},

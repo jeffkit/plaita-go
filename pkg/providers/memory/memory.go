@@ -10,12 +10,12 @@ import (
 )
 
 type provider struct {
-	workflows map[workflow.ID]map[workflow.Version]workflow.Workflow
+	workflows map[workflow.ID]map[workflow.Version]*workflow.Workflow
 }
 
 // NewProvider returns a new in-memory workflow provider.
 func NewProvider() providers.WorkflowProvider {
-	return &provider{workflows: make(map[workflow.ID]map[workflow.Version]workflow.Workflow)}
+	return &provider{workflows: make(map[workflow.ID]map[workflow.Version]*workflow.Workflow)}
 }
 
 // FromWorkflows returns a new in-memory workflow provider with the given workflows.
@@ -44,7 +44,7 @@ func (p *provider) GetWorkflow(
 	if !ok {
 		return nil, providers.ErrWorkflowNotFound
 	}
-	return &wf, nil
+	return wf, nil
 }
 
 // RegisterWorkflow registers a workflow.
@@ -54,8 +54,8 @@ func (p *provider) RegisterWorkflow(wf *workflow.Workflow) error {
 
 	}
 	if _, ok := p.workflows[wf.ID]; !ok {
-		p.workflows[wf.ID] = make(map[workflow.Version]workflow.Workflow)
+		p.workflows[wf.ID] = make(map[workflow.Version]*workflow.Workflow)
 	}
-	p.workflows[wf.ID][wf.Version] = *wf
+	p.workflows[wf.ID][wf.Version] = wf
 	return nil
 }

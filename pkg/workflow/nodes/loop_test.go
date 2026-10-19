@@ -39,7 +39,7 @@ func TestLoop_Execute(t *testing.T) {
 						OutputType: workflow.Property{DataType: workflow.Integer},
 						Output:     "$LOOP-RESULT",
 					},
-					ChildFlow: workflow.Workflow{
+					ChildFlow: &workflow.Workflow{
 						ID: "workflow",
 						Nodes: workflow.Nodes{
 							&Start{BaseNode{ID: "start", Next: "end"}},
@@ -85,7 +85,7 @@ func TestLoop_Execute(t *testing.T) {
 						OutputType: workflow.Property{DataType: workflow.Integer},
 						Output:     "$LOOP-RESULT",
 					},
-					ChildFlow: workflow.Workflow{
+					ChildFlow: &workflow.Workflow{
 						ID: "flow",
 						Nodes: workflow.Nodes{
 							&Start{BaseNode{ID: "start", Next: "end"}},

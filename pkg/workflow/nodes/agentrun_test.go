@@ -15,7 +15,7 @@ func agentRegistryForTest(t *testing.T) *agentproc.Registry {
 	t.Helper()
 	dir := t.TempDir()
 	agents := `{"agents": {
-		"echo": {"executor": "recursive", "provider": "p1",
+		"echo": {"executor": "testcli", "model": "test-model",
 			"command": "/bin/sh", "args": ["-c", "printf '%s\\n' '{\"type\":\"result\",\"text\":\"reply-from-agent\"}'"]}
 	}}`
 	providers := `{"providers": {"p1": {"type": "anthropic", "apiBase": "https://x", "apiKey": "k", "model": "test-model"}}}`

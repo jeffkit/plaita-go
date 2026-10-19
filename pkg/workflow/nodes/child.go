@@ -23,8 +23,8 @@ func init() {
 // Child node is used to execute a children workflow.
 type Child struct {
 	BaseNode
-	ChildFlow workflow.Workflow `json:"childFlow"`
-	Input     any               `json:"input,omitempty"`
+	ChildFlow *workflow.Workflow `json:"childFlow"`
+	Input     any                `json:"input,omitempty"`
 }
 
 // Validate validates the children workflow node.

@@ -25,7 +25,7 @@ func TestChildrenFlow_Execute(t *testing.T) {
 					ID:   "child",
 					Next: "next-node",
 				},
-				ChildFlow: workflow.Workflow{
+				ChildFlow: &workflow.Workflow{
 					ID: "test-workflow",
 					InputType: workflow.Property{
 						DataType: workflow.Object,
