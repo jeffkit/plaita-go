@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -138,6 +137,10 @@ func Run(ctx context.Context, spec *AgentSpec, opts RunOptions) (*RunResult, err
 
 // readPlain handles the plain stdout path (recursive-direct): accumulate
 // everything, then extract the trailing JSON result object.
+//
+// Ordering matters: the stream must be drained to EOF BEFORE cmd.Wait() —
+// exec closes the pipe's read end inside Wait, so reaping first can lose
+// buffered output (documented os/exec pitfall).
 func readPlain(ctx context.Context, cmd *exec.Cmd, stdout interface{ Read([]byte) (int, error) }, opts RunOptions) (*RunResult, error) {
 	var body strings.Builder
 	done := make(chan struct{})
@@ -151,28 +154,14 @@ func readPlain(ctx context.Context, cmd *exec.Cmd, stdout interface{ Read([]byte
 		}
 	}()
 
-	timeout := opts.Timeout
-	if timeout <= 0 {
-		timeout = time.Hour * 24
+	// watchdog only kills; the stream goroutine observes EOF and finishes
+	if err := armWatchdog(ctx, cmd, opts.Timeout, done); err != nil {
+		<-done
+		_ = cmd.Wait()
+		return nil, fmt.Errorf("agentproc: %s", err)
 	}
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	waitCh := make(chan error, 1)
-	go func() { waitCh <- cmd.Wait() }()
 
-	var waitErr error
-	select {
-	case waitErr = <-waitCh:
-	case <-timer.C:
-		killGroup(cmd)
-		<-waitCh
-		return nil, fmt.Errorf("agentproc: timeout after %s (process group killed)", timeout)
-	case <-ctx.Done():
-		killGroup(cmd)
-		<-waitCh
-		return nil, fmt.Errorf("agentproc: canceled: %w", ctx.Err())
-	}
-	<-done
+	waitErr := cmd.Wait()
 
 	res := &RunResult{SessionID: opts.SessionID}
 	obj := extractRecursiveResult(body.String())
@@ -215,10 +204,9 @@ func readEvents(ctx context.Context, cmd *exec.Cmd, stdout interface{ Read([]byt
 		out.SessionID = opts.SessionID
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(1)
+	done := make(chan struct{})
 	go func() {
-		defer wg.Done()
+		defer close(done)
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 		for scanner.Scan() {
@@ -234,34 +222,15 @@ func readEvents(ctx context.Context, cmd *exec.Cmd, stdout interface{ Read([]byt
 		}
 	}()
 
-	timeout := opts.Timeout
-	if timeout <= 0 {
-		// fall back to a very long ceiling so ctx still governs
-		timeout = time.Hour * 24
+	// watchdog only kills; the stream goroutine observes EOF and finishes.
+	// Drain to EOF BEFORE cmd.Wait() — exec closes the read end inside Wait.
+	if err := armWatchdog(ctx, cmd, opts.Timeout, done); err != nil {
+		<-done
+		_ = cmd.Wait()
+		return &out.RunResult, fmt.Errorf("agentproc: %s", err)
 	}
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
 
-	waitCh := make(chan error, 1)
-	go func() { waitCh <- cmd.Wait() }()
-
-	var waitErr error
-	monitoring := true
-	for monitoring {
-		select {
-		case waitErr = <-waitCh:
-			monitoring = false
-		case <-timer.C:
-			killGroup(cmd)
-			<-waitCh
-			return &out.RunResult, fmt.Errorf("agentproc: timeout after %s (process group killed)", timeout)
-		case <-ctx.Done():
-			killGroup(cmd)
-			<-waitCh
-			return &out.RunResult, fmt.Errorf("agentproc: canceled: %w", ctx.Err())
-		}
-	}
-	wg.Wait()
+	waitErr := cmd.Wait()
 
 	if out.failedReason == "" && waitErr != nil {
 		if exitErr, ok := waitErr.(*exec.ExitError); ok {
@@ -275,6 +244,36 @@ func readEvents(ctx context.Context, cmd *exec.Cmd, stdout interface{ Read([]byt
 		return &out.RunResult, fmt.Errorf("agentproc: %s", out.failedReason)
 	}
 	return &out.RunResult, nil
+}
+
+// armWatchdog kills the process group when the turn exceeds its timeout or
+// the caller's context is canceled. It reports the kill reason as an error;
+// nil means the stream reached EOF first (normal completion).
+func armWatchdog(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, done <-chan struct{}) error {
+	if timeout <= 0 {
+		// fall back to a very long ceiling so ctx still governs
+		timeout = time.Hour * 24
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	var ctxDone <-chan struct{}
+	if ctx != nil {
+		ctxDone = ctx.Done()
+	}
+	if ctxDone == nil {
+		ctxDone = make(chan struct{}) // never fires
+	}
+	select {
+	case <-done:
+		return nil // stream finished before anything bad happened
+	case <-timer.C:
+		killGroup(cmd)
+		return fmt.Errorf("timeout after %s (process group killed)", timeout)
+	case <-ctxDone:
+		killGroup(cmd)
+		return fmt.Errorf("canceled: %w", ctx.Err())
+	}
 }
 
 func (o *turnOutcome) consumeLine(line string) {
