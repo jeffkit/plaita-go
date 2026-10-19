@@ -2,6 +2,8 @@ package agentproc
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -171,6 +173,56 @@ func TestRunDetailsCollected(t *testing.T) {
 	}
 	if len(res.Details) != 2 {
 		t.Errorf("details = %v", res.Details)
+	}
+}
+
+// TestRecursiveDirectDetailsCollected pins the plain path (#16): with
+// CollectDetails the recursive-direct transcript lines are recorded — the
+// stream-json NDJSON the observations parser consumes — while the trailing
+// result object still assembles the reply.
+func TestRecursiveDirectDetailsCollected(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "recbin")
+	script := `#!/bin/sh
+printf '%s\n' \
+'{"type":"assistant","message":{"content":[{"type":"text","text":"step"}]}}' \
+'{"type":"result","result":"ok reply","session_id":"rc-1"}'`
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	spec := &AgentSpec{
+		Name: "rec", Executor: ModeRecursiveDirect, Mode: ModeRecursiveDirect,
+		Env: map[string]string{"RECURSIVE_BIN": bin},
+	}
+	res, err := Run(context.Background(), spec, RunOptions{Message: "hi", CollectDetails: true, Timeout: 10 * time.Second})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Text != "ok reply" {
+		t.Errorf("text = %q", res.Text)
+	}
+	if len(res.Details) != 2 {
+		t.Errorf("details = %v, want the 2 transcript lines", res.Details)
+	}
+}
+
+// TestRecursiveDirectNoDetailsByDefault pins that Details stays empty unless
+// CollectDetails is requested.
+func TestRecursiveDirectNoDetailsByDefault(t *testing.T) {
+	spec := &AgentSpec{
+		Name: "rec", Executor: ModeRecursiveDirect, Mode: ModeRecursiveDirect,
+		Env: map[string]string{"RECURSIVE_BIN": "/bin/sh", "RECURSIVE_WORKSPACE": "."},
+	}
+	// /bin/sh will fail on recursive's argv, but exit fast; the assertion is
+	// on Details being empty in the returned (failed) result — use a script
+	// that ignores argv instead so the run succeeds.
+	spec.Env["RECURSIVE_BIN"] = "/bin/echo" // ignore args, prints nothing
+	res, err := Run(context.Background(), spec, RunOptions{Message: "hi", Timeout: 10 * time.Second})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(res.Details) != 0 {
+		t.Errorf("details = %v, want empty without CollectDetails", res.Details)
 	}
 }
 

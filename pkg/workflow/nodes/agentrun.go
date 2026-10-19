@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jeffkit/plaita-go/internal/runtime"
@@ -152,6 +153,14 @@ func (a *AgentRun) Execute(ctx context.Context) (*workflow.ExecuteResult, error)
 			spec.Env["RECURSIVE_WORKSPACE"] = repo
 		}
 	}
+	// details=true on the recursive executor: switch the CLI to stream-json so
+	// the event stream (tool calls / text turns) is parseable into
+	// observations — the plain single-object output carries no tool events.
+	// plaita-nodes parity: want_details && executor == "recursive" ⇒
+	// RECURSIVE_OUTPUT_FORMAT = "stream-json" (explicit override).
+	if a.Details && spec.Mode == agentproc.ModeRecursiveDirect {
+		spec.Env["RECURSIVE_OUTPUT_FORMAT"] = "stream-json"
+	}
 
 	runResult, err := agentproc.Run(ctx, spec, agentproc.RunOptions{
 		Message:        prompt,
@@ -173,9 +182,127 @@ func (a *AgentRun) Execute(ctx context.Context) (*workflow.ExecuteResult, error)
 		"usage":      usageOrNil(runResult.Usage),
 	}
 	if a.Details {
-		out["details"] = runResult.Details
+		// Python output contract (agent_run.py:644): details=true exposes
+		// `observations` — the parsed {type:"span"/"generation",...} list —
+		// never raw protocol lines. The recursive-direct path always parses
+		// (its reply IS the stream-json transcript); the protocol path only
+		// when the bridge actually emitted lines.
+		if spec.Mode == agentproc.ModeRecursiveDirect || len(runResult.Details) > 0 {
+			out["observations"] = parseStreamDetails(runResult.Details)
+		}
 	}
 	return result(a, out), nil
+}
+
+// detailsCap mirrors plaita-nodes _DETAILS_CAP: an observation ceiling per
+// agent run so a runaway session cannot flood the trace.
+const detailsCap = 50
+
+// parseStreamDetails ports plaita-nodes parse_stream_details: recursive /
+// claude-compatible stream-json NDJSON lines → observations list.
+//
+//   - assistant tool_use blocks pair with the following user tool_result (by
+//     tool_use_id) into {"type":"span","name":"tool:<name>","input","output"};
+//   - assistant text blocks become {"type":"generation","name":"turn:<n>",
+//     "model","output"} (per-turn usage is not reported by this runtime);
+//   - system / stream_event / result lines are skipped; capped at detailsCap.
+func parseStreamDetails(lines []string) []map[string]any {
+	observations := []map[string]any{}
+	pendingTools := map[string]map[string]any{} // tool_use_id → tool_use block
+	turnNo := 0
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			continue
+		}
+		eventType, _ := event["type"].(string)
+		switch eventType {
+		case "assistant":
+			message, _ := event["message"].(map[string]any)
+			content, _ := message["content"].([]any)
+			for _, item := range content {
+				block, ok := item.(map[string]any)
+				if !ok {
+					continue
+				}
+				blockType, _ := block["type"].(string)
+				switch blockType {
+				case "tool_use":
+					id, _ := block["id"].(string)
+					pendingTools[id] = block
+				case "text":
+					text, _ := block["text"].(string)
+					if strings.TrimSpace(text) == "" {
+						continue
+					}
+					turnNo++
+					observations = append(observations, map[string]any{
+						"type": "generation", "name": fmt.Sprintf("turn:%d", turnNo),
+						"model": message["model"], "output": text,
+					})
+				}
+			}
+		case "user":
+			message, _ := event["message"].(map[string]any)
+			content, _ := message["content"].([]any)
+			for _, item := range content {
+				block, ok := item.(map[string]any)
+				if !ok {
+					continue
+				}
+				blockType, _ := block["type"].(string)
+				if blockType != "tool_result" {
+					continue
+				}
+				toolUseID, _ := block["tool_use_id"].(string)
+				toolUse, pending := pendingTools[toolUseID]
+				if !pending {
+					continue
+				}
+				delete(pendingTools, toolUseID)
+				name, _ := toolUse["name"].(string)
+				observations = append(observations, map[string]any{
+					"type": "span", "name": "tool:" + name,
+					"input":  toolUse["input"],
+					"output": toolResultText(block["content"]),
+				})
+			}
+		}
+		if len(observations) >= detailsCap {
+			break
+		}
+	}
+	if len(observations) > detailsCap {
+		observations = observations[:detailsCap]
+	}
+	return observations
+}
+
+// toolResultText renders a tool_result content: a content-block array joins
+// its text blocks with "\n" (plaita parity); anything else passes through.
+func toolResultText(content any) any {
+	blocks, ok := content.([]any)
+	if !ok {
+		return content
+	}
+	texts := make([]string, 0, len(blocks))
+	for _, item := range blocks {
+		block, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		blockType, _ := block["type"].(string)
+		if blockType != "text" {
+			continue
+		}
+		text, _ := block["text"].(string)
+		texts = append(texts, text)
+	}
+	return strings.Join(texts, "\n")
 }
 
 func result(a *AgentRun, v any) *workflow.ExecuteResult {
