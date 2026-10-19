@@ -5,6 +5,7 @@ go 1.24
 require (
 	github.com/Masterminds/semver/v3 v3.2.1
 	github.com/agiledragon/gomonkey/v2 v2.12.0
+	github.com/alicebob/miniredis/v2 v2.40.0
 	github.com/dop251/goja v0.0.0-20241009100908-5f46f2705ca3
 	github.com/fatih/structs v1.1.0
 	github.com/go-ozzo/ozzo-validation v3.6.0+incompatible
@@ -14,10 +15,9 @@ require (
 	github.com/json-iterator/go v1.1.12
 	github.com/maja42/goval v1.3.1
 	github.com/mcuadros/go-lookup v0.0.0-20200831155250-80f87a4fa5ee
+	github.com/redis/go-redis/v9 v9.7.3
 	github.com/samber/lo v1.38.1
-	github.com/senseyeio/duration v0.0.0-20180430131211-7c2a214ada46
 	github.com/sethvargo/go-retry v0.2.4
-	github.com/shopspring/decimal v1.3.1
 	github.com/sourcegraph/conc v0.3.0
 	github.com/spf13/cast v1.5.0
 	github.com/stretchr/testify v1.8.4
@@ -42,6 +42,7 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
+	github.com/yuin/gopher-lua v1.1.1 // indirect
 	go.uber.org/atomic v1.10.0 // indirect
 	go.uber.org/multierr v1.9.0 // indirect
 	golang.org/x/exp v0.0.0-20220303212507-bbda1eaf7a17 // indirect
