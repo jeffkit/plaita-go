@@ -177,22 +177,6 @@ func stash(meta map[string]string, key string, v any) {
 	}
 }
 
-func stashList(meta map[string]string, key string, v any) error {
-	switch l := v.(type) {
-	case []any:
-		parts := make([]string, 0, len(l))
-		for _, item := range l {
-			parts = append(parts, fmt.Sprint(item))
-		}
-		stash(meta, key, strings.Join(parts, ","))
-	case string:
-		stash(meta, key, l)
-	default:
-		return fmt.Errorf("%s must be an array", key)
-	}
-	return nil
-}
-
 func foldKey(m map[string]any, from, to string) {
 	if v, ok := m[from]; ok {
 		if _, exists := m[to]; !exists {

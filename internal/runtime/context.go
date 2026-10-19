@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jinzhu/copier"
 
@@ -28,6 +29,13 @@ type Context struct {
 	ExecuteNodeErrors     map[string]any  `json:"errors"`
 	EnvVariables          map[string]any  `json:"env_variables"`
 	GlobalVariables       map[string]any  `json:"global_variables"`
+
+	// FlowDeadline is the deadline imposed by the current flow's own timeout
+	// budget. It stays zero for flows without an explicit timeout. It is used
+	// to attribute a context deadline error to the flow budget instead of the
+	// node budget (plaita FLOW_ERROR vs NODE_ERROR); it is runtime bookkeeping
+	// and never serialized.
+	FlowDeadline time.Time `json:"-"`
 }
 
 func newContext() *Context {
@@ -39,6 +47,13 @@ func newContext() *Context {
 		EnvVariables:       make(map[string]any),
 		GlobalVariables:    make(map[string]any),
 	}
+}
+
+// NewContext returns a fresh workflow runtime context with empty per-execution
+// state ($INPUT/$NODE/$ERROR/current node). Use NewExecutionRuntimeContext to
+// seed one with child-flow linkage.
+func NewContext() *Context {
+	return newContext()
 }
 
 // WithWorkflowInput sets the workflow input in workflow runtime context and return new context.
@@ -58,21 +73,58 @@ func (c *Context) GetWorkflowInput() any {
 	return c.WorkflowInput
 }
 
-// WithEnvVariablesContext sets the env variables in context.
-func (c *Context) WithEnvVariablesContext() {
-	if c.EnvVariables == nil {
-		c.EnvVariables = map[string]any{}
-	}
-	environ := os.Environ()
-	for i := 0; i < len(environ); i++ {
-		e := strings.Split(environ[i], "=")
-		if len(e) < 2 {
-			continue
+// WithEnvVariablesContext populates the env variables from the process
+// environment. With an allowlist, only the listed keys are copied (plaita
+// 0.5.0 allowlist model): keys missing from the environment are silently
+// dropped (typos must not crash the flow) and values keep everything after
+// the first '=' (SplitN, not Split).
+//
+// The zero-argument legacy form copies the FULL process environment — the
+// workflow engine never uses it (Workflow.Execute assembles $ENV through the
+// ExposeEnv allowlist); it exists only for callers that explicitly want the
+// whole environment.
+func (c *Context) WithEnvVariablesContext(allowed ...string) {
+	env := map[string]any{}
+	if len(allowed) > 0 {
+		want := make(map[string]struct{}, len(allowed))
+		for _, k := range allowed {
+			want[k] = struct{}{}
 		}
-		c.mu.Lock()
-		c.EnvVariables[e[0]] = e[1]
-		c.mu.Unlock()
+		for _, entry := range os.Environ() {
+			k, v, ok := strings.Cut(entry, "=")
+			if !ok {
+				continue
+			}
+			if _, hit := want[k]; hit {
+				env[k] = v
+			}
+		}
+	} else {
+		for _, entry := range os.Environ() {
+			k, v, ok := strings.Cut(entry, "=")
+			if !ok {
+				continue
+			}
+			env[k] = v
+		}
 	}
+	c.mu.Lock()
+	c.EnvVariables = env
+	c.mu.Unlock()
+}
+
+// WithEnvVariables replaces the env variables in context with the given map.
+// It is the inheritance path: a child flow without its own exposeEnv
+// declaration sees exactly the (already filtered) env of its parent
+// execution (plaita#141).
+func (c *Context) WithEnvVariables(variables map[string]any) {
+	env := make(map[string]any, len(variables))
+	for k, v := range variables {
+		env[k] = v
+	}
+	c.mu.Lock()
+	c.EnvVariables = env
+	c.mu.Unlock()
 }
 
 // WithParentWorkflowContext sets the parent workflow context in context.
@@ -183,11 +235,29 @@ func WithWorkflowRuntimeContext(ctx context.Context, workflowRuntimeContext *Con
 }
 
 // WorkflowRuntimeContext returns the workflow runtime context from context.
+// A nil context (or one without a runtime context) yields a fresh empty one
+// instead of panicking — $PARENT on a root flow evaluates against this empty
+// context and must not crash (see evaluator's parent fallback).
 func WorkflowRuntimeContext(ctx context.Context) *Context {
+	if ctx == nil {
+		return newContext()
+	}
 	if runtimeCtx, _ := ctx.Value(workflowRuntimeContextContextKey).(*Context); runtimeCtx != nil {
 		return runtimeCtx
 	}
 	return newContext()
+}
+
+// LookupWorkflowRuntimeContext returns the workflow runtime context carried by
+// ctx and reports whether one was actually present. Callers that need to
+// distinguish "no runtime context" from "empty runtime context" (flow
+// execution setup) must use this instead of WorkflowRuntimeContext.
+func LookupWorkflowRuntimeContext(ctx context.Context) (*Context, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	runtimeCtx, _ := ctx.Value(workflowRuntimeContextContextKey).(*Context)
+	return runtimeCtx, runtimeCtx != nil
 }
 
 // ResetWorkflowRuntimeContext resets the workflow runtime context from context.
@@ -195,7 +265,37 @@ func ResetWorkflowRuntimeContext(ctx context.Context) context.Context {
 	return context.WithValue(ctx, workflowRuntimeContextContextKey, newContext())
 }
 
-// CloneContext deep clone the workflow runtime context from context.
+// NewExecutionRuntimeContext returns a fresh runtime context for a new flow
+// execution. Child-flow state carried by ctx ($PARENT linkage and $GLOBAL)
+// is preserved — child/loop/parallel sub-flows keep their parent chain —
+// while the per-execution state ($INPUT/$NODE/$ERROR/current node) starts
+// clean:
+//
+//   - ParentWorkflowContext points at the parent execution context found in
+//     ctx (its runtime context), so $PARENT.<...> resolves in the flow that
+//     spawned this execution; a root flow has no parent and $PARENT stays nil.
+//   - The parent's global variables are copied in ($GLOBAL falls back to the
+//     parent in plaita; the copy is the Go encoding of that fallback).
+func NewExecutionRuntimeContext(ctx context.Context) *Context {
+	fresh := newContext()
+	parent, ok := LookupWorkflowRuntimeContext(ctx)
+	if !ok {
+		return fresh
+	}
+	if parent.ParentWorkflowContext != nil {
+		fresh.ParentWorkflowContext = parent.ParentWorkflowContext
+	}
+	if parentRuntime := WorkflowRuntimeContext(parent.ParentWorkflowContext); parentRuntime != nil {
+		fresh.WithGlobalVariables(parentRuntime.GetGlobalVariables())
+	}
+	return fresh
+}
+
+// CloneContext deep clone the workflow runtime context from context. The
+// clone's parent linkage points at the SOURCE execution (ctx): a parallel
+// branch is a child of the flow that contains the parallel node, so
+// $PARENT inside the branch must resolve against that flow, matching
+// plaita's child-execution parent chain.
 func CloneContext(ctx context.Context) context.Context {
 	runtimeCtx := WorkflowRuntimeContext(ctx)
 	newRuntimeCtx := newContext()
@@ -205,7 +305,8 @@ func CloneContext(ctx context.Context) context.Context {
 	_ = copier.CopyWithOption(&newRuntimeCtx.CurrentNodeContext, runtimeCtx.CurrentNodeContext, copyOpts)
 	_ = copier.CopyWithOption(&newRuntimeCtx.EnvVariables, runtimeCtx.EnvVariables, copyOpts)
 	_ = copier.CopyWithOption(&newRuntimeCtx.GlobalVariables, runtimeCtx.GlobalVariables, copyOpts)
-	newRuntimeCtx.ParentWorkflowContext = runtimeCtx.ParentWorkflowContext
+	newRuntimeCtx.ParentWorkflowContext = ctx
 	newRuntimeCtx.LastNodeID = runtimeCtx.LastNodeID
+	newRuntimeCtx.FlowDeadline = runtimeCtx.FlowDeadline
 	return WithWorkflowRuntimeContext(ctx, newRuntimeCtx)
 }

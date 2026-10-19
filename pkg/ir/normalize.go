@@ -3,8 +3,12 @@ package ir
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
+
+	"github.com/jeffkit/plaita-go/pkg/duration"
+	"github.com/jeffkit/plaita-go/pkg/workflow"
 )
 
 // normalizeDoc rewrites a deployment-form flow document in place into the
@@ -37,13 +41,18 @@ func normalizeDoc(doc map[string]any, sc scope) error {
 		}
 	}
 
-	// exposeEnv has no engine field yet; keep it observable via metadata.
-	for _, k := range []string{"exposeEnv", "expose_env"} {
-		if v, ok := doc[k]; ok {
-			if err := stashList(meta, "exposeEnv", v); err != nil {
-				return fmt.Errorf("ir: flow %q: %v", doc["id"], err)
-			}
-			delete(doc, k)
+	// $ENV allowlist: plaita 0.5.0 allowlist model (fail-closed). The engine
+	// carries it as Workflow.ExposeEnv; illegal entries ("*", blank,
+	// whitespace-padded, non-string) are rejected at load — earlier than
+	// Python, which raises at run time.
+	foldKey(doc, "expose_env", "exposeEnv")
+	if v, ok := doc["exposeEnv"]; ok {
+		list, err := asStringList(v)
+		if err != nil {
+			return fmt.Errorf("ir: flow %q: exposeEnv: %v", doc["id"], err)
+		}
+		if err := workflow.ValidateExposeEnv(list); err != nil {
+			return fmt.Errorf("ir: flow %q: %v", doc["id"], err)
 		}
 	}
 	doc["metadata"] = meta
@@ -235,7 +244,8 @@ func translateAgentRun(n map[string]any) error {
 }
 
 // normalizeHandler canonicalizes an error/timeout handler: strategy spelling,
-// plaita-only fields (code/message) moved to metadata, retry spelling folded.
+// plaita error_code/error_message folded into the engine's code/message
+// handler fields, retry spelling folded.
 func normalizeHandler(n map[string]any, key string, meta map[string]string, recoverable bool) error {
 	raw, ok := n[key]
 	if !ok {
@@ -250,14 +260,11 @@ func normalizeHandler(n map[string]any, key string, meta map[string]string, reco
 	if s, ok := h["strategy"].(string); ok && s == "continue_with" {
 		h["strategy"] = "continue-with"
 	}
-	// plaita error_code/error_message (aliases code/message) have no engine
-	// counterpart; preserve them as metadata instead of dropping.
-	for _, pair := range [][2]string{{"error_code", "errorCode"}, {"error_message", "errorMessage"}, {"code", "errorCode"}, {"message", "errorMessage"}} {
-		if v, ok := h[pair[0]]; ok {
-			stash(meta, pair[1], v)
-			delete(h, pair[0])
-		}
-	}
+	// plaita error_code/error_message (aliases code/message) fold into the
+	// handler object: the engine policy structs carry them (abort uses them
+	// as the flow error code/message — plaita NodeExecutionError).
+	foldKey(h, "error_code", "code")
+	foldKey(h, "error_message", "message")
 	return nil
 }
 
@@ -497,8 +504,11 @@ func translateEnd(n map[string]any) error {
 }
 
 // normalizeProperty folds plaita property spellings into the engine schema,
-// recursively for object properties.
+// recursively for object properties. Every property of a deployed flow is
+// marked strict: value validation uses the plaita io.match model (no cast
+// coercion). Properties built directly as Go structs keep the lenient model.
 func normalizeProperty(p map[string]any) error {
+	p["strict"] = true
 	if _, has := p["dataType"]; !has {
 		if t, ok := p["type"]; ok {
 			p["dataType"] = t
@@ -529,6 +539,28 @@ func normalizeProperty(p map[string]any) error {
 		}
 	}
 	delete(p, "children")
+	// plaita Property.required (io.py _handle_required): bool form folds into
+	// is_required; list form marks the named children required.
+	switch req := p["required"].(type) {
+	case bool:
+		if _, has := p["isRequired"]; !has {
+			p["isRequired"] = req
+		}
+	case []any:
+		props, _ := p["properties"].(map[string]any)
+		for _, name := range req {
+			s, ok := name.(string)
+			if !ok || props == nil {
+				continue
+			}
+			if child, ok := props[s].(map[string]any); ok {
+				if _, has := child["isRequired"]; !has {
+					child["isRequired"] = true
+				}
+			}
+		}
+	}
+	delete(p, "required")
 	if props, ok := p["properties"].(map[string]any); ok {
 		for _, v := range props {
 			if m, ok := v.(map[string]any); ok {
@@ -541,8 +573,30 @@ func normalizeProperty(p map[string]any) error {
 	return nil
 }
 
+// asStringList converts a JSON-decoded array of strings; non-string entries
+// are rejected (plaita expose_env raises on non-str entries too).
+func asStringList(v any) ([]string, error) {
+	l, ok := v.([]any)
+	if !ok {
+		return nil, fmt.Errorf("must be an array of strings, got %T", v)
+	}
+	out := make([]string, 0, len(l))
+	for _, item := range l {
+		s, ok := item.(string)
+		if !ok {
+			return nil, fmt.Errorf("must be an array of strings, got element %T", item)
+		}
+		out = append(out, s)
+	}
+	return out, nil
+}
+
 // normalizeTimeout converts plaita timeout spellings to ISO 8601.
-// Accepted: "" (absent), millisecond number / numeric string, "PT..." string.
+// Accepted: "" / nil (absent = no budget), millisecond number / numeric
+// string, "PT..." ISO string. An explicit 0 ("PT0S") is a zero budget —
+// the strictest limit, never "no timeout" (plaita#138); negative and
+// non-finite numbers are rejected instead of silently degrading to
+// unlimited (plaita#139).
 func normalizeTimeout(v any) (string, error) {
 	switch t := v.(type) {
 	case nil:
@@ -553,34 +607,49 @@ func normalizeTimeout(v any) (string, error) {
 			return "", nil
 		}
 		if strings.HasPrefix(s, "P") {
+			// validate the ISO spelling here so a bad budget fails at load,
+			// not at execute
+			if _, err := duration.ParseISO8601(s); err != nil {
+				return "", fmt.Errorf("timeout %q: %v", t, err)
+			}
 			return s, nil
 		}
 		ms, err := strconv.ParseFloat(s, 64)
 		if err != nil {
 			return "", fmt.Errorf("timeout %q is neither ISO 8601 nor milliseconds", t)
 		}
-		return millisToISO(ms), nil
+		return normalizeMillis(ms)
 	case json.Number:
 		ms, err := t.Float64()
 		if err != nil {
 			return "", fmt.Errorf("timeout %v is not a number", v)
 		}
-		return millisToISO(ms), nil
+		return normalizeMillis(ms)
 	case int:
-		return millisToISO(float64(t)), nil
+		return normalizeMillis(float64(t))
 	case int64:
-		return millisToISO(float64(t)), nil
+		return normalizeMillis(float64(t))
 	case float64:
-		return millisToISO(t), nil
+		return normalizeMillis(t)
 	default:
 		return "", fmt.Errorf("timeout has unsupported type %T", v)
 	}
 }
 
-func millisToISO(ms float64) string {
-	if ms <= 0 {
-		return ""
+func normalizeMillis(ms float64) (string, error) {
+	if math.IsInf(ms, 0) || math.IsNaN(ms) {
+		return "", fmt.Errorf("timeout %v must be a finite number", ms)
 	}
+	if ms < 0 {
+		return "", fmt.Errorf("timeout %v must be a non-negative number", ms)
+	}
+	if ms == 0 {
+		return "PT0S", nil
+	}
+	return millisToISO(ms), nil
+}
+
+func millisToISO(ms float64) string {
 	if ms == float64(int64(ms)) && int64(ms)%1000 == 0 {
 		return "PT" + strconv.FormatInt(int64(ms)/1000, 10) + "S"
 	}

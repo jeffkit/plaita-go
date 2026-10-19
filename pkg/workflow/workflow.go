@@ -4,11 +4,15 @@ package workflow
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
+	"strings"
+	"time"
 
 	"github.com/fatih/structs"
 	validation "github.com/go-ozzo/ozzo-validation"
 	"github.com/samber/lo"
+	"github.com/sethvargo/go-retry"
 
 	"github.com/jeffkit/plaita-go/internal/errs"
 	"github.com/jeffkit/plaita-go/internal/runtime"
@@ -82,8 +86,14 @@ type Workflow struct {
 	OutputType          Property                     `json:"outputType,omitempty"`     // workflow输出数据格式
 	ErrorHandlePolicy   RecoverableErrorHandlePolicy `json:"errorHandler,omitempty"`   // 错误处理策略
 	TimeoutHandlePolicy TimeoutHandlePolicy          `json:"timeoutHandler,omitempty"` // 超时处理策略
-	Metadata            map[string]string            `json:"metadata,omitempty"`       // workflow元数据
+	Metadata            map[string]any               `json:"metadata,omitempty"`       // workflow元数据
 	Context             Context                      `json:"context,omitempty"`        // workflow上下文配置
+	// ExposeEnv is the $ENV allowlist (plaita 0.5.0 allowlist model,
+	// fail-closed): only the listed environment variables are visible to flow
+	// expressions. An empty/absent list exposes nothing. A child flow without
+	// its own declaration inherits the parent execution's (already filtered)
+	// env. Wildcards ("*"), blank or whitespace-padded entries are rejected.
+	ExposeEnv []string `json:"exposeEnv,omitempty"`
 }
 
 // Validate validates the workflow.
@@ -96,6 +106,10 @@ func (f *Workflow) Validate() error {
 		return err
 	}
 
+	if err := ValidateExposeEnv(f.ExposeEnv); err != nil {
+		return err
+	}
+
 	if _, ok := f.findStartNode(); !ok {
 		return ErrStartNodeNotFound
 	}
@@ -104,6 +118,18 @@ func (f *Workflow) Validate() error {
 		return ErrEndNodeNotFound
 	}
 
+	return nil
+}
+
+// ValidateExposeEnv validates a $ENV allowlist (plaita _safe_environment
+// rules): entries must be exact environment variable names — no wildcard,
+// no blank, no whitespace padding. Go's []string cannot carry non-strings.
+func ValidateExposeEnv(allowed []string) error {
+	for _, k := range allowed {
+		if k == "" || strings.TrimSpace(k) != k || strings.Contains(k, "*") {
+			return fmt.Errorf("exposeEnv contains invalid entry %q: no wildcards, no blank or whitespace-padded keys; list exact environment variable names", k)
+		}
+	}
 	return nil
 }
 
@@ -136,22 +162,22 @@ func (f *Workflow) Execute(ctx context.Context, args ExecuteArgs) (any, error) {
 		var cancelFunc context.CancelFunc
 		ctx, cancelFunc = context.WithTimeout(ctx, f.Timeout.TimeDuration())
 		defer cancelFunc()
-
-		// TODO(scottzhlin): 计算剩余的超时时间并存入context向下传递 node的超时时间应该受到workflow超时时间的影响
 	}
 
-	ctx = runtime.ResetWorkflowRuntimeContext(ctx)
-	ctx = runtime.WithWorkflowInput(ctx, args)
-	runtimeCtx := runtime.WorkflowRuntimeContext(ctx)
-	runtimeCtx.WithEnvVariablesContext()
-	globalVariables := f.Context.ParseGlobal()
-	runtimeCtx.WithGlobalVariables(globalVariables)
+	ctx = f.prepareExecutionRuntimeContext(ctx, args)
 
 	var result any
 	var err error
 	retryFunc := func(ctx context.Context) error {
 		triggerFlowStart(ctx, f)
-		result, err = f.execute(ctx, args)
+		// An explicit zero budget (or an already-expired caller context) fails
+		// immediately instead of letting ctx-ignoring node bodies run to
+		// completion — plaita treats 0 as the strictest budget (plaita#138).
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			result, err = nil, ctxErr
+		} else {
+			result, err = f.execute(ctx, args)
+		}
 		triggerFlowEnd(ctx, f, result, err)
 		if err == nil {
 			return nil
@@ -165,7 +191,60 @@ func (f *Workflow) Execute(ctx context.Context, args ExecuteArgs) (any, error) {
 		return RetryableError(err)
 	}
 
-	return result, f.ErrorHandlePolicy.Retrier().Do(ctx, retryFunc)
+	// flow-level retry stays a cheap engine-level re-execution (10ms fixed);
+	// the plaita exponential backoff and retry classification live at the
+	// node level (RecoverableErrorHandlePolicy.Retrier / executeNode).
+	flowRetrier := newLowDelayRetrier(
+		retry.WithMaxRetries(uint64(f.ErrorHandlePolicy.RetryTimes), retry.NewConstant(10*time.Millisecond)))
+	return result, flowRetrier.Do(ctx, retryFunc)
+}
+
+// prepareExecutionRuntimeContext builds the runtime context for one flow
+// execution (both Execute and GetDebugExecute):
+//
+//   - a FRESH context replaces any inherited one, but the parent execution
+//     found in ctx is kept reachable as $PARENT and its $GLOBAL/$ENV are
+//     inherited (child/loop/parallel sub-flow semantics, plaita
+//     get_global_variable fallback + plaita#141 expose_env inheritance);
+//   - $ENV is built from the process environment through the ExposeEnv
+//     allowlist — an undeclared allowlist (nil) inherits the parent
+//     execution's filtered env, a declared one re-filters os.Environ, and
+//     with neither $ENV stays empty (fail-closed);
+//   - the flow's own globals override the inherited ones.
+func (f *Workflow) prepareExecutionRuntimeContext(ctx context.Context, args ExecuteArgs) context.Context {
+	fresh := runtime.NewExecutionRuntimeContext(ctx)
+	_, hadParent := runtime.LookupWorkflowRuntimeContext(ctx)
+	ctx = runtime.WithWorkflowRuntimeContext(ctx, fresh)
+	ctx = runtime.WithWorkflowInput(ctx, args)
+	fresh.WithGlobalVariables(f.Context.ParseGlobal())
+
+	// $ENV assembly (plaita 0.5.0 allowlist model, fail-closed):
+	//   - declared allowlist (non-empty) → filter os.Environ through it;
+	//   - declared EMPTY allowlist → expose nothing;
+	//   - undeclared (nil) → inherit the parent execution's filtered env
+	//     (plaita#141), or expose nothing at the root.
+	switch {
+	case f.ExposeEnv != nil && len(f.ExposeEnv) > 0:
+		fresh.WithEnvVariablesContext(f.ExposeEnv...)
+	case f.ExposeEnv != nil:
+		fresh.WithEnvVariables(nil)
+	case hadParent && fresh.ParentWorkflowContext != nil:
+		fresh.WithEnvVariables(runtime.WorkflowRuntimeContext(fresh.ParentWorkflowContext).EnvVariables)
+	default:
+		fresh.WithEnvVariables(nil)
+	}
+
+	// own timeout budget → record its deadline for FLOW/NODE timeout
+	// attribution; without an own budget the enclosing flow's deadline (if
+	// any) stays authoritative — the context chain already enforces the min.
+	if !f.Timeout.IsZero() {
+		if dl, ok := ctx.Deadline(); ok {
+			fresh.FlowDeadline = dl
+		}
+	} else if fresh.ParentWorkflowContext != nil {
+		fresh.FlowDeadline = runtime.WorkflowRuntimeContext(fresh.ParentWorkflowContext).FlowDeadline
+	}
+	return ctx
 }
 
 func (f *Workflow) execute(ctx context.Context, _ ExecuteArgs) (result any, err error) {
@@ -261,12 +340,7 @@ func (f *Workflow) GetDebugExecute(ctx context.Context, args ExecuteArgs) (*Exec
 		return nil, err
 	}
 
-	ctx = runtime.ResetWorkflowRuntimeContext(ctx)
-	ctx = runtime.WithWorkflowInput(ctx, args)
-	runtimeCtx := runtime.WorkflowRuntimeContext(ctx)
-	runtimeCtx.WithEnvVariablesContext()
-	globalVariables := f.Context.ParseGlobal()
-	runtimeCtx.WithGlobalVariables(globalVariables)
+	ctx = f.prepareExecutionRuntimeContext(ctx, args)
 
 	executor := NewExecutor()
 	f.ExecuteGenerator(ctx, executor)
@@ -305,10 +379,9 @@ func (f *Workflow) SetGlobalVariable(key string, value any) {
 }
 
 func (f *Workflow) executeNode(ctx context.Context, node Node) (result *ExecuteResult, err error) {
-	timeout := node.GetTimeout().TimeDuration()
-	if timeout > 0 {
+	if nodeTimeout := node.GetTimeout(); !nodeTimeout.IsZero() {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, node.GetTimeout().TimeDuration())
+		ctx, cancel = context.WithTimeout(ctx, nodeTimeout.TimeDuration())
 		defer cancel()
 	}
 
@@ -316,7 +389,14 @@ func (f *Workflow) executeNode(ctx context.Context, node Node) (result *ExecuteR
 		runtimeCtx := runtime.WorkflowRuntimeContext(ctx)
 		runtimeCtx.ResetCurrentNodeContext()
 		triggerNodeStart(ctx, f, node)
-		result, err = node.Execute(ctx)
+		// fail fast on an expired context: a node body that ignores ctx must
+		// not run to completion once the budget is gone (plaita runs every
+		// node under the remaining budget and raises NodeTimeoutError).
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			result, err = nil, ctxErr
+		} else {
+			result, err = node.Execute(ctx)
+		}
 		args := node.MoreInfoAfterExecute(ctx)
 		ret := any(nil)
 		if result != nil {
@@ -327,10 +407,21 @@ func (f *Workflow) executeNode(ctx context.Context, node Node) (result *ExecuteR
 			return nil
 		}
 		if contextTimeoutError(err) {
+			if flowBudgetBinding(runtimeCtx, ctx) {
+				// The flow-level budget is the binding constraint — this is a
+				// FLOW_ERROR, not the node's timeout to handle: bubble the
+				// error up so the flow's timeout policy decides.
+				return err
+			}
 			timeoutHandlePolicy := node.GetTimeoutHandlePolicy()
 			defaultValue, handledErr := timeoutHandlePolicy.Handle(err)
 			result = &ExecuteResult{Result: defaultValue, NextNode: node.NextNode()}
 			return handledErr
+		}
+		// plaita node-F2: deterministic errors (1001 request generation, the
+		// ValueError class) never retry; transient ones do.
+		if !IsRetryableError(err) {
+			return err
 		}
 		return RetryableError(err)
 	}
@@ -353,6 +444,23 @@ func (f *Workflow) executeNode(ctx context.Context, node Node) (result *ExecuteR
 		return result, finalErr
 	}
 	return result, nil
+}
+
+// flowBudgetBinding reports whether the context-deadline error was caused by
+// the flow-level budget rather than the node's own: the recorded flow
+// deadline has passed and the node ctx has no strictly tighter deadline.
+// (plaita: time_limit_by_flow → NodeTimeoutError with FLOW_ERROR type.)
+func flowBudgetBinding(runtimeCtx *runtime.Context, ctx context.Context) bool {
+	if runtimeCtx == nil || runtimeCtx.FlowDeadline.IsZero() {
+		return false
+	}
+	if time.Now().Before(runtimeCtx.FlowDeadline) {
+		return false
+	}
+	if dl, ok := ctx.Deadline(); ok && dl.Before(runtimeCtx.FlowDeadline) {
+		return false
+	}
+	return true
 }
 
 func (f *Workflow) findStartNode() (Node, bool) {
