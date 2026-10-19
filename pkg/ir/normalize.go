@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/jeffkit/plaita-go/pkg/duration"
+	"github.com/jeffkit/plaita-go/pkg/sandbox"
 )
 
 // normalizeDoc rewrites a deployment-form flow document in place into the
@@ -227,15 +228,43 @@ func normalizeNode(n map[string]any) error {
 }
 
 // translateAgentRun folds the agentrun node's camel spellings into the
-// snake field names plaita-nodes defines, and rejects the sandbox branch
-// (workspace) — this engine has no sandbox driver, so the flow must not
-// load instead of silently running on the host.
+// snake field names plaita-nodes defines, and validates the split between
+// the host path (repo) and the sandbox path (workspace):
+//
+//   - workspace and repo are mutually exclusive;
+//   - a literal workspace name must exist in the infra registry
+//     (.plaita/sandboxes.json, fail-closed — never created on the fly);
+//   - expression workspaces cannot be checked statically; the runtime branch
+//     applies the same fail-closed guard after evaluation.
 func translateAgentRun(n map[string]any) error {
 	foldKey(n, "timeoutSecs", "timeout_secs")
 	foldKey(n, "dryRun", "dry_run")
-	if v := firstAny(n, "workspace"); v != nil && v != "" {
-		return fmt.Errorf("agentrun workspace (sandbox branch) is not supported by this engine; " +
-			"use repo for host-side runs or run this flow on the plaita runtime")
+
+	workspace, present := n["workspace"]
+	if !present || workspace == nil {
+		return nil
+	}
+	workspaceName, ok := workspace.(string)
+	if !ok {
+		return fmt.Errorf("agentrun workspace must be a string (registry name or expression)")
+	}
+	workspaceName = strings.TrimSpace(workspaceName)
+	if workspaceName == "" {
+		return nil
+	}
+	if repo := firstAny(n, "repo"); repo != nil && repo != "" {
+		return fmt.Errorf("agentrun workspace and repo are mutually exclusive")
+	}
+	if sandbox.IsDynamicExpression(workspaceName) {
+		return nil
+	}
+	specs, err := sandbox.LoadSandboxes("")
+	if err != nil {
+		return fmt.Errorf("agentrun workspace %q: %v", workspaceName, err)
+	}
+	if _, registered := specs[workspaceName]; !registered {
+		return fmt.Errorf("agentrun workspace %q is not registered (fail-closed): "+
+			"define it in .plaita/sandboxes.json", workspaceName)
 	}
 	return nil
 }

@@ -3,6 +3,7 @@ package ir
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -316,6 +317,37 @@ func TestLoadAgentRunRejects(t *testing.T) {
 	]}`))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "agentrun")
+}
+
+// Workspace is now a supported branch; a literal name must be registered in
+// the infra registry (fail-closed), while an expression is checked at runtime
+// after evaluation.
+func TestLoadAgentRunWorkspaceRegistry(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("PLAITA_HOME", home)
+	require.NoError(t, os.WriteFile(filepath.Join(home, "sandboxes.json"), []byte(`{
+		"sandboxes": {
+			"sbx": {"driver": "docker", "image": "alpine@sha256:deadbeef"}
+		}
+	}`), 0o600))
+
+	flow := func(workspace string) []byte {
+		return []byte(`{"flow_id":"ws_flow","nodes":[
+			{"type":"start","id":"s","next":"r"},
+			{"type":"agentrun","id":"r","agent":"a","prompt":"p","workspace":"` + workspace + `","next":"e"},
+			{"type":"end","id":"e","resultType":"success","output":"$NODE.r.text"}
+		]}`)
+	}
+
+	_, err := Load(flow("sbx"))
+	require.NoError(t, err, "a registered workspace must load")
+
+	_, err = Load(flow("nope"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not registered")
+
+	_, err = Load(flow("$INPUT.ws"))
+	require.NoError(t, err, "dynamic workspace names are validated at runtime")
 }
 
 // plaita-nodes self-contained nodes load through the same contract: camel
