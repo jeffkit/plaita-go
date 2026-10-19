@@ -19,6 +19,9 @@ func TestConfigShadowDerivation(t *testing.T) {
 	if cfg.DLQKey != ShadowKeyPrefix+":flow:queue:dlq" {
 		t.Fatalf("dlq = %q", cfg.DLQKey)
 	}
+	if cfg.DispatchLedgerKey != ShadowKeyPrefix+":dispatch:ledger" {
+		t.Fatalf("ledger = %q", cfg.DispatchLedgerKey)
+	}
 }
 
 // TestConfigDefaults: protocol defaults (§1.2).
@@ -38,6 +41,12 @@ func TestConfigDefaults(t *testing.T) {
 	}
 	if cfg.DLQKey != cfg.QueueName+":dlq" || cfg.DLQMaxLen != 1000 {
 		t.Fatalf("dlq defaults drifted: %q %d", cfg.DLQKey, cfg.DLQMaxLen)
+	}
+	if cfg.DispatchLedgerKey != DefaultKeyPrefix+":dispatch:ledger" {
+		t.Fatalf("dispatch ledger default drifted: %q", cfg.DispatchLedgerKey)
+	}
+	if cfg.DispatcherID == "" {
+		t.Fatal("dispatcher id default must be non-empty")
 	}
 	if cfg.EventTTLSeconds != 7*86400 || cfg.StateTTLDays != 30 {
 		t.Fatalf("ttl defaults drifted: %d %d", cfg.EventTTLSeconds, cfg.StateTTLDays)
@@ -68,6 +77,9 @@ func TestApplyShadow(t *testing.T) {
 	cfg.ApplyShadow()
 	if cfg.KeyPrefix != ShadowKeyPrefix || cfg.QueueName != ShadowKeyPrefix+":flow:queue" {
 		t.Fatalf("shadow switch incomplete: %+v", cfg)
+	}
+	if cfg.DispatchLedgerKey != ShadowKeyPrefix+":dispatch:ledger" {
+		t.Fatalf("shadow ledger key = %q", cfg.DispatchLedgerKey)
 	}
 }
 

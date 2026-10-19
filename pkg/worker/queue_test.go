@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // TestQueueMalformedPayloadDLQ: non-JSON payload → DLQ + ack at the parse
@@ -112,30 +114,47 @@ func TestQueueOverschemaDLQ(t *testing.T) {
 	})
 }
 
+// seedPending delivers one message to a foreign consumer so it lands in the
+// group PEL, then lets it age past the claim threshold. Queue-layer tests use
+// this instead of ProcessOne: the worker loop would hand a foreign-target task
+// over (phase 2) rather than exercising the reclaim path directly.
+func seedPending(t *testing.T, rdb *redis.Client, cfg *Config, payload map[string]any) string {
+	t.Helper()
+	id := enqueueTask(t, rdb, cfg, payload, "")
+	res := rdb.XReadGroup(context.Background(), &redis.XReadGroupArgs{
+		Group:    cfg.ConsumerGroup,
+		Consumer: "seed-consumer",
+		Streams:  []string{cfg.QueueName, ">"},
+		Count:    1,
+	}).Val()
+	if len(res) != 1 || len(res[0].Messages) != 1 {
+		t.Fatalf("seed XREADGROUP failed: %v", res)
+	}
+	return id
+}
+
 // TestQueueMaxDeliveriesDLQ: reclaim path with an exhausted delivery budget →
 // guarded dead-letter (§2.4).
 func TestQueueMaxDeliveriesDLQ(t *testing.T) {
-	w, rdb, _, cfg := newTestWorker(t)
+	_, rdb, _, cfg := newTestWorker(t)
 	cfg.MaxDeliveries = 1
 	ctx := context.Background()
+	q := NewTaskQueue(rdb, cfg, silentLogger{})
+	if err := q.EnsureGroup(ctx); err != nil {
+		t.Fatal(err)
+	}
 
 	executionID := newExecutionID()
-	payload := baseStartPayload(executionID)
-	payload["target_instance_id"] = "someone-else" // MVP: leaves pending untouched
-	enqueueTask(t, rdb, cfg, payload, "")
-
-	// First round delivers (count=1) but the target check leaves it pending.
-	if _, err := w.ProcessOne(ctx); err != nil {
-		t.Fatalf("ProcessOne first round: %v", err)
-	}
-	if n := pendingCount(t, rdb, cfg); n != 1 {
-		t.Fatalf("PEL = %d, want 1", n)
-	}
+	seedPending(t, rdb, cfg, baseStartPayload(executionID))
 
 	// Age past the claim threshold → reclaim sees delivery_count=1 >= max=1.
 	time.Sleep(120 * time.Millisecond) // real-time idle (miniredis PEL idle ignores FastForward)
-	if _, err := w.ProcessOne(ctx); err != nil {
-		t.Fatalf("ProcessOne reclaim round: %v", err)
+	delivery, err := q.Read(ctx)
+	if err != nil {
+		t.Fatalf("queue read: %v", err)
+	}
+	if delivery != nil {
+		t.Fatalf("expected the ceiling to dead-letter, got a delivery: %+v", delivery.Task)
 	}
 	reason, entry := dlqReason(t, rdb, cfg)
 	if reason != ReasonMaxDeliveries {
@@ -152,23 +171,25 @@ func TestQueueMaxDeliveriesDLQ(t *testing.T) {
 // TestReclaimLeaseGuard: a pending message whose execution lease is still
 // active is never reclaimed (§2.4 #47).
 func TestReclaimLeaseGuard(t *testing.T) {
-	w, rdb, _, cfg := newTestWorker(t)
+	_, rdb, _, cfg := newTestWorker(t)
 	ctx := context.Background()
+	q := NewTaskQueue(rdb, cfg, silentLogger{})
+	if err := q.EnsureGroup(ctx); err != nil {
+		t.Fatal(err)
+	}
 
 	executionID := newExecutionID()
-	payload := baseStartPayload(executionID)
-	payload["target_instance_id"] = "someone-else"
-	enqueueTask(t, rdb, cfg, payload, "")
-
-	if _, err := w.ProcessOne(ctx); err != nil {
-		t.Fatalf("ProcessOne first round: %v", err)
-	}
+	seedPending(t, rdb, cfg, baseStartPayload(executionID))
 	rdb.Set(ctx, cfg.KeyPrefix+":execution:lease:"+executionID,
 		"start:busy-worker:0123456789abcdef:3", time.Minute)
 
 	time.Sleep(120 * time.Millisecond) // real-time idle (miniredis PEL idle ignores FastForward)
-	if _, err := w.ProcessOne(ctx); err != nil {
-		t.Fatalf("ProcessOne reclaim round: %v", err)
+	delivery, err := q.Read(ctx)
+	if err != nil {
+		t.Fatalf("queue read: %v", err)
+	}
+	if delivery != nil {
+		t.Fatal("lease guard must keep the message pending")
 	}
 	if n := pendingCount(t, rdb, cfg); n != 1 {
 		t.Fatalf("PEL = %d, want 1 (lease guard kept it)", n)

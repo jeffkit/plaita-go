@@ -98,7 +98,15 @@ type executionRun struct {
 	nodeRetries int
 	cancelHit   bool
 	finished    bool
-	rootRuntime any // root flow's runtime context (captured on flow end)
+	// drainCancelled: D2 force-stop aborted this run. It is NOT the console
+	// cancel intent — the step is abandoned and the message stays pending
+	// (§9.3), no cancelled terminal is written.
+	drainCancelled   bool
+	drainCancelledAt string
+	// succeededNodes feeds the retry-counter reset (§9.1: any successful node
+	// advance clears the consecutive-failure counters).
+	succeededNodes map[string]bool
+	rootRuntime    any // root flow's runtime context (captured on flow end)
 
 	// saveMu serializes state saves (progress heartbeat vs terminal write)
 	// so a heartbeat save can never land after the terminal row.
@@ -118,6 +126,82 @@ func (r *executionRun) finalize(save func() error) error {
 	r.saveMu.Lock()
 	defer r.saveMu.Unlock()
 	return save()
+}
+
+// markFinished closes the run without a terminal write (retry re-enqueue,
+// lease loss, drain abort): no later heartbeat may overwrite the row.
+func (r *executionRun) markFinished() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.finished = true
+	r.mu.Unlock()
+}
+
+// isFinished reports whether the run has left its execution window.
+func (r *executionRun) isFinished() bool {
+	if r == nil {
+		return true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.finished
+}
+
+// isAdvancing is the orphan-watch liveness predicate (§3.4/§8.2): the run is
+// still executing or it has an open node (started_at set, ended_at empty).
+func (r *executionRun) isAdvancing() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.finished {
+		return true
+	}
+	for _, timing := range r.nodeTimings {
+		if ended, _ := timing["ended_at"].(string); ended == "" {
+			return true
+		}
+	}
+	return false
+}
+
+// markDrainCancelled records that D2 aborted the run (§9.3 D2).
+func (r *executionRun) markDrainCancelled() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.drainCancelled = true
+	r.drainCancelledAt = nowISO()
+	r.mu.Unlock()
+}
+
+// drainAborted reports whether D2 aborted the run.
+func (r *executionRun) drainAborted() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.drainCancelled
+}
+
+// succeededNodeIDs returns the node ids that completed successfully (retry
+// counter reset input).
+func (r *executionRun) succeededNodeIDs() []string {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, 0, len(r.succeededNodes))
+	for id := range r.succeededNodes {
+		out = append(out, id)
+	}
+	return out
 }
 
 // heartbeatSave performs a progress-heartbeat save unless the run already
@@ -254,10 +338,16 @@ func (r *executionRun) endNode(nodeID, nodeType, name string, failed bool) map[s
 	entry["failed"] = failed
 	if failed {
 		r.failedNode = nodeID
-	} else if r.failedNode == nodeID {
-		// A retry of the same node succeeded — it is no longer the failed
-		// node candidate.
-		r.failedNode = ""
+	} else {
+		if r.succeededNodes == nil {
+			r.succeededNodes = map[string]bool{}
+		}
+		r.succeededNodes[nodeID] = true
+		if r.failedNode == nodeID {
+			// A retry of the same node succeeded — it is no longer the failed
+			// node candidate.
+			r.failedNode = ""
+		}
 	}
 	return r.recordTimelineLocked("node_end", map[string]any{
 		"node_id": nodeID, "node_type": nodeType, "name": name, "failed": failed,

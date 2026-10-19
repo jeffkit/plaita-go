@@ -308,16 +308,45 @@ func TestWorkerCancelMidExecution(t *testing.T) {
 	}
 }
 
-// TestWorkerResumeMVP: resume tasks fail deterministically (A47-F2 is phase
-// 2) — except that cancellation intent still wins.
+// TestWorkerResumeMVP: the phase-2 A47-F2 carrier semantics. The engine has no
+// checkpoint resume yet, so the wake-up path still fails deterministically —
+// but the ack/short-circuit dispositions are aligned with the protocol.
 func TestWorkerResumeMVP(t *testing.T) {
-	t.Run("resume without cancel → deterministic error terminal", func(t *testing.T) {
+	t.Run("suspended + continue → idempotent short-circuit, no lease", func(t *testing.T) {
 		w, rdb, _, cfg := newTestWorker(t)
 		ctx := context.Background()
 		executionID := newExecutionID()
-		// Existing suspended execution row.
+		// Existing suspended execution row with no pending dispatch credential.
 		rdb.Set(ctx, stateKeyOf(cfg, executionID),
 			fmt.Sprintf(`{"execution_id":%q,"status":"suspended"}`, executionID), 0)
+
+		payload := baseStartPayload(executionID)
+		payload["type"] = "resume"
+		payload["resume_type"] = "continue"
+		enqueueTask(t, rdb, cfg, payload, "")
+
+		if _, err := w.ProcessOne(ctx); err != nil {
+			t.Fatalf("ProcessOne: %v", err)
+		}
+		state := loadStateRow(t, rdb, cfg, executionID)
+		if state.Status != StatusSuspended {
+			t.Fatalf("status = %q, want suspended (no progress, no terminal)", state.Status)
+		}
+		if n := streamLen(t, rdb, cfg.QueueName); n != 0 {
+			t.Fatalf("queue XLEN = %d, want 0 (idempotent ack)", n)
+		}
+		// #33 contract: the short-circuit does not take the execution lease.
+		if v := rdb.Get(ctx, cfg.KeyPrefix+":execution:lease:"+executionID).Val(); v != "" {
+			t.Fatalf("suspended+continue must not take a lease, got %q", v)
+		}
+	})
+
+	t.Run("running + continue → deterministic resume_not_supported", func(t *testing.T) {
+		w, rdb, _, cfg := newTestWorker(t)
+		ctx := context.Background()
+		executionID := newExecutionID()
+		rdb.Set(ctx, stateKeyOf(cfg, executionID),
+			fmt.Sprintf(`{"execution_id":%q,"status":"running"}`, executionID), 0)
 
 		payload := baseStartPayload(executionID)
 		payload["type"] = "resume"
@@ -336,6 +365,30 @@ func TestWorkerResumeMVP(t *testing.T) {
 		}
 		if n := streamLen(t, rdb, cfg.QueueName); n != 0 {
 			t.Fatalf("queue XLEN = %d, want 0 (poison ack)", n)
+		}
+	})
+
+	t.Run("terminal + continue → idempotent ack, row untouched", func(t *testing.T) {
+		w, rdb, _, cfg := newTestWorker(t)
+		ctx := context.Background()
+		executionID := newExecutionID()
+		rdb.Set(ctx, stateKeyOf(cfg, executionID),
+			fmt.Sprintf(`{"execution_id":%q,"status":"completed","end_time":"2026-01-01T00:00:00"}`, executionID), 0)
+
+		payload := baseStartPayload(executionID)
+		payload["type"] = "resume"
+		payload["resume_type"] = "continue"
+		enqueueTask(t, rdb, cfg, payload, "")
+
+		if _, err := w.ProcessOne(ctx); err != nil {
+			t.Fatalf("ProcessOne: %v", err)
+		}
+		state := loadStateRow(t, rdb, cfg, executionID)
+		if state.Status != StatusCompleted || state.Error != nil {
+			t.Fatalf("terminal row overwritten: %+v", state)
+		}
+		if n := streamLen(t, rdb, cfg.QueueName); n != 0 {
+			t.Fatalf("queue XLEN = %d, want 0 (already_terminal ack)", n)
 		}
 	})
 
@@ -358,6 +411,27 @@ func TestWorkerResumeMVP(t *testing.T) {
 		state := loadStateRow(t, rdb, cfg, executionID)
 		if state.Status != StatusCancelled {
 			t.Fatalf("status = %q, want cancelled (cancel wins, §4.2)", state.Status)
+		}
+	})
+
+	t.Run("cancel carrier without flag still cancels", func(t *testing.T) {
+		w, rdb, _, cfg := newTestWorker(t)
+		ctx := context.Background()
+		executionID := newExecutionID()
+		rdb.Set(ctx, stateKeyOf(cfg, executionID),
+			fmt.Sprintf(`{"execution_id":%q,"status":"suspended"}`, executionID), 0)
+
+		payload := baseStartPayload(executionID)
+		payload["type"] = "resume"
+		payload["resume_type"] = "cancel"
+		enqueueTask(t, rdb, cfg, payload, "")
+
+		if _, err := w.ProcessOne(ctx); err != nil {
+			t.Fatalf("ProcessOne: %v", err)
+		}
+		state := loadStateRow(t, rdb, cfg, executionID)
+		if state.Status != StatusCancelled {
+			t.Fatalf("status = %q, want cancelled (carrier carries the intent)", state.Status)
 		}
 	})
 
@@ -414,11 +488,13 @@ func TestWorkerMissingFlowDeterministicFailure(t *testing.T) {
 	}
 }
 
-// TestWorkerEngineErrorNormalized: a failing node → error terminal with the
-// §5.4 normalized structure (code/message/error_type/failed_node).
+// TestWorkerEngineErrorNormalized: a retryable node failure with no budget
+// left → error terminal with the §5.4 normalized structure + the fixed
+// node_retry_budget_exhausted error_type (§9.1).
 func TestWorkerEngineErrorNormalized(t *testing.T) {
 	w, rdb, _, cfg := newTestWorker(t)
 	ctx := context.Background()
+	cfg.MaxDeliveries = 1 // first failure exhausts the per-node budget
 	flow := `{
 	  "flow_id": "boom_flow",
 	  "nodes": [
@@ -448,8 +524,17 @@ func TestWorkerEngineErrorNormalized(t *testing.T) {
 	if msg, _ := state.Error["message"].(string); !strings.Contains(msg, "kaputt") {
 		t.Fatalf("message = %v, want the node error", state.Error["message"])
 	}
-	if state.Error["error_type"] == "" || state.Error["error_type"] == "error" {
-		t.Fatalf("error_type missing: %v", state.Error)
+	if state.Error["error_type"] != "node_retry_budget_exhausted" {
+		t.Fatalf("error_type = %v, want node_retry_budget_exhausted", state.Error["error_type"])
+	}
+	if state.Error["code"] != float64(DefaultNodeAbortCode) {
+		t.Fatalf("code = %v, want %d", state.Error["code"], DefaultNodeAbortCode)
+	}
+	if state.Error["node_retries"] != float64(1) {
+		t.Fatalf("node_retries = %v, want 1", state.Error["node_retries"])
+	}
+	if n := streamLen(t, rdb, cfg.QueueName); n != 0 {
+		t.Fatalf("queue XLEN = %d, want 0", n)
 	}
 	// timeline ends with run_end(final=false) then final=true.
 	timeline, _ := state.Timeline["events"].([]any)

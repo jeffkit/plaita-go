@@ -3,7 +3,9 @@ package worker
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -22,28 +24,40 @@ import (
 //
 //	handler returned nil          → terminal state persisted → ack (+XDEL)
 //	handler returned error        → transient/deliberate leave-pending
+//	node retryable failure        → backoff + re-enqueue a fresh carrier → ack
 //	lease conflict                → §3.5 ack-safe disposition
-//	payload/schema/max-deliveries → DLQ + ack (queue layer)
+//	payload/schema/max-deliveries → DLQ + ack (queue layer, guarded)
 //
-// MVP boundaries — deliberately NOT implemented (phase 2, see the final
-// report):
+// Phase-2 surfaces implemented here (M4):
 //
-//	TODO(phase-2): orphan watch (_lease_orphan_watch) — after a lease loss the
-//	        worker must keep publishing progress heartbeats so the keeper's
-//	        1800s staleness never kills a still-running execution (§3.4/§8.2).
-//	TODO(phase-2): suspended/resume carrier semantics (A47-F2) — real resume
-//	        continuation, resume flow-hash gate, decision-carrier handling
-//	        beyond the conflict disposition (§3.4/§7).
-//	TODO(phase-2): dispatch_ledger write/read parity (§6.3) and the full
-//	        TaskNotForThisWorker handover protocol with counter keys (§9.2).
-//	TODO(phase-2): DLQ replay (plaita:dlq:replay) and the dead-letter guard's
-//	        recovery-clone re-enqueue branch (§2.4/§9.2).
-//	TODO(phase-2): three-state drain (draining/force-stop/signal, §9.3) and
-//	        node-level retry budgets + exponential-backoff re-enqueue (§9.1).
-//	TODO(phase-2): per-step state persistence (PERSIST_EVERY_N_STEPS=1, §5.2)
-//	        — the progress heartbeat (ttl/3) stands in for it in this MVP.
-//	TODO(phase-2): task age gate (PLAITA_TASK_MAX_AGE_SECONDS, §1.2) and the
+//	orphan watch (§3.4/§8.2)      — after a lease loss only progress
+//	                                heartbeats are published, so keeper never
+//	                                kills a still-running execution at 1800s.
+//	resume carriers (A47-F2)      — decision carriers are never acked in the
+//	                                lease-conflict window; terminal executions
+//	                                short-circuit idempotently; suspended +
+//	                                continue is a no-op short-circuit (cancel
+//	                                intent wins) that re-dispatches a pending
+//	                                suspend service task when owed.
+//	dispatch ledger (§6.3)        — append-only decision stream + the full
+//	                                TaskNotForThisWorker handover (bounded by
+//	                                affinityhandover counter keys, no DLQ).
+//	DLQ replay + guard (§2.4/§9.2) — see dlqreplay.go; the dead-letter guard
+//	                                re-enqueues a recovery clone and
+//	                                terminalizes budget-exhausted runs.
+//	drain (§9.3)                  — D1 draining / D2 force-stop / D3 signals,
+//	                                see drain.go.
+//	node retry budgets (§9.1)     — per-node/refetch/nofail counters, see
+//	                                retry.go.
+//
+// Still out of scope (phase 3):
+//
+//	TODO(phase-3): per-step state persistence (PERSIST_EVERY_N_STEPS=1, §5.2)
+//	        — the progress heartbeat (ttl/3) stands in for it.
+//	TODO(phase-3): task age gate (PLAITA_TASK_MAX_AGE_SECONDS, §1.2) and the
 //	        tenant quota / dedup-key idempotency paths.
+//	TODO(phase-3): checkpoint resume (M6) — swap the retry carrier back to the
+//	        protocol's start→resume/continue conversion once it exists.
 
 // runContextKey carries the executionRun through the engine execution
 // context so the global engine event listeners can correlate events to the
@@ -63,7 +77,7 @@ func runFromCtx(ctx context.Context) *executionRun {
 	return run
 }
 
-// Worker is the runtime worker MVP.
+// Worker is the runtime worker.
 type Worker struct {
 	cfg    *Config
 	rdb    *redis.Client
@@ -75,12 +89,18 @@ type Worker struct {
 	flows    *FlowSource
 	bus      *EventPublisher
 	registry *Registry
+	ledger   *DispatchLedger
+	retries  *RetryBudgets
 
 	active       atomic.Int64
 	runCtx       context.Context
 	runCtxCancel context.CancelFunc
 	wg           sync.WaitGroup
 	started      atomic.Bool
+
+	drainState
+	orphanMu sync.Mutex
+	orphans  map[string]*orphanEntry
 }
 
 // New assembles a worker. The engine event callbacks (pkg/workflow/event.go)
@@ -97,7 +117,11 @@ func New(cfg *Config, rdb *redis.Client, logger Logger) *Worker {
 		flows:    NewFlowSource(rdb, cfg, logger),
 		bus:      NewEventPublisher(rdb, cfg),
 		registry: NewRegistry(rdb, cfg, logger),
+		ledger:   NewDispatchLedger(rdb, cfg, logger),
+		retries:  NewRetryBudgets(rdb, cfg, logger),
+		orphans:  map[string]*orphanEntry{},
 	}
+	w.drainState.activeRuns = map[*executionRun]context.CancelFunc{}
 	w.queue.SetDeadLetterGuard(w.deadLetterGuard)
 	w.registerEngineListeners()
 	return w
@@ -151,8 +175,9 @@ func (w *Worker) registerEngineListeners() {
 	})
 }
 
-// Run consumes until ctx is cancelled. Registry lifecycle: starting →
-// running → (caller cancels) → unregistered (§8.1, §9.3).
+// Run consumes until ctx is cancelled or a drain completes. Registry
+// lifecycle: starting → running → (drain) draining → stopping → unregistered
+// (§8.1, §9.3).
 func (w *Worker) Run(ctx context.Context) error {
 	if !w.started.CompareAndSwap(false, true) {
 		return errors.New("worker already started")
@@ -169,7 +194,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 	w.registry.SetStatus(ctx, RegStatusRunning)
 
-	w.wg.Add(2)
+	w.wg.Add(3)
 	go func() {
 		defer w.wg.Done()
 		w.registry.HeartbeatLoop(ctx)
@@ -178,13 +203,27 @@ func (w *Worker) Run(ctx context.Context) error {
 		defer w.wg.Done()
 		w.sweepLoop(ctx)
 	}()
+	go func() {
+		defer w.wg.Done()
+		w.orphanLoop(ctx)
+	}()
 	defer func() {
+		w.runCtxCancel()
+		w.wg.Wait()
+		w.stopDrainTimer()
 		w.registry.SetStatus(context.Background(), RegStatusStopping)
 		w.registry.Unregister(context.Background())
 	}()
 
 	backoff := time.Duration(0)
 	for {
+		// §9.3 D1: the loop exits at the task boundary while draining; the
+		// synchronous ProcessOne means every in-flight step is finished (or
+		// was force-cancelled) by the time we get here.
+		if w.Draining() {
+			w.logger.Info("draining: consumption loop stopped", "inflight", w.active.Load())
+			return nil
+		}
 		select {
 		case <-ctx.Done():
 			return nil
@@ -193,6 +232,12 @@ func (w *Worker) Run(ctx context.Context) error {
 		handled, err := w.ProcessOne(ctx)
 		if err != nil {
 			// Transient family: warn + backoff, never blow up the loop (§2.4).
+			// A D2 force-stop abandons the in-flight step; the message stays
+			// pending and no retry/re-enqueue is attempted (A46-06).
+			if errors.Is(err, ErrDrainAborted) || w.ForceStopped() {
+				w.logger.Warn("task abandoned by drain force-stop (message left pending)", "error", err)
+				continue
+			}
 			w.logger.Warn("task processing left message pending", "error", err)
 			backoff = reconnectBackoff
 			continue
@@ -232,6 +277,13 @@ func (w *Worker) ProcessOne(ctx context.Context) (bool, error) {
 	if err != nil || delivery == nil {
 		return false, err
 	}
+	// §9.3 D1 post-read gate: a message delivered after draining began is
+	// neither dispatched nor acked — it stays in the PEL for another worker.
+	if w.Draining() || w.ForceStopped() {
+		w.logger.Info("message delivered after drain began, leaving pending",
+			"id", delivery.Task.MessageID)
+		return true, nil
+	}
 	task := delivery.Task
 	w.active.Add(1)
 	w.registry.SetActiveTasks(ctx, int(w.active.Load()))
@@ -240,30 +292,38 @@ func (w *Worker) ProcessOne(ctx context.Context) (bool, error) {
 		w.registry.SetActiveTasks(context.Background(), int(w.active.Load()))
 	}()
 
-	// Capacity-routed dispatch target check (§6.3). The full handover
-	// protocol (TaskNotForThisWorker → counter keys → re-enqueue) is phase 2;
-	// MVP leaves the message pending so the target worker's reclaim or the
-	// delivery ceiling disposes of it.
+	// Capacity-routed dispatch target check (§6.3, §9.2): a foreign target
+	// goes through the bounded handover protocol; it is never dead-lettered
+	// by this worker.
 	if task.TargetInstanceID != "" && task.TargetInstanceID != w.cfg.InstanceID {
-		w.logger.Warn("task routed to another worker, leaving pending (handover is phase 2)",
-			"target", task.TargetInstanceID, "self", w.cfg.InstanceID, "id", task.MessageID)
-		return true, nil
+		return w.handleForeignTarget(ctx, delivery)
 	}
 
 	switch task.Type {
 	case "start":
 		if err := w.handleStart(ctx, task); err != nil {
-			return true, err
+			return w.dispositionHandlerError(ctx, delivery, err)
 		}
 	case "resume":
 		if err := w.handleResume(ctx, task); err != nil {
-			return true, err
+			return w.dispositionHandlerError(ctx, delivery, err)
 		}
 	default:
 		// Unknown type → ValueError class → poison ack (§2.3, §9.2).
 		w.logger.Warn("unknown task type, poison ack", "type", task.Type, "id", task.MessageID)
 	}
 	return true, w.queue.Ack(ctx, task.MessageID)
+}
+
+// dispositionHandlerError maps a handler error to the §9.2 disposition. Only
+// the node-retryable class is acked (after enqueueing a fresh carrier); every
+// other error leaves the message pending.
+func (w *Worker) dispositionHandlerError(ctx context.Context, delivery *Delivery, err error) (bool, error) {
+	var nre *NodeRetryableError
+	if errors.As(err, &nre) {
+		return w.requeueRetryableFailure(ctx, delivery, nre)
+	}
+	return true, err
 }
 
 // handleStart executes a start task: cancel entry checkpoint → lease acquire
@@ -292,6 +352,16 @@ func (w *Worker) handleStart(ctx context.Context, task *Task) error {
 			return w.leaseConflictDisposition(ctx, task)
 		}
 		return fmt.Errorf("lease acquire: %w", err)
+	}
+
+	// A brand-new execution id must not inherit retry budgets from a previous
+	// life of the same id (§8.3. 删除执行时一并清). An existing row (retry
+	// re-enqueue / duplicate carrier) keeps its counters.
+	if prev, perr := w.store.LoadExecutionState(ctx, tenant, executionID); perr != nil {
+		_ = w.lease.Release(ctx, handle)
+		return fmt.Errorf("state probe: %w", perr)
+	} else if prev == nil {
+		_ = w.retries.ResetAll(ctx, tenant, executionID)
 	}
 
 	// Flow definition (§7). Missing = deterministic (poison ack after an
@@ -373,6 +443,12 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 	// engine returns (by cancellation, lease loss or plain completion).
 	loopCtx := ctx
 	ctx = withRun(runCtx, run)
+	w.registerRun(run, cancelRun)
+	defer w.unregisterRun(run)
+	defer w.dropOrphan(task.ExecutionID, "run ended")
+	// §9.1: any node that completed successfully clears its retry counter
+	// (and, on a fully successful run, the consecutive-failure counters).
+	defer w.resetRetryProgress(loopCtx, tenant, task.ExecutionID, run)
 
 	// Cancel polling (§4.2): entry/step boundaries are covered by the flag
 	// checks around Execute; this poller covers the in-execution gaps.
@@ -434,10 +510,24 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 					continue
 				}
 				if !ok {
-					// Lease lost: stop the execution; the fenced terminal
-					// write would be rejected anyway — leave pending.
-					w.logger.Error("execution lease lost mid-run, aborting execution",
+					// §3.4 失租：**先发布一次进度**（执行可能仍在推进——不让
+					// keeper 在「租约已丢但 impl 仍在跑」的窗口里判死健康 run），
+					// 再标记 lease_lost、请求中止当前步，并转交 orphan watch
+					// （只发心跳，不续租、不再 cancel）。
+					w.logger.Error("execution lease lost mid-run, publishing orphan progress and aborting step",
 						"execution_id", task.ExecutionID)
+					w.publishOrphanProgress(tenant, handle.FenceToken, &orphanEntry{
+						executionID: task.ExecutionID,
+						tenantID:    tenant,
+						fenceToken:  handle.FenceToken,
+						run:         run,
+					})
+					w.registerOrphan(&orphanEntry{
+						executionID: task.ExecutionID,
+						tenantID:    tenant,
+						fenceToken:  handle.FenceToken,
+						run:         run,
+					})
 					leaseLost.Store(true)
 					cancelRun()
 					return
@@ -489,13 +579,29 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 			_ = w.lease.Release(loopCtx, handle)
 			return fmt.Errorf("cancelled persist: %w", err)
 		}
+	case execErr != nil && run.drainAborted():
+		// §9.3 D2: the step was abandoned by force-stop. Deliberately NO
+		// terminal write — the execution stays resumable and the message
+		// remains pending for another worker (the Python drain docstring's
+		// "留 pending 由其他 worker 续跑" contract; this build has no hard
+		// interrupt, so aborting the step is the faithful part). A flow that
+		// finished cleanly before the force-stop keeps its completed row.
+		w.logger.Warn("execution abandoned by drain force-stop; message left pending",
+			"execution_id", task.ExecutionID)
+		_ = w.lease.Release(loopCtx, handle)
+		return ErrDrainAborted
 	case execErr != nil:
-		ne := NormalizeEngineError(execErr, run.failedNode, run.nodeRetries)
-		if err := run.finalize(func() error {
-			return w.persistErrorTerminal(loopCtx, tenant, handle.FenceToken, plan.state, run, ne)
-		}); err != nil {
+		terminalized, retryErr, err := w.classifyNodeFailure(loopCtx, tenant, handle, plan.state, run, execErr)
+		if err != nil {
 			_ = w.lease.Release(loopCtx, handle)
-			return fmt.Errorf("error terminal persist: %w", err)
+			return err
+		}
+		if !terminalized {
+			// Budget left: hand the retry carrier decision to the consumer
+			// loop, which performs the backoff + enqueue→ack choreography.
+			run.markFinished()
+			_ = w.lease.Release(loopCtx, handle)
+			return retryErr
 		}
 	default:
 		w.logger.Info("execution completed", "execution_id", task.ExecutionID)
@@ -519,6 +625,98 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 		w.logger.Warn("lease release failed", "execution_id", task.ExecutionID, "error", err)
 	}
 	return nil
+}
+
+// classifyNodeFailure applies the §9.1 node-retry decision to an engine
+// failure. It returns:
+//
+//	terminalized=true  — the error terminal (normal OR budget-exhausted) was
+//	                     written; the caller only releases the lease.
+//	terminalized=false — a retryable failure below budget; retryErr carries
+//	                     the NodeRetryableError for the re-enqueue path.
+func (w *Worker) classifyNodeFailure(ctx context.Context, tenant string, handle *LeaseHandle,
+	state *ExecutionState, run *executionRun, execErr error) (bool, error, error) {
+	if !isRetryableNodeFailure(execErr, run) {
+		// Deterministic failure: record it (§9.1 layer 3: the counter is the
+		// only convergence signal for non-retryable node failures) and write
+		// the ordinary error terminal.
+		if n, cerr := w.retries.RecordDeterministic(ctx, tenant, state.ExecutionID); cerr != nil {
+			w.logger.Warn("deterministic failure counter increment failed", "error", cerr)
+		} else if n >= DeterministicFailureMax {
+			w.logger.Error("deterministic node failures reached the ceiling; execution stays terminalized",
+				"execution_id", state.ExecutionID, "count", n, "max", DeterministicFailureMax)
+		}
+		ne := NormalizeEngineError(execErr, run.failedNode, run.nodeRetries)
+		if err := run.finalize(func() error {
+			return w.persistErrorTerminal(ctx, tenant, handle.FenceToken, state, run, ne)
+		}); err != nil {
+			return false, nil, fmt.Errorf("error terminal persist: %w", err)
+		}
+		return true, nil, nil
+	}
+
+	nodeID := run.failedNode
+	attempt, err := w.retries.RecordNodeRetry(ctx, tenant, state.ExecutionID, nodeID)
+	if err != nil {
+		// Counter unreadable: treat as attempt 1 (never block a retry on
+		// bookkeeping — §9.1 fallback semantics).
+		w.logger.Warn("node retry counter increment failed (treated as attempt 1)", "error", err)
+		attempt = 1
+	}
+	budget := w.cfg.MaxDeliveries
+	total, terr := w.retries.RecordTotal(ctx, tenant, state.ExecutionID)
+	if terr != nil {
+		w.logger.Warn("total retry counter increment failed", "error", terr)
+	}
+	if attempt >= budget || (terr == nil && total >= NodeRetryTotalMax) {
+		reason := fmt.Sprintf("node %s failed %d/%d times; retry budget exhausted: %v", nodeID, attempt, budget, execErr)
+		if terr == nil && total >= NodeRetryTotalMax {
+			reason = fmt.Sprintf("execution retried %d times (fallback ceiling %d); node %s keeps failing: %v",
+				total, NodeRetryTotalMax, nodeID, execErr)
+		}
+		w.logger.Error("node retry budget exhausted, terminalizing error",
+			"execution_id", state.ExecutionID, "node", nodeID, "attempt", attempt, "budget", budget, "total", total)
+		ne := WorkerError("node_retry_budget_exhausted", DefaultNodeAbortCode, reason)
+		ne.NodeRetries = attempt
+		ne.FailedNode = nodeID
+		if err := w.terminalizeNodeRetryExhausted(ctx, tenant, handle, state, run, ne, attempt); err != nil {
+			return false, nil, fmt.Errorf("node retry exhausted persist: %w", err)
+		}
+		return true, nil, nil
+	}
+
+	w.logger.Warn("node retryable failure below budget, re-enqueueing after backoff",
+		"execution_id", state.ExecutionID, "node", nodeID, "attempt", attempt, "budget", budget)
+	return false, &NodeRetryableError{
+		ExecutionID: state.ExecutionID,
+		FailedNode:  nodeID,
+		Attempt:     attempt,
+		Budget:      budget,
+		Err:         execErr,
+	}, nil
+}
+
+// resetRetryProgress clears the retry counters for every node that advanced
+// (§9.1). The total/deterministic counters are cleared only when the run
+// completed: this build replays the whole flow on retry (no checkpoint
+// resume), so the always-successful start node must not reset the
+// consecutive-failure ceilings.
+func (w *Worker) resetRetryProgress(ctx context.Context, tenant, executionID string, run *executionRun) {
+	if run == nil {
+		return
+	}
+	succeeded := run.succeededNodeIDs()
+	if len(succeeded) == 0 {
+		return
+	}
+	if err := w.retries.ResetOnProgress(ctx, tenant, executionID, succeeded); err != nil {
+		return
+	}
+	state, err := w.store.LoadExecutionState(ctx, tenant, executionID)
+	if err != nil || state == nil || state.Status != StatusCompleted {
+		return
+	}
+	_ = w.retries.ResetConsecutive(ctx, tenant, executionID)
 }
 
 // persistErrorTerminal writes the error terminal state (§5.2 error branch,
@@ -583,16 +781,83 @@ func (w *Worker) leaseConflictDisposition(ctx context.Context, task *Task) error
 		// execution (§3.5 point 4).
 		w.logger.Info("lease held by live worker, acking message",
 			"execution_id", task.ExecutionID, "holder", instanceID)
+		if task.Type == "resume" {
+			// plaita#53: an acked resume means THIS resumption did not take
+			// effect — say so, or operators read the silence as success.
+			w.logger.Warn("resume carrier acked while a live holder owns the lease — this resume had no effect",
+				"execution_id", task.ExecutionID, "resume_type", task.ResumeType, "holder", instanceID)
+		}
 		return nil
 	}
 	return fmt.Errorf("%w: holder %q not running (status=%q)", ErrExecutionLeaseConflict, instanceID, status)
 }
 
-// handleResume — MVP boundary: the suspended/resume carrier semantics
-// (A47-F2) are phase 2. A resume task never silently disappears: cancellation
-// intent still wins (§4.2), and everything else fails deterministically with
-// an error terminal on the target execution.
+// handleResume implements the A47-F2 carrier semantics (§3.5, §4.2 #5, §5.3,
+// §9.2). The engine has no suspend/resume yet, so the *wake-up* path still
+// fails deterministically (resume_not_supported); what phase 2 aligns is the
+// ack / re-delivery / dead-letter disposition:
+//
+//   - terminal executions short-circuit idempotently (already_terminal);
+//   - cancel intent (flag or resume_type=cancel) wins over every shortcut;
+//   - suspended + continue/retry is a no-op short-circuit that takes NO lease,
+//     except to compensate a pending suspend service dispatch (plaita#233);
+//   - an event/timeout carrier on a *running* execution missed the suspend
+//     point and is normalized to a continue carrier (enqueue → ack, #258).
 func (w *Worker) handleResume(ctx context.Context, task *Task) error {
+	tenant := task.TenantID
+	executionID := task.ExecutionID
+	if executionID == "" {
+		w.logger.Warn("resume without execution_id, poison ack", "resume_type", task.ResumeType)
+		return nil
+	}
+
+	// Pre-lease probes (no lease taken on the short-circuit paths).
+	cancelHit, _, err := w.store.IsCancelRequested(ctx, tenant, executionID)
+	if err != nil {
+		return fmt.Errorf("cancel probe: %w", err)
+	}
+	state, err := w.store.LoadExecutionState(ctx, tenant, executionID)
+	if err != nil {
+		return err
+	}
+	// A missing row is NOT a pre-lease decision: the lease-conflict window must
+	// still be observed (a decision carrier routed at a live holder is never
+	// acked, §3.5), so the poison ack happens inside the lease path below.
+	if state != nil && TerminalStatuses[state.Status] {
+		// §5.3: already_terminal is an idempotent ack — never overwrite a
+		// finished execution with a resume error.
+		w.logger.Info("resume for terminal execution, idempotent ack",
+			"execution_id", executionID, "status", state.Status, "resume_type", task.ResumeType)
+		return nil
+	}
+
+	// Cancellation priority (§4.2 #4/#5): a cancel flag (or the cancel carrier
+	// itself) must be consumed under the lease; it also overrides the
+	// suspended+continue short-circuit below (台账第三十四轮 ④).
+	if cancelHit || task.ResumeType == "cancel" {
+		return w.resumeCancelUnderLease(ctx, task)
+	}
+
+	// §4.2 #5 / #33: suspended + continue|retry carries no progress semantics.
+	// No lease is taken unless a dispatch_pending credential needs one.
+	if state != nil && state.Status == StatusSuspended &&
+		(task.ResumeType == "continue" || task.ResumeType == "retry") {
+		compensated, cerr := w.compensateSuspendDispatch(ctx, task, state)
+		if cerr != nil {
+			return cerr // not acked: the service dispatch must be retried
+		}
+		w.logger.Info("suspended execution: resume carrier carries no progress semantics, idempotent ack",
+			"execution_id", executionID, "resume_type", task.ResumeType, "dispatch_compensated", compensated)
+		return nil
+	}
+
+	// Everything else advances (or deterministically fails) under the lease.
+	return w.resumeUnderLease(ctx, task)
+}
+
+// resumeUnderLease acquires the execution lease, re-reads the state (§3.4
+// resume TOCTOU), re-runs the preconditions and performs the disposition.
+func (w *Worker) resumeUnderLease(ctx context.Context, task *Task) error {
 	tenant := task.TenantID
 	executionID := task.ExecutionID
 
@@ -606,56 +871,249 @@ func (w *Worker) handleResume(ctx context.Context, task *Task) error {
 	}
 	defer func() { _ = w.lease.Release(ctx, handle) }()
 
-	// Cancellation priority (§4.2 #4): a cancel flag on the target
-	// execution terminalizes cancelled regardless of carrier type.
+	// In-lease re-check (plaita#241): the entry snapshot may already be stale.
 	if hit, _, err := w.store.IsCancelRequested(ctx, tenant, executionID); err != nil {
 		return fmt.Errorf("cancel probe: %w", err)
 	} else if hit {
-		state, err := w.store.LoadExecutionState(ctx, tenant, executionID)
-		if err != nil {
-			return err
-		}
-		if state == nil {
-			w.logger.Warn("resume for missing execution with cancel flag, acking",
-				"execution_id", executionID)
-			return nil
-		}
-		now := nowISO()
-		state.Status = StatusCancelled
-		state.EndTime = now
-		state.LastUpdateTime = now
-		if err := w.store.SaveExecutionState(ctx, tenant, state, handle.FenceToken); err != nil {
-			return err
-		}
-		w.logger.Info("resume terminalized cancelled execution", "execution_id", executionID)
-		return nil
+		return w.writeResumeCancelled(ctx, tenant, executionID, handle.FenceToken)
 	}
-
 	state, err := w.store.LoadExecutionState(ctx, tenant, executionID)
 	if err != nil {
 		return err
 	}
 	if state == nil {
-		w.logger.Warn("resume for missing execution, poison ack",
-			"execution_id", executionID, "resume_type", task.ResumeType)
+		w.logger.Warn("resume: execution vanished under the lease, poison ack",
+			"execution_id", executionID)
 		return nil
 	}
+	if TerminalStatuses[state.Status] {
+		w.logger.Info("resume: execution terminalized under the lease, idempotent ack",
+			"execution_id", executionID, "status", state.Status)
+		return nil
+	}
+	if task.ResumeType == "cancel" {
+		return w.writeResumeCancelled(ctx, tenant, executionID, handle.FenceToken)
+	}
+	if state.Status == StatusSuspended && (task.ResumeType == "continue" || task.ResumeType == "retry") {
+		compensated, cerr := w.dispatchPendingService(ctx, task, state, handle.FenceToken)
+		if cerr != nil {
+			return cerr
+		}
+		w.logger.Info("suspended execution (in-lease recheck): idempotent ack",
+			"execution_id", executionID, "dispatch_compensated", compensated)
+		return nil
+	}
+	if state.Status == StatusRunning && (task.ResumeType == "event" || task.ResumeType == "timeout") {
+		// #258: the carrier arrived after the suspend point was consumed —
+		// normalize it into a continue carrier instead of acking the only
+		// recovery path.
+		return w.requeueNormalizedContinue(ctx, task)
+	}
+
+	// Engine has no suspend/resume yet (checkpoint v1.5 = M6): the wake-up
+	// cannot be applied; write the deterministic failure terminal.
 	ne := WorkerError("resume_not_supported", flowErrorCode,
-		fmt.Sprintf("resume carrier (type=%s) not supported by plaita-go worker MVP; suspended/resume semantics are phase 2 (A47-F2)", task.ResumeType))
+		fmt.Sprintf("resume carrier (type=%s) cannot advance execution: plaita-go engine has no checkpoint resume yet (A47-F2 wake-up path pending M6)", task.ResumeType))
 	if err := w.persistErrorTerminal(ctx, tenant, handle.FenceToken, state, nil, ne); err != nil {
 		return err
 	}
-	w.logger.Warn("resume not supported, deterministic error terminal written",
+	w.logger.Warn("resume wake-up not supported, deterministic error terminal written",
 		"execution_id", executionID, "resume_type", task.ResumeType)
 	return nil
 }
 
-// deadLetterGuard is the MVP guard (§9.2): schema rejections pass; missing /
-// terminal state passes; a running/suspended state with an active lease
-// skips; anything else passes WITHOUT the recovery-clone re-enqueue (phase
-// 2). Load failures skip (conservative).
-func (w *Worker) deadLetterGuard(ctx context.Context, task *Task, reason string) bool {
+// resumeCancelUnderLease terminalizes a cancel intent. The lease mutual
+// exclusion keeps two carriers from writing concurrently; the write itself is
+// idempotent.
+func (w *Worker) resumeCancelUnderLease(ctx context.Context, task *Task) error {
+	tenant := task.TenantID
+	executionID := task.ExecutionID
+	holder := NewHolderToken("resume", w.cfg.InstanceID)
+	handle, err := w.lease.Acquire(ctx, tenant, executionID, holder, w.cfg.LeaseTTLSeconds)
+	if err != nil {
+		if errors.Is(err, ErrExecutionLeaseConflict) {
+			return w.leaseConflictDisposition(ctx, task)
+		}
+		return fmt.Errorf("resume cancel lease acquire: %w", err)
+	}
+	defer func() { _ = w.lease.Release(ctx, handle) }()
+
+	state, err := w.store.LoadExecutionState(ctx, tenant, executionID)
+	if err != nil {
+		return err
+	}
+	if state == nil || TerminalStatuses[state.Status] {
+		w.logger.Info("resume cancel: nothing to do (missing or terminal execution), ack",
+			"execution_id", executionID)
+		return nil
+	}
+	return w.writeResumeCancelled(ctx, tenant, executionID, handle.FenceToken)
+}
+
+func (w *Worker) writeResumeCancelled(ctx context.Context, tenant, executionID string, fenceGen int64) error {
+	state, err := w.store.LoadExecutionState(ctx, tenant, executionID)
+	if err != nil {
+		return err
+	}
+	if state == nil {
+		return nil
+	}
+	if TerminalStatuses[state.Status] {
+		return nil
+	}
+	now := nowISO()
+	state.Status = StatusCancelled
+	state.EndTime = now
+	state.LastUpdateTime = now
+	if err := w.store.SaveExecutionState(ctx, tenant, state, fenceGen); err != nil {
+		return err
+	}
+	w.logger.Info("resume terminalized cancelled execution", "execution_id", executionID)
+	return nil
+}
+
+// requeueNormalizedContinue implements the §9.2 ResumeProtocolError
+// normalization: an event/timeout carrier that missed the suspend point is
+// replaced by a continue carrier. The caller acks the original only after the
+// enqueue succeeded (ProcessOne's standard ack).
+func (w *Worker) requeueNormalizedContinue(ctx context.Context, task *Task) error {
+	body := map[string]any{
+		"type":         "resume",
+		"flow_id":      task.FlowID,
+		"execution_id": task.ExecutionID,
+		"resume_type":  "continue",
+		"timestamp":    nowISO(),
+	}
+	if task.TenantID != "" {
+		body["tenant_id"] = task.TenantID
+	}
+	if len(task.Params) > 0 {
+		body["params"] = task.Params
+	}
+	if _, err := w.queue.Enqueue(ctx, body, task.EnvelopeSchemaVer); err != nil {
+		w.logger.Warn("normalized continue re-enqueue failed; leaving the original pending",
+			"execution_id", task.ExecutionID, "error", err)
+		return fmt.Errorf("normalized continue enqueue: %w", err)
+	}
+	w.logger.Warn("resume carrier missed the suspend point; normalized to a continue carrier",
+		"execution_id", task.ExecutionID, "resume_type", task.ResumeType)
+	return nil
+}
+
+// pendingSuspendDispatch returns the dispatch_pending credential when present
+// and still pending (§5.1, plaita#233).
+func pendingSuspendDispatch(state *ExecutionState) map[string]any {
+	if state == nil || state.DispatchPending == nil {
+		return nil
+	}
+	if pending, _ := state.DispatchPending["pending"].(bool); !pending {
+		return nil
+	}
+	return state.DispatchPending
+}
+
+// compensateSuspendDispatch re-dispatches a pending suspend service task for
+// the suspended+continue short-circuit. It takes a short "dispatch" lease
+// unless another worker holds one (that holder owns the re-dispatch); the
+// lease protects the credential-clear write from clobbering a concurrent
+// advance.
+func (w *Worker) compensateSuspendDispatch(ctx context.Context, task *Task, state *ExecutionState) (bool, error) {
+	if pendingSuspendDispatch(state) == nil {
+		return false, nil
+	}
+	holder := NewHolderToken("dispatch", w.cfg.InstanceID)
+	handle, err := w.lease.Acquire(ctx, task.TenantID, task.ExecutionID, holder, w.cfg.LeaseTTLSeconds)
+	if err != nil {
+		if errors.Is(err, ErrExecutionLeaseConflict) {
+			w.logger.Warn("suspend dispatch compensation skipped: execution lease held by another worker (it will re-dispatch)",
+				"execution_id", task.ExecutionID)
+			return false, nil
+		}
+		return false, fmt.Errorf("suspend dispatch lease: %w", err)
+	}
+	defer func() { _ = w.lease.Release(ctx, handle) }()
+
+	fresh, err := w.store.LoadExecutionState(ctx, task.TenantID, task.ExecutionID)
+	if err != nil {
+		return false, err
+	}
+	if fresh == nil || fresh.Status != StatusSuspended {
+		return false, nil
+	}
+	return w.dispatchPendingService(ctx, task, fresh, handle.FenceToken)
+}
+
+// dispatchPendingService performs the actual re-dispatch + credential clear
+// under a held lease.
+func (w *Worker) dispatchPendingService(ctx context.Context, task *Task, state *ExecutionState, fenceGen int64) (bool, error) {
+	marker := pendingSuspendDispatch(state)
+	if marker == nil {
+		return false, nil
+	}
+	serviceConfig, _ := marker["service_config"].(map[string]any)
+	if serviceConfig == nil {
+		serviceConfig = map[string]any{}
+	}
+	subtype, _ := marker["service_type"].(string)
+	if subtype == "" {
+		subtype, _ = serviceConfig["type"].(string)
+	}
+	if subtype == "" {
+		w.logger.Warn("suspend dispatch credential has no service type; clearing it",
+			"execution_id", task.ExecutionID)
+	} else {
+		body := make(map[string]any, len(serviceConfig)+2)
+		for k, v := range serviceConfig {
+			body[k] = v
+		}
+		if _, ok := body["execution_id"]; !ok {
+			body["execution_id"] = task.ExecutionID
+		}
+		if _, ok := body["tenant_id"]; !ok {
+			body["tenant_id"] = task.TenantID
+		}
+		blob, err := json.Marshal(body)
+		if err != nil {
+			return false, fmt.Errorf("suspend dispatch marshal: %w", err)
+		}
+		queueKey := w.cfg.KeyPrefix + ":" + subtype + ":queue"
+		if err := w.rdb.RPush(ctx, queueKey, string(blob)).Err(); err != nil {
+			// Must NOT ack: the message is the only carrier that can retry
+			// the dispatch (ServiceDispatchError semantics, §5.2).
+			w.logger.Error("suspend service dispatch failed; message will be left pending",
+				"execution_id", task.ExecutionID, "queue", queueKey, "error", err)
+			return false, fmt.Errorf("suspend dispatch rpush: %w", err)
+		}
+		w.logger.Warn("suspend service task re-dispatched",
+			"execution_id", task.ExecutionID, "queue", queueKey, "node", marker["node_id"])
+	}
+	// Credential and "dispatched" marker share one write (§5.2).
+	state.DispatchPending = nil
+	if err := w.store.SaveExecutionState(ctx, task.TenantID, state, fenceGen); err != nil {
+		w.logger.Error("suspend dispatch succeeded but clearing the credential failed; message stays pending",
+			"execution_id", task.ExecutionID, "error", err)
+		return false, err
+	}
+	return true, nil
+}
+
+// deadLetterGuard implements §9.2's _dead_letter_guard:
+//
+//	schema rejection                 → allow, never clone (A49-01)
+//	state missing / terminal         → allow
+//	state load / lease probe failure → skip (conservative)
+//	lease active                     → skip (a live worker owns it)
+//	deleted execution (tombstone)    → allow, never clone (A51-01)
+//	running + retry budget exhausted → terminalize error, then allow
+//	non-terminal + lease empty       → re-enqueue a recovery clone, then allow
+//
+// The clone inherits the SOURCE envelope version (§2.2 / A44-02): a copy
+// written by this build must not masquerade as newer than its source.
+func (w *Worker) deadLetterGuard(ctx context.Context, env *Envelope, task *Task, reason string) bool {
 	if reason == ReasonUnsupportedSchema {
+		return true
+	}
+	if task == nil || task.ExecutionID == "" {
 		return true
 	}
 	state, err := w.store.LoadExecutionState(ctx, task.TenantID, task.ExecutionID)
@@ -675,8 +1133,257 @@ func (w *Worker) deadLetterGuard(ctx context.Context, task *Task, reason string)
 		w.logger.Warn("dead letter guard: lease active, skipping", "execution_id", task.ExecutionID)
 		return false
 	}
-	// Phase 2 would re-enqueue a recovery clone here (§9.2 guard last row).
+	// The state snapshot may predate a deletion; check the tombstone after the
+	// lease probe and before cloning/terminalizing (A51-01).
+	tombstoned, terr := w.executionTombstoned(ctx, task.TenantID, task.ExecutionID)
+	if terr != nil {
+		w.logger.Warn("dead letter guard: tombstone check failed, skipping", "error", terr)
+		return false
+	}
+	if tombstoned {
+		w.logger.Warn("dead letter guard: execution deleted, allowing the dead letter without a recovery clone",
+			"execution_id", task.ExecutionID)
+		return true
+	}
+	// Retry-budget exhaustion (plaita#242: only a running execution is
+	// "stuck"; suspended waits for an external decision and must never be
+	// terminalized here).
+	if state.Status == StatusRunning {
+		retryCount := w.retries.MaxNodeRetry(ctx, task.TenantID, task.ExecutionID)
+		totalExhausted := w.retries.TotalExhausted(ctx, task.TenantID, task.ExecutionID)
+		if retryCount >= w.cfg.MaxDeliveries || totalExhausted {
+			w.logger.Error("dead letter guard: retry budget exhausted, terminalizing before the dead letter",
+				"execution_id", task.ExecutionID, "node_retries", retryCount, "total_exhausted", totalExhausted)
+			state.Status = StatusError
+			state.EndTime = nowISO()
+			state.LastUpdateTime = state.EndTime
+			state.Error = map[string]any{
+				"message":       fmt.Sprintf("node execution kept failing (%d retries); retry budget exhausted", retryCount),
+				"node_retries":  retryCount,
+				"code":          DefaultNodeAbortCode,
+				"error_type":    "node_retry_budget_exhausted",
+				"failed_reason": reason,
+			}
+			if err := w.store.SaveExecutionState(ctx, task.TenantID, state, 0); err != nil {
+				w.logger.Warn("dead letter guard: terminalization failed, skipping", "error", err)
+				return false
+			}
+			return true
+		}
+	}
+	// Non-terminal + no lease: the only recovery carrier is this message.
+	// Re-enqueue a fresh copy (delivery restarts at 1) before allowing the
+	// original into the DLQ.
+	payload := env.PayloadRaw
+	if payload == "" {
+		w.logger.Warn("dead letter guard: no raw payload to clone, skipping")
+		return false
+	}
+	if _, err := w.queue.EnqueueRaw(ctx, payload, task.EnvelopeSchemaVer); err != nil {
+		w.logger.Warn("dead letter guard: recovery clone enqueue failed, skipping", "error", err)
+		return false
+	}
+	w.logger.Warn("dead letter guard: recovery carrier re-enqueued; original may now dead-letter",
+		"execution_id", task.ExecutionID)
 	return true
+}
+
+// executionTombstoned reports whether the execution carries a deletion
+// tombstone for this tenant (§8.3 platform-root key; cross-tenant same ids are
+// not treated as deleted).
+func (w *Worker) executionTombstoned(ctx context.Context, tenantID, executionID string) (bool, error) {
+	raw, err := w.rdb.Get(ctx, w.tombstoneKey(executionID)).Result()
+	if errors.Is(err, redis.Nil) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var tomb map[string]any
+	if json.Unmarshal([]byte(raw), &tomb) != nil {
+		return false, nil
+	}
+	tombTenant, _ := tomb["tenant"].(string)
+	if tombTenant == "" {
+		tombTenant = w.cfg.DefaultTenantID
+	}
+	carrierTenant := tenantID
+	if carrierTenant == "" {
+		carrierTenant = w.cfg.DefaultTenantID
+	}
+	return tombTenant == carrierTenant, nil
+}
+
+// requeueRetryableFailure implements §9.1's explicit re-enqueue: backoff
+// (interruptible by D2), enqueue a fresh carrier, then ack the original. The
+// enqueue→ack order is load-bearing: a crash in between duplicates (the lease
+// serializes), never loses.
+func (w *Worker) requeueRetryableFailure(ctx context.Context, delivery *Delivery, nre *NodeRetryableError) (bool, error) {
+	task := delivery.Task
+	if delay := nodeRetryBackoff(nre.Attempt); delay > 0 {
+		w.logger.Warn("node retryable failure: backing off before re-enqueue",
+			"execution_id", task.ExecutionID, "node", nre.FailedNode,
+			"attempt", nre.Attempt, "budget", nre.Budget, "delay", delay)
+		if w.interruptibleSleep(ctx, delay) {
+			w.logger.Warn("retry backoff aborted by drain force-stop; not re-enqueueing, message left pending",
+				"execution_id", task.ExecutionID, "attempt", nre.Attempt)
+			return true, fmt.Errorf("%w: retry backoff aborted", ErrDrainAborted)
+		}
+	}
+	body := w.retryCarrierBody(ctx, task)
+	messageID, err := w.queue.Enqueue(ctx, body, task.EnvelopeSchemaVer)
+	if err != nil {
+		w.logger.Warn("retry carrier enqueue failed; original left pending for reclaim",
+			"execution_id", task.ExecutionID, "error", err)
+		return true, fmt.Errorf("retry carrier enqueue: %w", err)
+	}
+	if err := w.queue.Ack(ctx, task.MessageID); err != nil {
+		w.logger.Warn("retry carrier enqueued but the original ack failed (duplicate delivery, lease-serialized)",
+			"execution_id", task.ExecutionID, "error", err)
+		return true, nil
+	}
+	w.logger.Warn("retry carrier re-enqueued and original acked",
+		"execution_id", task.ExecutionID, "node", nre.FailedNode,
+		"attempt", nre.Attempt, "budget", nre.Budget, "message_id", messageID)
+	return true, nil
+}
+
+// handleForeignTarget implements the TaskNotForThisWorker handover (§9.2):
+// never a DLQ, bounded by a per-execution INCR counter key (7d TTL), enqueue
+// before ack, and a broadcast fallback when the target instance is gone.
+func (w *Worker) handleForeignTarget(ctx context.Context, delivery *Delivery) (bool, error) {
+	task := delivery.Task
+	status, err := w.registry.LookupStatus(ctx, task.TargetInstanceID)
+	if err != nil {
+		w.recordHandoverLedger(ctx, task, DecisionTargeted, ReasonHandoverProbeFailure, "")
+		return true, fmt.Errorf("dispatch target probe failed: %w", err)
+	}
+
+	body := map[string]any{}
+	if err := json.Unmarshal([]byte(delivery.Envelope.PayloadRaw), &body); err != nil || body == nil {
+		body = taskPayloadDict(task)
+	}
+
+	// A46-02: a gone target must not be kept — otherwise every non-target
+	// worker hands the task over again until the counter exhausts a runnable
+	// task. Strip the target and broadcast.
+	if status != RegStatusRunning {
+		delete(body, "target_instance_id")
+		newID, err := w.queue.Enqueue(ctx, body, task.EnvelopeSchemaVer)
+		if err != nil {
+			w.recordHandoverLedger(ctx, task, DecisionBroadcast, ReasonTargetUnavailable, "")
+			return true, fmt.Errorf("broadcast handover enqueue: %w", err)
+		}
+		w.recordHandoverLedger(ctx, task, DecisionBroadcast, ReasonTargetUnavailable, newID)
+		w.logger.Warn("dispatch target unavailable: task re-enqueued as broadcast",
+			"target", task.TargetInstanceID, "status", status, "message_id", newID)
+		return true, w.queue.Ack(ctx, task.MessageID)
+	}
+
+	count, err := w.recordHandover(ctx, task, delivery)
+	if err != nil {
+		// Fail-closed: without a bound we never hand over (the old boolean
+		// marker was the unbounded-handover incident).
+		w.recordHandoverLedger(ctx, task, DecisionTargeted, ReasonHandoverUnbounded, "")
+		return true, fmt.Errorf("%w: %v", ErrHandoverCounterUnavailable, err)
+	}
+	if count > AffinityHandoverMax {
+		w.recordHandoverLedger(ctx, task, DecisionTargeted, ReasonHandoverExhausted, "")
+		w.logger.Error("handover budget exhausted; execution terminalized, message left pending",
+			"execution_id", task.ExecutionID, "count", count, "max", AffinityHandoverMax)
+		return w.terminalizeHandoverExhausted(ctx, task, count)
+	}
+
+	newID, err := w.queue.Enqueue(ctx, body, task.EnvelopeSchemaVer)
+	if err != nil {
+		w.recordHandoverLedger(ctx, task, DecisionTargeted, ReasonHandover, "")
+		return true, fmt.Errorf("handover enqueue: %w", err)
+	}
+	w.recordHandoverLedger(ctx, task, DecisionTargeted, ReasonHandover, newID)
+	w.logger.Info("task handed over to its targeted worker",
+		"target", task.TargetInstanceID, "count", count, "message_id", newID)
+	return true, w.queue.Ack(ctx, task.MessageID)
+}
+
+// recordHandover INCRs the handover counter with a sliding 7-day TTL. A
+// failure is returned: the counter is the ONLY termination condition for a
+// handover loop (new copies always restart delivery at 1).
+func (w *Worker) recordHandover(ctx context.Context, task *Task, delivery *Delivery) (int, error) {
+	key := w.handoverKey(task, delivery)
+	pipe := w.rdb.TxPipeline()
+	incr := pipe.Incr(ctx, key)
+	pipe.Expire(ctx, key, counterTTLSeconds*time.Second)
+	if _, err := pipe.Exec(ctx); err != nil {
+		w.logger.Error("handover counter increment failed (bound unavailable, refusing to hand over)",
+			"key", key, "error", err)
+		return 0, err
+	}
+	return int(incr.Val()), nil
+}
+
+func (w *Worker) handoverKey(task *Task, delivery *Delivery) string {
+	if task.ExecutionID != "" {
+		return w.cfg.Namespace(task.TenantID) + ":execution:affinityhandover:" + task.ExecutionID
+	}
+	// No execution id: hash the canonical body (Go marshals map keys sorted,
+	// matching Python's json.dumps(sort_keys=True)).
+	canonical := delivery.Envelope.PayloadRaw
+	var body map[string]any
+	if json.Unmarshal([]byte(canonical), &body) == nil && body != nil {
+		if blob, err := json.Marshal(body); err == nil {
+			canonical = string(blob)
+		}
+	}
+	sum := sha1.Sum([]byte(canonical))
+	return w.cfg.KeyPrefix + ":affinity:handover:" + hex.EncodeToString(sum[:])
+}
+
+// terminalizeHandoverExhausted makes "no host can run this" observable. An
+// already-terminal execution is acked (the message can never be processed);
+// otherwise the run is terminalized and the message left pending — the 7-day
+// counter keeps every later reclaim from producing another copy, so the loop
+// is bounded even though this worker does not ack.
+func (w *Worker) terminalizeHandoverExhausted(ctx context.Context, task *Task, count int) (bool, error) {
+	if task.ExecutionID == "" {
+		return true, ErrHandoverCounterUnavailable
+	}
+	state, err := w.store.LoadExecutionState(ctx, task.TenantID, task.ExecutionID)
+	if err != nil {
+		return true, err
+	}
+	if state == nil {
+		return true, nil
+	}
+	if TerminalStatuses[state.Status] {
+		if err := w.queue.Ack(ctx, task.MessageID); err != nil {
+			return true, err
+		}
+		w.logger.Warn("handover exhausted on an already-terminal execution: message acked to stop the reclaim noise",
+			"execution_id", task.ExecutionID)
+		return true, nil
+	}
+	state.Status = StatusError
+	state.EndTime = nowISO()
+	state.LastUpdateTime = state.EndTime
+	state.Error = map[string]any{
+		"message":            fmt.Sprintf("no worker accepted this task after %d handovers", count),
+		"code":               DefaultNodeAbortCode,
+		"type":               "AffinityHandoverExhausted",
+		"affinity_handovers": count,
+		"affinity_reason":    fmt.Sprintf("target %s never consumed the carrier", task.TargetInstanceID),
+	}
+	if err := w.store.SaveExecutionState(ctx, task.TenantID, state, 0); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func (w *Worker) recordHandoverLedger(ctx context.Context, task *Task, decision, reason, messageID string) {
+	entry := w.handoverEntry(task, decision, reason, messageID)
+	if _, err := w.ledger.Record(ctx, entry); err != nil {
+		// Record already logged; a ledger failure never blocks the handover.
+		return
+	}
 }
 
 // newRunningState seeds the state row for a start task (§5.1 field set).

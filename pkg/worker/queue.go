@@ -46,6 +46,20 @@ type Task struct {
 	SuspendedResumeChain bool // true when this is a decision resume carrier (§3.5)
 }
 
+// isDecisionCarrier reports the A47-F2 decision carriers: the only wake-up
+// sources of a suspended execution. They are never acked in the lease-conflict
+// window, whatever the holder's liveness says (§3.5).
+func (t *Task) isDecisionCarrier() bool {
+	if t == nil || t.Type != "resume" {
+		return false
+	}
+	switch t.ResumeType {
+	case "event", "timeout", "cancel":
+		return true
+	}
+	return false
+}
+
 // reclaimWindow mirrors task_queue.py:392-394 (#196 rotating window).
 const reclaimWindow = 8
 
@@ -54,9 +68,9 @@ const reconnectBackoff = time.Second
 
 // DeadLetterGuard is consulted before a guarded dead-letter (§9.2
 // _dead_letter_guard). It returns true to allow the dead-letter to proceed.
-// MVP guard semantics live in worker.go; the recovery-clone re-enqueue branch
-// is phase 2.
-type DeadLetterGuard func(ctx context.Context, task *Task, reason string) bool
+// The guard may re-enqueue a recovery clone and/or terminalize the execution;
+// a false return leaves the message pending.
+type DeadLetterGuard func(ctx context.Context, env *Envelope, task *Task, reason string) bool
 
 // TaskQueue implements the Redis stream task queue face.
 type TaskQueue struct {
@@ -201,7 +215,7 @@ func (q *TaskQueue) parseEnvelope(env *Envelope) (*Task, error) {
 	case "event", "timeout", "cancel":
 		// Decision carriers: the only wake-up source for suspended
 		// executions — never acked on lease conflict (§3.5 A47-F2).
-		task.SuspendedResumeChain = true
+		task.SuspendedResumeChain = task.isDecisionCarrier()
 	}
 	return task, nil
 }
@@ -355,7 +369,9 @@ func (q *TaskQueue) deadLetter(ctx context.Context, env *Envelope, task *Task, d
 		"source_id":        env.MessageID,
 		"delivery_count":   deliveryCount,
 		"dead_lettered_at": floatEpoch(),
-		"schema_version":   env.SchemaVersion,
+		// A44 b类: the audit/replay side reads the SOURCE envelope version,
+		// never this build's write version.
+		"schema_version": env.SchemaVersion,
 	}
 	if task != nil {
 		entry["payload"] = taskPayloadDict(task)
@@ -373,9 +389,13 @@ func (q *TaskQueue) deadLetter(ctx context.Context, env *Envelope, task *Task, d
 		q.logger.Error("dead letter marshal failed", "error", err, "reason", reason)
 		return
 	}
+	sourceSchema := env.SchemaVersion
+	if sourceSchema <= 0 {
+		sourceSchema = 1
+	}
 	if err := q.client.XAdd(ctx, &redis.XAddArgs{Stream: q.cfg.DLQKey, Values: map[string]any{
 		"payload":        string(blob),
-		"schema_version": strconv.Itoa(TaskSchemaVersion),
+		"schema_version": strconv.Itoa(sourceSchema),
 	}}).Err(); err != nil {
 		q.logger.Error("dead letter XADD failed", "error", err, "reason", reason)
 		return
@@ -401,11 +421,39 @@ func (q *TaskQueue) deadLetterInvalid(ctx context.Context, env *Envelope, perr e
 // deadLetterGuarded runs the dead-letter guard first (§9.2); a skipped guard
 // leaves the message pending.
 func (q *TaskQueue) deadLetterGuarded(ctx context.Context, env *Envelope, task *Task, deliveryCount int, reason string) {
-	if q.dlGuard != nil && !q.dlGuard(ctx, task, reason) {
+	if q.dlGuard != nil && !q.dlGuard(ctx, env, task, reason) {
 		q.logger.Warn("dead letter guard skipped dead-lettering", "id", env.MessageID, "reason", reason)
 		return
 	}
 	q.deadLetter(ctx, env, task, deliveryCount, reason, nil)
+}
+
+// Enqueue appends a task body to the main queue stream (worker-as-producer
+// paths: retry re-enqueue, handover, recovery clone, DLQ replay). The envelope
+// schema version is inherited from the source carrier (§2.2 / A44-02): a copy
+// written by this build must never masquerade as a newer schema than the
+// message it reproduces.
+func (q *TaskQueue) Enqueue(ctx context.Context, body map[string]any, schemaVersion int) (string, error) {
+	blob, err := json.Marshal(body)
+	if err != nil {
+		return "", err
+	}
+	return q.EnqueueRaw(ctx, string(blob), schemaVersion)
+}
+
+// EnqueueRaw appends an already-serialized payload (used by the dead-letter
+// guard's recovery clone so unknown fields survive byte-for-byte).
+func (q *TaskQueue) EnqueueRaw(ctx context.Context, payload string, schemaVersion int) (string, error) {
+	if schemaVersion <= 0 {
+		schemaVersion = TaskSchemaVersion
+	}
+	return q.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: q.cfg.QueueName,
+		Values: map[string]any{
+			"payload":        payload,
+			"schema_version": strconv.Itoa(schemaVersion),
+		},
+	}).Result()
 }
 
 // taskPayloadDict re-parses the raw payload into a generic dict for the DLQ
