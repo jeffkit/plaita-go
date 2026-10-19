@@ -346,7 +346,25 @@ func (w *Worker) SweepEventTimeouts(ctx context.Context) error {
 }
 
 // eventBridgeLoop turns Redis Pub/Sub business events into resume carriers.
+// It reconnects with the consumer-loop backoff: a Redis restart must not
+// permanently disable wake-ups in a long-lived worker.
 func (w *Worker) eventBridgeLoop(ctx context.Context) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		w.consumeEventChannel(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(reconnectBackoff):
+		}
+	}
+}
+
+// consumeEventChannel runs one Pub/Sub session until the subscription fails or
+// the context is cancelled.
+func (w *Worker) consumeEventChannel(ctx context.Context) {
 	pubsub := w.rdb.PSubscribe(ctx, w.cfg.KeyPrefix+"*:events:*")
 	defer pubsub.Close()
 	// Wait for the subscription confirmation before consuming: PSubscribe
@@ -354,7 +372,7 @@ func (w *Worker) eventBridgeLoop(ctx context.Context) {
 	// otherwise be missed with no reconciler in this build.
 	if _, err := pubsub.Receive(ctx); err != nil {
 		if ctx.Err() == nil {
-			w.logger.Warn("event bridge subscription failed", "error", err)
+			w.logger.Warn("event bridge subscription failed (will retry)", "error", err)
 		}
 		return
 	}
@@ -365,6 +383,7 @@ func (w *Worker) eventBridgeLoop(ctx context.Context) {
 			return
 		case message, ok := <-channel:
 			if !ok {
+				w.logger.Warn("event bridge channel closed (will reconnect)")
 				return
 			}
 			// The execution timeline channel {ns}:execution:events:{id} shares
