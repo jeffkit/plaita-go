@@ -79,15 +79,17 @@ make test   # 已封装代理
 | 节点 | Go 状态 | 说明 |
 |---|---|---|
 | agentrun | ✅ 已落地 | spawn 路径 + recursive-direct；**workspace 沙箱分支待做**（见下） |
-| gate / rate_limit / report | ❌ 拒载 | 管线控制原子，纯引擎逻辑，**Wave 2** |
+| gate / rate_limit / report | ✅ 已落地（2026-10-19） | 语义逐行移植；gate 的 shlex/裁剪/重试、rate_limit 的 flock 计数、report 的 token 白名单全对齐；错误重试分类已落在错误值上，**引擎按类型分流的接线待做** |
 | hitl / hitl_await | ❌ 拒载 | 需外部 resume 协议 + 挂起恢复，依赖 worker 层，**Wave 3** |
 | decision | ❌ 拒载 | 结构化决策（LLM/规则），依赖 agent/LLM 布线，**Wave 3** |
 | llm | ❌ 拒载 | 同上 |
-| notify / feishu_webhook / dingtalk_webhook / slack_webhook / wecom_webhook / generic_webhook / email_send | ❌ 拒载 | 通知/外发族，纯 HTTP 逻辑，**Wave 2**（按生产使用面挑） |
-| api_request / parse_json | ❌ 拒载 | 通用 HTTP/JSON 处理，**Wave 2** |
+| notify / feishu_webhook / dingtalk_webhook / slack_webhook / wecom_webhook / generic_webhook / email_send | ✅ 已落地（2026-10-19） | payload/加签（钉钉 HMAC）/业务码分类（feishu code/wecom·dingtalk errcode/slack ok）对齐；凭据经 `NotifyCredentialStore` 接口（宿主装配，缺省 fail-closed）；URL 打码按 _redact |
+| api_request / parse_json | ✅ 已落地（2026-10-19） | api_request：手动重定向（跨源剥头/303 规则/10 hop）、凭据经 resolver 接口 fail-closed、URL 打码；parse_json：候选提取（末行胜出，绝不用首个 `{`——#43）、verdict 白名单、join_fields |
 | capture | ❌ 拒载 | 观测捕获，随事件落盘层，**Wave 3** |
 | sql_query | ❌ 拒载 | 依赖驱动选型，按需 |
 | git_publish / github_comment / writefile | ❌ 拒载 | 文件系统/远端写操作，需沙箱/宿主工作区约定，**Wave 2-3** |
+
+**已知接线缺口（Wave 2 遗留）**：①引擎 `workflow.executeNode` 对节点错误统一按 retryTimes 重试——notify/api_request 已把「确定性 vs 瞬态」分类落在错误值上，引擎按错误类型分流的接线待做；②webhook/邮件凭据仓（Python 侧 Fernet console 存储）Go 侧为宿主装配接口，worker 主线接。
 
 ### 沙箱支持（已拍板：要支持，2026-10-19）
 

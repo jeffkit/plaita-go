@@ -77,6 +77,21 @@ var supportedNodeTypes = map[string]bool{
 	"redis":      true,
 	"code":       true,
 	"agentrun":   true,
+
+	// plaita-nodes 自包含节点集（2026-10-19 Wave 2 对齐）
+	"gate":             true,
+	"rate_limit":       true,
+	"report":           true,
+	"notify":           true,
+	"feishu_webhook":   true,
+	"dingtalk_webhook": true,
+	"slack_webhook":    true,
+	"wecom_webhook":    true,
+	"generic_webhook":  true,
+	"email_send":       true,
+	"api_request":      true,
+	"parse_json":       true,
+	"writefile":        true,
 }
 
 // knownUnsupported types carry a targeted hint; anything else unknown gets a

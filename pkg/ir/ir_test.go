@@ -317,3 +317,41 @@ func TestLoadAgentRunRejects(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "agentrun")
 }
+
+// plaita-nodes self-contained nodes load through the same contract: camel
+// aliases fold, the chain builds.
+func TestLoadPlaitaNodesFlow(t *testing.T) {
+	data := []byte(`{
+		"flow_id": "nodes_flow",
+		"nodes": [
+			{"type": "start", "id": "s", "next": "g"},
+			{"type": "gate", "id": "g", "gate_name": "check", "command": "true",
+			 "timeout_secs": 30, "max_retries": 1, "dryRun": false, "next": "p"},
+			{"type": "parse_json", "id": "p", "text": "$NODE.g.stdout", "choices": ["yes"],
+			 "join_fields": ["tags"], "next": "w"},
+			{"type": "writefile", "id": "w", "path": "out/result.json",
+			 "content": "$NODE.p", "json": true, "next": "e"},
+			{"type": "end", "id": "e", "resultType": "success", "output": "$NODE.p.parse_ok"}
+		]
+	}`)
+	wf, err := Load(data)
+	require.NoError(t, err)
+	types := map[string]bool{}
+	for _, n := range wf.Nodes {
+		types[string(n.GetType())] = true
+	}
+	assert.True(t, types["gate"] && types["parse_json"] && types["writefile"])
+}
+
+func TestLoadNotifyFamilyAccepted(t *testing.T) {
+	for _, typ := range []string{"notify", "feishu_webhook", "dingtalk_webhook",
+		"slack_webhook", "wecom_webhook", "generic_webhook", "email_send",
+		"api_request", "rate_limit", "report"} {
+		data := []byte(`{"nodes":[
+			{"type":"start","id":"s","next":"n"},
+			{"type":"` + typ + `","id":"n","timeoutSecs":5}
+		]}`)
+		_, err := Load(data)
+		require.NoError(t, err, "type %s should load", typ)
+	}
+}

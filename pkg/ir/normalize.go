@@ -197,6 +197,8 @@ func normalizeNode(n map[string]any) error {
 	}
 	foldKey(n, "output_type", "outputType")
 
+	foldNodeFieldAliases(n)
+
 	switch t {
 	case "switch":
 		return translateSwitch(n)
@@ -257,6 +259,32 @@ func normalizeHandler(n map[string]any, key string, meta map[string]string, reco
 		}
 	}
 	return nil
+}
+
+// nodeFieldAliases folds the camelCase spellings of plaita-nodes node
+// fields into their canonical snake_case JSON tags (the Go nodes use the
+// Python field names as tags; these aliases cover the mixed-case fields).
+var nodeFieldAliases = [][2]string{
+	{"timeoutSecs", "timeout_secs"},
+	{"maxRetries", "max_retries"},
+	{"dryRun", "dry_run"},
+	{"storeDir", "store_dir"},
+	{"baseDir", "base_dir"},
+	{"gateName", "gate_name"},
+	{"bodyIsHtml", "body_is_html"},
+	{"timeoutMs", "timeout_ms"},
+	{"raiseOnError", "raise_on_error"},
+	{"allowRedirects", "allow_redirects"},
+	{"joinFields", "join_fields"},
+	{"workspaceRoot", "workspace_root"},
+}
+
+// foldNodeFieldAliases applies the alias table to a node doc (harmless when
+// keys are absent).
+func foldNodeFieldAliases(n map[string]any) {
+	for _, pair := range nodeFieldAliases {
+		foldKey(n, pair[0], pair[1])
+	}
 }
 
 // translateSwitch: plaita branches allow name-as-target (branch_name_as_target);
