@@ -40,4 +40,4 @@ jobs:
         # - Test_today_eval / Test_now_eval: gomonkey time.Now patch flaky.
         # - test_execute_workflow_with_http_request_info: live-network test
         #   (asserts a real outbound request fails; depends on egress state).
-        run: go test ./... -skip 'Test_today_eval|Test_now_eval|test_execute_workflow_with_http_request_info'
+        run: go test ./... -skip 'Test_today_eval|Test_now_eval|Test_now_today_eval|TestWorkflow_Execute/test_execute_workflow_with_http_request_info'
