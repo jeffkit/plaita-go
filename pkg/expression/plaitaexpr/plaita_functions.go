@@ -259,17 +259,17 @@ func plaitaContains(container, needle any) (bool, error) {
 // registered as a side-effect/mutator). It supports BOTH containers:
 //   - list:  list.pop(index) — index required (plaita always passes it),
 //     negative index counts from the end, IndexError when out of range;
-//     returns the removed element and shrinks the list in place.
+//     returns the removed element;
 //   - dict:  dict.pop(key) — no default variant in plaita, KeyError when the
-//     key is missing; returns the removed value and deletes the key in place.
+//     key is missing; returns the removed value.
 //
-// Go note: map deletion is fully in-place (maps are reference types). For a
-// slice the elements are shifted and the tail zeroed in the shared backing
-// array, but Go cannot shrink the caller's slice header — a subsequent plain
-// read of the original variable still reports the old length. The function
-// returns the popped element (plaita's contract); callers needing the
-// shrunken list should persist `$F.slice(l, 0, $F.len(l)-1)`-style results
-// themselves.
+// plaita#69 write protection (issue #9): the evaluator refuses live context
+// roots ($INPUT/$NODE/$GLOBAL/$PARENT/$ENV paths) as the pop target with a
+// named error BEFORE evaluation — exactly the ValueError plaita raises. For
+// the fresh targets that remain legal, the removal happens on a COPY: the
+// caller's slice header cannot shrink in Go anyway, and the previous
+// in-place variant left "length unchanged, tail zeroed" corruption
+// (`[1,2,3]` → `[2,3,0]`) in whatever array the input shared.
 func pop(container, key any) (any, error) {
 	switch c := container.(type) {
 	case nil:
@@ -284,7 +284,8 @@ func pop(container, key any) (any, error) {
 		if !found {
 			return nil, fmt.Errorf("$F.pop: KeyError: %q", k)
 		}
-		delete(c, k)
+		out := copyPyMap(c)
+		delete(out, k)
 		return v, nil
 	case string:
 		return nil, fmt.Errorf("$F.pop: 'str' object has no attribute 'pop'")
@@ -292,6 +293,9 @@ func pop(container, key any) (any, error) {
 	rv := reflect.ValueOf(container)
 	switch rv.Kind() {
 	case reflect.Map:
+		// Non string-keyed exotic maps are outside the JSON value domain;
+		// read-only pop (the copy discipline of the map[string]any branch
+		// carries: nothing shared is mutated, post-gate this is unobservable).
 		keyVal := reflect.ValueOf(key)
 		if !keyVal.IsValid() || keyVal.Type() != rv.Type().Key() {
 			return nil, fmt.Errorf("$F.pop: KeyError: %v", key)
@@ -300,20 +304,20 @@ func pop(container, key any) (any, error) {
 		if !existing.IsValid() {
 			return nil, fmt.Errorf("$F.pop: KeyError: %v", key)
 		}
-		result := existing.Interface()
-		rv.SetMapIndex(keyVal, reflect.Zero(keyVal.Type()))
-		return result, nil
+		return existing.Interface(), nil
 	case reflect.Slice:
 		idx, err := popIndex(key, rv.Len())
 		if err != nil {
 			return nil, err
 		}
-		result := rv.Index(idx).Interface()
-		// Shift the tail left in the shared backing array and zero the last
-		// slot (the caller's slice header cannot shrink in Go).
-		reflect.Copy(rv.Slice(idx, rv.Len()-1), rv.Slice(idx+1, rv.Len()))
-		rv.Index(rv.Len() - 1).Set(reflect.Zero(rv.Type().Elem()))
-		return result, nil
+		// Copy first, shrink the COPY: the input slice (and its backing
+		// array) is left untouched — no more "shifted + zeroed tail"
+		// write-through on shared arrays.
+		out := make([]any, rv.Len())
+		reflect.Copy(reflect.ValueOf(out), rv)
+		popped := out[idx]
+		out = append(out[:idx], out[idx+1:]...)
+		return popped, nil
 	default:
 		return nil, fmt.Errorf("$F.pop: %T object has no attribute 'pop'", container)
 	}

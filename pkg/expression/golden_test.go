@@ -1,10 +1,12 @@
 package expression_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -34,8 +36,14 @@ func TestPlaitaExpressionGolden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read golden cases: %v", err)
 	}
+	// UseNumber keeps the exported Python types faithful: a Python int 3 in
+	// the original test arrives as JSON `3` and must stay an int on the Go
+	// side (Python str(3) == "3", str(3.0) == "3.0" — template interpolation
+	// renders the difference, so the decode must not lose it).
 	var cases []goldenCase
-	if err := json.Unmarshal(data, &cases); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&cases); err != nil {
 		t.Fatalf("parse golden cases: %v", err)
 	}
 	if len(cases) == 0 {
@@ -86,6 +94,7 @@ func goldenContext(t *testing.T, m map[string]any) context.Context {
 	}
 	for k, v := range m {
 		name := strings.TrimPrefix(k, "$")
+		v = restoreGoldenNumbers(v)
 		switch name {
 		case "INPUT":
 			rc.WorkflowInput = v
@@ -119,6 +128,35 @@ func goldenContext(t *testing.T, m map[string]any) context.Context {
 func wantErr(raw json.RawMessage) bool {
 	var m map[string]any
 	return json.Unmarshal(raw, &m) == nil && m["$error"] != nil
+}
+
+// restoreGoldenNumbers converts UseNumber-decoded json.Number values back to
+// the Python types the export started from: integral numbers become int64
+// (Python int), everything else float64 (Python float).
+func restoreGoldenNumbers(v any) any {
+	switch t := v.(type) {
+	case json.Number:
+		if i, err := strconv.ParseInt(t.String(), 10, 64); err == nil {
+			return i
+		}
+		f, err := strconv.ParseFloat(t.String(), 64)
+		if err != nil {
+			return t
+		}
+		return f
+	case map[string]any:
+		for k, e := range t {
+			t[k] = restoreGoldenNumbers(e)
+		}
+		return t
+	case []any:
+		for i, e := range t {
+			t[i] = restoreGoldenNumbers(e)
+		}
+		return t
+	default:
+		return v
+	}
 }
 
 func errorName(raw json.RawMessage) string {

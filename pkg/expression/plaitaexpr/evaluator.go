@@ -75,6 +75,14 @@ func (e *Evaluator) evalFunc(
 ) (model.Value, error) {
 	execArgs := execArgsFromRuntimeCtx(ctx)
 	deepCopy(parameters, &execArgs)
+	// plaita#69 write protection (issue #9): a mutator whose target is a live
+	// context root ($INPUT/$NODE/$GLOBAL/$ENV/$ERROR/$PARENT path) is a named
+	// error BEFORE anything evaluates — the ValueError plaita raises in
+	// _gate_mutator_argument. Must run before the variable pre-resolution,
+	// which would hide the roots behind synthetic identifiers.
+	if err := gateMutatorLiveRoot(expr.Statement()); err != nil {
+		return model.Value{}, err
+	}
 	statement, err := preResolveStatementVariables(expr, expr.Statement(), execArgs)
 	if err != nil {
 		return model.Value{}, err
@@ -85,6 +93,152 @@ func (e *Evaluator) evalFunc(
 	// before resolving the function, so a failing argument errors first.
 	result, err := goval.NewEvaluator().Evaluate(statement, execArgs, AllFunctions())
 	return model.NewValue(result), err
+}
+
+// mutatorFuncs are the $F functions Python's expression.py registers with
+// has_side_effects=True — the ones plaita#69's gate covers. delete and
+// delDictValue are `a.pop(b)`; delListItem is `a.pop(b)` too.
+var mutatorFuncs = map[string]bool{
+	"set":          true,
+	"setDictValue": true,
+	"delete":       true,
+	"delDictValue": true,
+	"clear":        true,
+	"clearDict":    true,
+	"pop":          true,
+	"delListItem":  true,
+	"setListItem":  true,
+}
+
+// freshListProducers are the pure $F calls whose result is a NEW list by
+// construction (Python's shallow producers): mutating such a result never
+// reaches a persisted context root, so they are the one legal target shape
+// for a mutator (`$F.pop($F.append($INPUT.list, 4), 0)`).
+var freshListProducers = map[string]bool{
+	"append":         true,
+	"addListItem":    true,
+	"extend":         true,
+	"insert":         true,
+	"insertListItem": true,
+	"remove":         true,
+	"slice":          true,
+	"reverse":        true,
+	"sort":           true,
+	"split":          true,
+	"keys":           true,
+	"values":         true,
+	"items":          true,
+	"getDictKeys":    true,
+	"getDictValues":  true,
+	"json_loads":     true,
+}
+
+// mutatorHeadRe matches the statement head: a mutator call identifier and its
+// opening paren (`set(INPUT.map, "c", 3)`).
+var mutatorHeadRe = regexp.MustCompile(`^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+
+// calleeHeadRe matches a callee head inside a target argument
+// (`append(INPUT.list, 4)`).
+var calleeHeadRe = regexp.MustCompile(`^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+
+// statementRootRefRe matches a live context root reference in a
+// dollar-stripped statement (`INPUT.list`, `PARENT.INPUT.a`, bare `INPUT`).
+// A root token in field position (preceded by '.') is NOT a root reference —
+// same rule as plaita's _scan_root_refs_impl.
+var statementRootRefRe = regexp.MustCompile(
+	`(?:^|[^A-Za-z0-9_.$])(INPUT|NODE|GLOBAL|ENV|ERROR|PARENT)(?:\.|[^A-Za-z0-9_.$]|$)`)
+
+// gateMutatorLiveRoot implements the plaita#69 mutator write protection for
+// the Go engine: when the statement calls a mutator and its TARGET argument
+// (position 0) references a live context root, the call is refused with a
+// named error before evaluation — mirroring plaita's `_gate_mutator_argument`
+// ValueError ("mutation of a persisted root").
+//
+// The statement is the dollar-stripped goval form (parser.parseFunc already
+// removed every "$"), and quoted literals are masked before scanning so a
+// string like "set(INPUT...)" inside an argument cannot trip the gate.
+func gateMutatorLiveRoot(statement string) error {
+	head := mutatorHeadRe.FindStringSubmatch(statement)
+	if head == nil || !mutatorFuncs[head[1]] {
+		return nil
+	}
+	fn := head[1]
+	target, ok := firstStatementArg(statement[len(head[0]):])
+	if !ok {
+		// No argument to classify (cannot happen for the registered mutators,
+		// which all take a target) — let evaluation surface the arity error.
+		return nil
+	}
+	if mutatorTargetAllowed(target) {
+		return nil
+	}
+	return fmt.Errorf(
+		"$F.%s: cannot mutate live context path '%s' (plaita#69 write protection: mutator targets must be fresh containers, not $INPUT/$NODE/$GLOBAL/$PARENT/$ENV paths)",
+		fn, target)
+}
+
+// mutatorTargetAllowed classifies the target argument text: a fresh list
+// producer call is allowed outright; any other target is allowed only when it
+// references no live context root.
+func mutatorTargetAllowed(target string) bool {
+	trimmed := strings.TrimSpace(target)
+	if callee := calleeHeadRe.FindStringSubmatch(trimmed); callee != nil {
+		if freshListProducers[callee[1]] {
+			return true
+		}
+	}
+	return !referencesLiveRoot(trimmed)
+}
+
+// referencesLiveRoot reports whether a dollar-stripped statement fragment
+// references one of the live context roots outside of quoted literals.
+func referencesLiveRoot(fragment string) bool {
+	masked := quotedSpanRe.ReplaceAllString(fragment, " ")
+	return statementRootRefRe.MatchString(masked)
+}
+
+// firstStatementArg extracts the first top-level argument of the argument
+// list beginning at src (which starts right after the head function's opening
+// paren) and reports whether one exists.
+func firstStatementArg(src string) (string, bool) {
+	depth := 0
+	var b strings.Builder
+	for i := 0; i < len(src); i++ {
+		c := src[i]
+		switch c {
+		case '"':
+			// copy the literal verbatim (escapes included)
+			b.WriteByte(c)
+			i++
+			for i < len(src) {
+				b.WriteByte(src[i])
+				if src[i] == '\\' && i+1 < len(src) {
+					i++
+					b.WriteByte(src[i])
+				} else if src[i] == '"' {
+					break
+				}
+				i++
+			}
+		case '(', '[', '{':
+			depth++
+			b.WriteByte(c)
+		case ')', ']', '}':
+			if depth == 0 {
+				return strings.TrimSpace(b.String()), b.Len() > 0
+			}
+			depth--
+			b.WriteByte(c)
+		case ',':
+			if depth == 0 {
+				return strings.TrimSpace(b.String()), b.Len() > 0
+			}
+			b.WriteByte(c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return strings.TrimSpace(b.String()), b.Len() > 0
 }
 
 // preResolvedPrefix is the synthetic identifier prefix under which
