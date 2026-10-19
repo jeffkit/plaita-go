@@ -92,6 +92,14 @@ var supportedNodeTypes = map[string]bool{
 	"api_request":      true,
 	"parse_json":       true,
 	"writefile":        true,
+
+	// Wave 2.5/2.6（2026-10-19）：本地命令/远端写 + LLM 原子 + 人工确认
+	"capture":        true,
+	"git_publish":    true,
+	"github_comment": true,
+	"llm":            true,
+	"decision":       true,
+	"hitl":           true,
 }
 
 // knownUnsupported types carry a targeted hint; anything else unknown gets a

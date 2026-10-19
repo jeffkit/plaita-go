@@ -143,8 +143,8 @@ func TestLoadRejects(t *testing.T) {
 	}{
 		{
 			name: "unsupported known type",
-			doc:  `{"nodes":[{"type":"start","id":"s","next":"d"},{"type":"decision","id":"d"}]}`,
-			want: "decision",
+			doc:  `{"nodes":[{"type":"start","id":"s","next":"d"},{"type":"hitl_await","id":"d"}]}`,
+			want: "hitl_await",
 		},
 		{
 			name: "unknown type",
@@ -347,6 +347,18 @@ func TestLoadNotifyFamilyAccepted(t *testing.T) {
 	for _, typ := range []string{"notify", "feishu_webhook", "dingtalk_webhook",
 		"slack_webhook", "wecom_webhook", "generic_webhook", "email_send",
 		"api_request", "rate_limit", "report"} {
+		data := []byte(`{"nodes":[
+			{"type":"start","id":"s","next":"n"},
+			{"type":"` + typ + `","id":"n","timeoutSecs":5}
+		]}`)
+		_, err := Load(data)
+		require.NoError(t, err, "type %s should load", typ)
+	}
+}
+
+func TestLoadWave25NodesAccepted(t *testing.T) {
+	for _, typ := range []string{"capture", "git_publish", "github_comment",
+		"llm", "decision", "hitl"} {
 		data := []byte(`{"nodes":[
 			{"type":"start","id":"s","next":"n"},
 			{"type":"` + typ + `","id":"n","timeoutSecs":5}
