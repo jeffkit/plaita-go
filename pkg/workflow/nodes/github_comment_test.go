@@ -161,6 +161,11 @@ func TestGithubCommentPost(t *testing.T) {
 }
 
 func TestGithubCommentRedactionAppliedBeforePost(t *testing.T) {
+	// [ARTIFACT-DIR] replacement only matches when the artifact dir sits
+	// outside the generic path rules (/Users, /home — Python applies those
+	// first too, and a dir under them still gets masked, just differently).
+	// Pin TMPDIR so the assertion is deterministic regardless of host layout.
+	t.Setenv("TMPDIR", "/tmp")
 	f := githubCommentStartFake(t)
 	githubCommentFakeEnv(t, f, "test-token")
 	artDir := t.TempDir()
