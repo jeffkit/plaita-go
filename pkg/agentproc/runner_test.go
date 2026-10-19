@@ -45,20 +45,20 @@ func TestRunStreamingAssembly(t *testing.T) {
 
 func TestRunNonStreamingUsesResultText(t *testing.T) {
 	script := `IFS= read -r _ || true; printf '%s\n' '{"type":"partial","text":"ignored"}' '{"type":"result","text":"final"}'`
-	res, err := runScript(t, script, RunOptions{Message: "hi", Streaming: false}, 0)
+	res, err := runScript(t, script, RunOptions{Message: "hi", Streaming: false, CollectDetails: true}, 0)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if res.Text != "final" {
-		t.Errorf("text = %q, want result.text", res.Text)
+		t.Fatalf("text = %q, want result.text; raw lines: %q", res.Text, res.Details)
 	}
 }
 
 func TestRunErrorEventIsTerminalEvenWithExitZero(t *testing.T) {
 	script := `IFS= read -r _ || true; printf '%s\n' '{"type":"partial","text":"half "}' '{"type":"error","message":"upstream rate limited"}'; exit 0`
-	res, err := runScript(t, script, RunOptions{Message: "hi", Streaming: true}, 0)
+	res, err := runScript(t, script, RunOptions{Message: "hi", Streaming: true, CollectDetails: true}, 0)
 	if err == nil {
-		t.Fatal("expected failure on error event")
+		t.Fatalf("expected failure on error event; got res=%+v details=%q", res, res.Details)
 	}
 	if !strings.Contains(err.Error(), "upstream rate limited") {
 		t.Errorf("error = %v", err)
