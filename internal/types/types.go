@@ -21,6 +21,7 @@ const (
 	NodeTypeHTTP       NodeType = "http"
 	NodeTypeCode       NodeType = "code"
 	NodeTypeRedis      NodeType = "redis"
+	NodeTypeAgentRun   NodeType = "agentrun"
 	NodeTypeMDB        NodeType = "mdb"
 	NodeTypeReadMDB    NodeType = "readmdb"
 	NodeTypeWriteMDB   NodeType = "writemdb"

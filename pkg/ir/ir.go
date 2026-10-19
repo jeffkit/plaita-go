@@ -76,6 +76,7 @@ var supportedNodeTypes = map[string]bool{
 	"http":       true,
 	"redis":      true,
 	"code":       true,
+	"agentrun":   true,
 }
 
 // knownUnsupported types carry a targeted hint; anything else unknown gets a

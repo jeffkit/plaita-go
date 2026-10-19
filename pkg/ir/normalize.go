@@ -212,6 +212,22 @@ func normalizeNode(n map[string]any) error {
 		return translateCode(n)
 	case "end":
 		return translateEnd(n)
+	case "agentrun":
+		return translateAgentRun(n)
+	}
+	return nil
+}
+
+// translateAgentRun folds the agentrun node's camel spellings into the
+// snake field names plaita-nodes defines, and rejects the sandbox branch
+// (workspace) — this engine has no sandbox driver, so the flow must not
+// load instead of silently running on the host.
+func translateAgentRun(n map[string]any) error {
+	foldKey(n, "timeoutSecs", "timeout_secs")
+	foldKey(n, "dryRun", "dry_run")
+	if v := firstAny(n, "workspace"); v != nil && v != "" {
+		return fmt.Errorf("agentrun workspace (sandbox branch) is not supported by this engine; " +
+			"use repo for host-side runs or run this flow on the plaita runtime")
 	}
 	return nil
 }

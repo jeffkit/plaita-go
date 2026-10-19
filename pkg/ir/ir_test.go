@@ -271,3 +271,49 @@ func TestPlaitaConditionOperators(t *testing.T) {
 	assert.Equal(t, "miss", run(t, flowWith("truthy", nil), map[string]any{"v": ""}))
 	assert.Equal(t, "hit", run(t, flowWith("falsy", nil), map[string]any{"v": 0}))
 }
+
+func TestLoadAgentRun(t *testing.T) {
+	data := []byte(`{
+		"flow_id": "agent_flow",
+		"nodes": [
+			{"type": "start", "id": "s", "next": "run"},
+			{"type": "agentrun", "id": "run", "agent": "echo", "prompt": "$INPUT.q",
+			 "timeout_secs": 90, "next": "end"},
+			{"type": "end", "id": "end", "resultType": "success", "output": "$NODE.run.text"}
+		]
+	}`)
+	wf, err := Load(data)
+	require.NoError(t, err)
+
+	var agentNode interface {
+		GetID() workflow.NodeID
+		GetMetadata() map[string]string
+	}
+	found := false
+	for _, n := range wf.Nodes {
+		if n.GetID() == "run" {
+			agentNode, found = n.(interface {
+				GetID() workflow.NodeID
+				GetMetadata() map[string]string
+			}), true
+		}
+	}
+	require.True(t, found, "agentrun node not loaded")
+	require.NotNil(t, agentNode)
+}
+
+func TestLoadAgentRunRejects(t *testing.T) {
+	_, err := Load([]byte(`{"nodes":[
+		{"type":"start","id":"s","next":"r"},
+		{"type":"agentrun","id":"r","agent":"a","workspace":"/sbx","repo":"/host"}
+	]}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "workspace")
+
+	_, err = Load([]byte(`{"nodes":[
+		{"type":"start","id":"s","next":"r"},
+		{"type":"agent","id":"r","agent":"a"}
+	]}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "agentrun")
+}

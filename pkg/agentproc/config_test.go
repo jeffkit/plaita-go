@@ -1,0 +1,128 @@
+package agentproc
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func writeConfig(t *testing.T, agents, providers string) *Registry {
+	t.Helper()
+	dir := t.TempDir()
+	if agents != "" {
+		if err := os.WriteFile(filepath.Join(dir, "agents.json"), []byte(agents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if providers != "" {
+		if err := os.WriteFile(filepath.Join(dir, "providers.json"), []byte(providers), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return &Registry{Dir: dir}
+}
+
+const testProviders = `{"providers": {
+  "glm": {"type": "anthropic", "apiBase": "https://open.bigmodel.cn/api/anthropic", "model": "glm-5.3-flash", "apiKey": "key-123"},
+  "viaEnv": {"type": "anthropic", "apiBase": "https://x", "keyEnv": "TEST_PROVIDER_KEY"}
+}}`
+
+func TestResolveRecursiveWithProvider(t *testing.T) {
+	r := writeConfig(t, `{"agents": {
+    "glm53": {"executor": "recursive", "provider": "glm", "model": "glm-5.3-flash",
+      "command": "python3", "args": ["/hub/recursive/bridge.py"], "env": {"RECURSIVE_MAX_TOKENS": "65536"}}
+  }}`, testProviders)
+
+	spec, err := r.ResolveAgent("glm53")
+	if err != nil {
+		t.Fatalf("ResolveAgent: %v", err)
+	}
+	if spec.Command != "python3" || len(spec.Args) != 1 || spec.Args[0] != "/hub/recursive/bridge.py" {
+		t.Errorf("spawn config = %s %v", spec.Command, spec.Args)
+	}
+	for _, want := range [][2]string{
+		{"RECURSIVE_PROVIDER_TYPE", "anthropic"},
+		{"RECURSIVE_API_BASE", "https://open.bigmodel.cn/api/anthropic"},
+		{"RECURSIVE_API_KEY", "key-123"},
+		{"RECURSIVE_MODEL", "glm-5.3-flash"},
+		{"RECURSIVE_MAX_TOKENS", "65536"},
+	} {
+		if got := spec.Env[want[0]]; got != want[1] {
+			t.Errorf("env[%s] = %q, want %q", want[0], got, want[1])
+		}
+	}
+	if spec.Model != "glm-5.3-flash" {
+		t.Errorf("model = %q", spec.Model)
+	}
+}
+
+func TestResolveClaudeTranslator(t *testing.T) {
+	r := writeConfig(t, `{"agents": {
+    "cc": {"executor": "claude", "provider": "glm", "command": "x", "args": []}
+  }}`, testProviders)
+	spec, err := r.ResolveAgent("cc")
+	if err != nil {
+		t.Fatalf("ResolveAgent: %v", err)
+	}
+	if spec.Env["ANTHROPIC_BASE_URL"] == "" || spec.Env["ANTHROPIC_AUTH_TOKEN"] != "key-123" {
+		t.Errorf("env = %v", spec.Env)
+	}
+	if spec.Env["CLAUDE_MODEL"] != "glm-5.3-flash" {
+		t.Errorf("model env = %q", spec.Env["CLAUDE_MODEL"])
+	}
+}
+
+func TestResolveLockedExecutorRejectsProvider(t *testing.T) {
+	r := writeConfig(t, `{"agents": {
+    "cur": {"executor": "cursor", "provider": "glm", "command": "x"}
+  }}`, testProviders)
+	_, err := r.ResolveAgent("cur")
+	if err == nil || !strings.Contains(err.Error(), "locked CLI") {
+		t.Fatalf("err = %v, want locked-CLI rejection", err)
+	}
+}
+
+func TestResolveMissingCommandFailsClosed(t *testing.T) {
+	r := writeConfig(t, `{"agents": {"a": {"executor": "recursive"}}}`, "")
+	_, err := r.ResolveAgent("a")
+	if err == nil || !strings.Contains(err.Error(), "missing command") {
+		t.Fatalf("err = %v, want missing command", err)
+	}
+}
+
+func TestResolveKeyEnv(t *testing.T) {
+	t.Setenv("TEST_PROVIDER_KEY", "from-env-999")
+	r := writeConfig(t, `{"agents": {
+    "a": {"executor": "claude", "provider": "viaEnv", "command": "x"}
+  }}`, testProviders)
+	spec, err := r.ResolveAgent("a")
+	if err != nil {
+		t.Fatalf("ResolveAgent: %v", err)
+	}
+	if spec.Env["ANTHROPIC_AUTH_TOKEN"] != "from-env-999" {
+		t.Errorf("auth token = %q", spec.Env["ANTHROPIC_AUTH_TOKEN"])
+	}
+}
+
+func TestResolveVarExpansion(t *testing.T) {
+	t.Setenv("TEST_HUB_DIR", "/opt/hub")
+	r := writeConfig(t, `{"agents": {
+    "a": {"executor": "recursive", "command": "python3", "args": ["${TEST_HUB_DIR}/bridge.py"], "env": {"W": "${TEST_HUB_DIR}"}}
+  }}`, "")
+	spec, err := r.ResolveAgent("a")
+	if err != nil {
+		t.Fatalf("ResolveAgent: %v", err)
+	}
+	if spec.Args[0] != "/opt/hub/bridge.py" || spec.Env["W"] != "/opt/hub" {
+		t.Errorf("args=%v env=%v", spec.Args, spec.Env)
+	}
+}
+
+func TestResolveUnknownAgent(t *testing.T) {
+	r := writeConfig(t, `{"agents": {}}`, "")
+	_, err := r.ResolveAgent("nope")
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("err = %v", err)
+	}
+}
