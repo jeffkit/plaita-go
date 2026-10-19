@@ -20,10 +20,14 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
   internal/interpreter/ goja（JS）/ yeagi（Go 源码）解释器，code 节点用
   pkg/model, pkg/parser, pkg/providers/  流程模型、解析、flow 来源（fs/memory）
   pkg/delegate, pkg/discovery/           http 节点的委托与寻址（polaris 已删，仅 domain/noop）
+  pkg/worker/       runtime worker MVP（2026-10-19）：Streams 取单/租约 Lua/状态写回/事件/取消/心跳
+  cmd/plaita-worker/  worker 入口（env 配置，影子键前缀可覆写）
+  pkg/llm/          LLM provider 链（OpenAI/Anthropic 兼容）
+  docs/WORKER_PROTOCOL.md  worker 协议权威文档（田野调查，实现与影子对账的验收基准）
 规划中：
-  nodes/agentproc/  agentproc stdin/stdout NDJSON 客户端 → agent 节点
-  runtime/      worker、队列接入、租约、事件持久化（对齐 plaita server/ 语义）
+  worker 二期      orphan watch/resume 载体语义(A47-F2)/dispatch_ledger/DLQ replay/drain 三态/节点级重试预算
   server/       console BFF 契约只读子集（execution 查询/事件流）
+  沙箱           Docker driver 优先 + AGS HTTP API（lease 与 worker 租约同族设计）
 ```
 
 ## IR 契约层（pkg/ir，已落地 2026-10-19）
