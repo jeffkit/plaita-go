@@ -67,22 +67,22 @@ func TestEval_PlaitaStringDispatch(t *testing.T) {
 		{
 			name: "single interpolation stringifies value",
 			expr: "v: {% $INPUT.a %}",
-			want: "v: 1",
+			want: "v: 1.0", // Python str(1.0) == "1.0" (issue #8)
 		},
 		{
 			name: "whole-string template is still a string (not native type)",
 			expr: "{% $INPUT.a %}",
-			want: "1",
+			want: "1.0",
 		},
 		{
 			name: "multi interpolation",
 			expr: "{%$INPUT.a%} and {%$a.b%}",
-			want: "1 and 2",
+			want: "1.0 and 2.0",
 		},
 		{
 			name: "multi-line template with multiple fragments",
 			expr: "line1\nname={%$INPUT.list.0.name%}\nsum={% $F.add($INPUT.a, $a.b) %}",
-			want: "line1\nname=hello\nsum=3",
+			want: "line1\nname=hello\nsum=3.0",
 		},
 		{
 			name: "fragment without dollar prefix stays literal",
@@ -102,7 +102,7 @@ func TestEval_PlaitaStringDispatch(t *testing.T) {
 		{
 			name: "trailing unclosed fragment stays literal after valid one",
 			expr: "a {% $INPUT.a %} b {%",
-			want: "a 1 b {%",
+			want: "a 1.0 b {%",
 		},
 		{
 			name: "empty fragment stays literal",
@@ -169,7 +169,114 @@ func TestEval_MapAndListRecursion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Eval() error = %v", err)
 	}
-	if got != "missing field stays nil: " {
+	// Python str(None) == "None" (issue #8: the old cast.ToString rendered "")
+	if got != "missing field stays nil: None" {
 		t.Errorf("Eval() got = %#v", got)
+	}
+}
+
+// TestEval_TemplatePythonStr pins issue #8's acceptance table: template
+// interpolation renders values with Python str() semantics — None → "None",
+// True/False, dicts/lists as Python repr — and bare-constant fragments
+// (true/None/numbers/strings) evaluate like plaita's template grammar
+// (`constant | function_call | variable`), instead of staying literal.
+func TestEval_TemplatePythonStr(t *testing.T) {
+	runtimeCtx := &runtime.Context{
+		WorkflowInput: map[string]any{
+			"map":     map[string]any{"b": 2.0, "a": 1.0},
+			"list":    []any{1.0, 2.0, 3.0},
+			"missing": nil,
+			"s":       "txt",
+		},
+	}
+	tests := []struct {
+		name string
+		expr string
+		want string
+	}{
+		// the acceptance table of issue #8 (dict key order is the documented
+		// Go divergence: Go maps are unordered, rendering is sorted)
+		{"map renders as Python repr", "{% $INPUT.map %}", "{'a': 1.0, 'b': 2.0}"},
+		{"list renders as Python repr", "{% $INPUT.list %}", "[1.0, 2.0, 3.0]"},
+		{"None renders as None", "{% $INPUT.missing %}", "None"},
+		{"bool literal fragment", "{% true %}", "True"},
+		{"False literal fragment", "{% false %}", "False"},
+		{"None literal fragment", "{% None %}", "None"},
+		{"null literal fragment", "{% null %}", "None"},
+		{"int literal fragment", "{% 1 %}", "1"},
+		{"float literal fragment", "{% 2.5 %}", "2.5"},
+		{"int kept int-shaped", "{% $F.add(1, 2) %}", "3"},
+		{"bool renders capitalized", "{% $F.eq(1, 1) %}", "True"},
+		{"quoted string fragment", "{% 'txt' %}", "txt"},
+		{"plain text unchanged", "hello {% world %}", "hello {% world %}"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := evalStringHelper(t, runtimeCtx, tt.expr)
+			if err != nil {
+				t.Fatalf("Eval() error = %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("Eval() got = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestEval_TemplateStructuredContentE2E pins the issue #8 agentrun-prompt
+// scenario: an upstream node's structured result interpolated into a prompt
+// keeps its content instead of silently collapsing to "".
+func TestEval_TemplateStructuredContentE2E(t *testing.T) {
+	runtimeCtx := &runtime.Context{
+		ExecuteNodeResults: map[string]any{
+			"previous": map[string]any{
+				"items": []any{"alpha", "beta"},
+				"count": 2.0,
+			},
+		},
+	}
+	got, err := evalStringHelper(t, runtimeCtx,
+		"Summarize this: {% $NODE.previous %}")
+	if err != nil {
+		t.Fatalf("Eval() error = %v", err)
+	}
+	want := "Summarize this: {'count': 2.0, 'items': ['alpha', 'beta']}"
+	if got != want {
+		t.Errorf("Eval() got = %#v, want %#v", got, want)
+	}
+}
+
+// TestEval_MutatorLiveRootRefused pins issue #9's write protection at the
+// facade level: mutator calls over live context roots are named errors, the
+// context object is untouched.
+func TestEval_MutatorLiveRootRefused(t *testing.T) {
+	runtimeCtx := &runtime.Context{
+		WorkflowInput: map[string]any{
+			"m":    map[string]any{"a": 1.0},
+			"list": []any{1.0, 2.0, 3.0},
+		},
+	}
+	for _, expr := range []string{
+		`$F.set($INPUT.m, 'c', 3)`,
+		`$F.clear($INPUT.m)`,
+		`$F.setListItem($INPUT.list, 0, 9)`,
+		`$F.pop($INPUT.list, 0)`,
+		`$F.delete($INPUT.m, 'a')`,
+	} {
+		t.Run(expr, func(t *testing.T) {
+			_, err := evalStringHelper(t, runtimeCtx, expr)
+			if err == nil {
+				t.Fatal("Eval() expected a plaita#69 write-protection error, got nil")
+			}
+		})
+	}
+	// the live context is unchanged after all the refusals
+	m := runtimeCtx.WorkflowInput.(map[string]any)["m"].(map[string]any)
+	if len(m) != 1 {
+		t.Errorf("live map was mutated: %#v", m)
+	}
+	l := runtimeCtx.WorkflowInput.(map[string]any)["list"].([]any)
+	if !reflect.DeepEqual(l, []any{1.0, 2.0, 3.0}) {
+		t.Errorf("live list was mutated: %#v", l)
 	}
 }

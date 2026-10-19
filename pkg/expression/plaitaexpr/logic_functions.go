@@ -12,14 +12,15 @@ func and(a, b any) any {
 }
 
 func or(args ...any) any {
-	var last any
 	for _, arg := range args {
 		if isTruthy(arg) {
 			return arg
 		}
-		last = arg
 	}
-	return last
+	// Python _fn_or: next((arg for arg in args if arg), False) — when every
+	// argument is falsy the result is the BOOL False, not the last argument
+	// (issue #26: or(0, '') used to yield '' instead of False).
+	return false
 }
 
 func not(a any) bool {

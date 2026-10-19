@@ -7,8 +7,6 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/spf13/cast"
-
 	"github.com/jeffkit/plaita-go/pkg/expression/plaitaexpr"
 	"github.com/jeffkit/plaita-go/pkg/expression/plaitaexpr/parser"
 	"github.com/jeffkit/plaita-go/pkg/model"
@@ -114,12 +112,15 @@ func evalString(ctx context.Context, s string) (any, error) {
 }
 
 // evalTemplateString interpolates `{% ... %}` fragments into the literal
-// text: each fragment whose inner expression starts with "$" and parses is
-// evaluated and spliced in as a string; every other fragment (wrong prefix,
-// unparsable or unclosed) stays literal, mirroring plaita's _eval_template
-// which only rewrites matched interpolations and returns unmatched strings
-// unchanged. An evaluation error of a *matched* fragment propagates (plaita
-// lets the thunk's KeyError/TypeError escape the template as well).
+// text: each fragment whose inner expression is a plaita expression (a `$`-
+// prefixed variable/function, or a bare constant — true/false/None/null,
+// numbers, quoted strings — mirroring plaita's `constant | function_call |
+// variable` template grammar) is evaluated and spliced in as its Python
+// str() rendering; every other fragment (unparsable or unclosed) stays
+// literal, mirroring plaita's _eval_template which only rewrites matched
+// interpolations and returns unmatched strings unchanged. An evaluation error
+// of a *matched* fragment propagates (plaita lets the thunk's
+// KeyError/TypeError escape the template as well).
 func evalTemplateString(ctx context.Context, s string) (any, error) {
 	var b strings.Builder
 	last := 0
@@ -128,23 +129,33 @@ func evalTemplateString(ctx context.Context, s string) (any, error) {
 		b.WriteString(s[last:loc[0]])
 		last = loc[1]
 		inner := strings.TrimSpace(s[loc[2]:loc[3]])
-		// plaita: "{% ... %}" only fires when the inner expression starts
-		// with the prefix; anything else stays literal text.
-		if !strings.HasPrefix(inner, expressionPrefix) {
-			b.WriteString(raw)
-			continue
+		var v any
+		switch {
+		case strings.HasPrefix(inner, expressionPrefix):
+			// A fragment that does not parse is not an interpolation match at
+			// all (plaita's scanString skips it) — keep it literal.
+			if _, err := parser.Parse(inner); err != nil {
+				b.WriteString(raw)
+				continue
+			}
+			evaluated, err := defaultEvaluator.Eval(ctx, inner, nil)
+			if err != nil {
+				return nil, err
+			}
+			v = evaluated.AsAny()
+		default:
+			// plaita's template grammar accepts bare constants too
+			// ("{% true %}" → "True"); anything unparsable stays literal.
+			constant, ok := plaitaexpr.TemplateConstant(inner)
+			if !ok {
+				b.WriteString(raw)
+				continue
+			}
+			v = constant
 		}
-		// A fragment that does not parse is not an interpolation match at
-		// all (plaita's scanString skips it) — keep it literal.
-		if _, err := parser.Parse(inner); err != nil {
-			b.WriteString(raw)
-			continue
-		}
-		v, err := defaultEvaluator.Eval(ctx, inner, nil)
-		if err != nil {
-			return nil, err
-		}
-		b.WriteString(cast.ToString(v.AsAny()))
+		// Python str(value): None → "None", True/False, dicts/lists as
+		// Python repr — never cast.ToString's silent "" for containers.
+		b.WriteString(plaitaexpr.PyStr(v))
 	}
 	b.WriteString(s[last:])
 	return b.String(), nil

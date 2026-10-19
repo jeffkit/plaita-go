@@ -28,8 +28,10 @@ func TestEval(t *testing.T) {
 					},
 				},
 			},
+			// Python str(2.0) == "2.0" — issue #8: floats keep their Python
+			// shape in templates instead of cast.ToString's "2".
 			expr:    "you need know 1 + 1 = {%$F.add($a.b, $INPUT.a)%}",
-			want:    "you need know 1 + 1 = 2",
+			want:    "you need know 1 + 1 = 2.0",
 			wantErr: false,
 		},
 		{
@@ -45,7 +47,7 @@ func TestEval(t *testing.T) {
 				},
 			},
 			expr:    "you need know {%$INPUT.a%} + {%$INPUT.a%} = {%$F.add($a.b, $INPUT.a)%}",
-			want:    "you need know 1 + 1 = 2",
+			want:    "you need know 1.0 + 1.0 = 2.0",
 			wantErr: false,
 		},
 		{

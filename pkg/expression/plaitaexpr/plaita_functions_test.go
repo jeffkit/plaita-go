@@ -162,27 +162,29 @@ func Test_notContains(t *testing.T) {
 }
 
 func Test_pop_list(t *testing.T) {
-	t.Run("pop first", func(t *testing.T) {
+	t.Run("pop first returns element without touching input", func(t *testing.T) {
 		l := []any{1, 2, 3}
 		v, err := pop(l, 0)
 		assert.NoError(t, err)
 		assert.Equal(t, 1, v)
-		// in-place: backing array shifted, tail zeroed
-		assert.Equal(t, []any{2, 3, nil}, l)
+		// issue #9: the pop happens on a COPY — no more "[2,3,0]" dirty tail
+		// in the shared backing array, and the input slice keeps its length
+		// and contents.
+		assert.Equal(t, []any{1, 2, 3}, l)
 	})
 	t.Run("pop middle", func(t *testing.T) {
 		l := []any{"a", "b", "c"}
 		v, err := pop(l, 1)
 		assert.NoError(t, err)
 		assert.Equal(t, "b", v)
-		assert.Equal(t, []any{"a", "c", nil}, l)
+		assert.Equal(t, []any{"a", "b", "c"}, l)
 	})
 	t.Run("negative index counts from end", func(t *testing.T) {
 		l := []any{1, 2, 3}
 		v, err := pop(l, -1)
 		assert.NoError(t, err)
 		assert.Equal(t, 3, v)
-		assert.Equal(t, []any{1, 2, nil}, l)
+		assert.Equal(t, []any{1, 2, 3}, l)
 	})
 	t.Run("index out of range", func(t *testing.T) {
 		_, err := pop([]any{1, 2, 3}, 5)
@@ -215,12 +217,13 @@ func Test_pop_list(t *testing.T) {
 }
 
 func Test_pop_dict(t *testing.T) {
-	t.Run("pop key returns value and deletes", func(t *testing.T) {
+	t.Run("pop key returns value without mutating input", func(t *testing.T) {
 		m := map[string]any{"a": 1, "b": 2}
 		v, err := pop(m, "a")
 		assert.NoError(t, err)
 		assert.Equal(t, 1, v)
-		assert.Equal(t, map[string]any{"b": 2}, m)
+		// issue #9 copy discipline: the caller's dict is untouched
+		assert.Equal(t, map[string]any{"a": 1, "b": 2}, m)
 	})
 	t.Run("missing key", func(t *testing.T) {
 		_, err := pop(map[string]any{"a": 1}, "z")
@@ -335,28 +338,30 @@ func Test_plaita_functions_eval(t *testing.T) {
 		assert.Equal(t, model.NewValue([]any{1, 2}), r)
 	})
 
-	t.Run("pop list", func(t *testing.T) {
-		ctx := newCtx(map[string]any{"list": []any{"x", "y", "z"}})
-		r, err := e.Eval(ctx, `$F.pop($INPUT.list, 0)`, nil)
-		assert.NoError(t, err)
-		assert.Equal(t, model.NewValue("x"), r)
+	t.Run("pop live root is refused (plaita#69)", func(t *testing.T) {
+		// issue #9 acceptance row: `$F.pop($INPUT.list, 0)` on `[1,2,3]` is
+		// Python's ValueError, not a returned 1 with a polluted list.
+		ctx := newCtx(map[string]any{"list": []any{1, 2, 3}})
+		_, err := e.Eval(ctx, `$F.pop($INPUT.list, 0)`, nil)
+		assert.ErrorContains(t, err, "plaita#69 write protection")
+		input := runtime.WorkflowRuntimeContext(ctx).WorkflowInput.(map[string]any)
+		assert.Equal(t, []any{1, 2, 3}, input["list"])
 	})
 
-	t.Run("pop dict", func(t *testing.T) {
+	t.Run("pop dict live root is refused (plaita#69)", func(t *testing.T) {
 		m := map[string]any{"a": 1, "b": 2}
 		ctx := newCtx(map[string]any{"m": m})
-		r, err := e.Eval(ctx, `$F.pop($INPUT.m, "a")`, nil)
-		assert.NoError(t, err)
-		assert.Equal(t, model.NewValue(1), r)
-		// dict.pop mutates in place
-		assert.Equal(t, map[string]any{"b": 2}, m)
+		_, err := e.Eval(ctx, `$F.pop($INPUT.m, "a")`, nil)
+		assert.ErrorContains(t, err, "plaita#69 write protection")
+		input := runtime.WorkflowRuntimeContext(ctx).WorkflowInput.(map[string]any)
+		assert.Equal(t, map[string]any{"a": 1, "b": 2}, input["m"])
 	})
 
 	t.Run("pop errors propagate", func(t *testing.T) {
 		ctx := newCtx(map[string]any{"list": []any{1}, "m": map[string]any{}})
-		_, err := e.Eval(ctx, `$F.pop($INPUT.list, 5)`, nil)
+		_, err := e.Eval(ctx, `$F.pop($F.append($INPUT.list, 2), 5)`, nil)
 		assert.ErrorContains(t, err, "out of range")
-		_, err = e.Eval(ctx, `$F.pop($INPUT.m, "missing")`, nil)
+		_, err = e.Eval(ctx, `$F.pop($F.json_loads('{"k": 1}'), "missing")`, nil)
 		assert.ErrorContains(t, err, "KeyError")
 	})
 }
@@ -365,6 +370,7 @@ func Test_plaita_functions_registered(t *testing.T) {
 	for _, name := range []string{
 		"eq", "ne", "gt", "gte", "lt", "lte",
 		"ifelse", "notContains", "getDictValues", "pop",
+		"delListItem", // issue #21 acceptance row: delListItem is registered
 	} {
 		_, ok := GetFunction(name)
 		assert.True(t, ok, "function %q should be registered", name)
