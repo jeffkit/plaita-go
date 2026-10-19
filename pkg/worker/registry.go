@@ -34,10 +34,11 @@ type ServiceInfo struct {
 	LastHeartbeat string         `json:"last_heartbeat"`
 }
 
-// Registry status lifecycle (§8.1).
+// Registry status lifecycle (§8.1, §9.3).
 const (
 	RegStatusStarting = "starting"
 	RegStatusRunning  = "running"
+	RegStatusDraining = "draining"
 	RegStatusStopping = "stopping"
 	RegStatusStopped  = "stopped"
 )
@@ -133,10 +134,35 @@ func maskURL(u *url.URL) string {
 // SetStatus flips the lifecycle status and flushes immediately (§9.3: status
 // transitions are persisted right away, not on the next heartbeat tick).
 func (r *Registry) SetStatus(ctx context.Context, status string) {
+	_ = r.SetStatusFlush(ctx, status, 1)
+}
+
+// SetStatusFlush sets the status and flushes with up to `attempts` short
+// retries — the draining transition must be visible immediately, otherwise
+// the dispatcher keeps routing to this instance during the window
+// (registry.flush_registry_status, 3 retries).
+func (r *Registry) SetStatusFlush(ctx context.Context, status string, attempts int) error {
 	r.mu.Lock()
 	r.info.Status = status
 	r.mu.Unlock()
-	_ = r.Flush(ctx)
+	if attempts < 1 {
+		attempts = 1
+	}
+	var err error
+	for i := 0; i < attempts; i++ {
+		if err = r.Flush(ctx); err == nil {
+			return nil
+		}
+		if i < attempts-1 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+	}
+	r.logger.Warn("registry status flush failed", "status", status, "error", err)
+	return err
 }
 
 // SetActiveTasks refreshes the capacity block when the in-flight count

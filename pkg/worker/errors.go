@@ -44,7 +44,40 @@ var (
 	// ErrMaxDeliveriesExceeded: delivery budget exhausted — guarded
 	// dead-letter (§2.4).
 	ErrMaxDeliveriesExceeded = errors.New("max deliveries exceeded")
+	// ErrDrainAborted means the in-flight step was abandoned because a drain
+	// force-stop cancelled it (§9.3 D2). The message must stay pending so
+	// another worker can take over; no terminal state is written.
+	ErrDrainAborted = errors.New("execution abandoned by drain force-stop")
+	// ErrHandoverCounterUnavailable: the TaskNotForThisWorker counter could
+	// not be incremented — fail-closed, never hand over without a bound
+	// (§9.2).
+	ErrHandoverCounterUnavailable = errors.New("affinity handover counter unavailable")
 )
+
+// NodeRetryableError is the NodeExecutionRetryableError analogue (§9.1): the
+// engine's node failed in a retryable way below the worker-level budget, so
+// the consumer loop must re-enqueue a fresh carrier instead of writing an
+// error terminal.
+type NodeRetryableError struct {
+	ExecutionID string
+	FailedNode  string
+	// Attempt is the per-node counter value after this failure (1-based).
+	Attempt int
+	// Budget is the per-node retry budget this attempt was measured against
+	// (queue max_deliveries, §9.1).
+	Budget int
+	Err    error
+}
+
+func (e *NodeRetryableError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("node %s retryable failure (attempt %d/%d): %v",
+		e.FailedNode, e.Attempt, e.Budget, e.Err)
+}
+
+func (e *NodeRetryableError) Unwrap() error { return e.Err }
 
 // flowErrorCode is plaita's _FLOW_ERROR_CODE fallback (§5.4: code=-500 when
 // neither a node-level nor handler error code is available).

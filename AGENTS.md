@@ -20,12 +20,13 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
   internal/interpreter/ goja（JS）/ yeagi（Go 源码）解释器，code 节点用
   pkg/model, pkg/parser, pkg/providers/  流程模型、解析、flow 来源（fs/memory）
   pkg/delegate, pkg/discovery/           http 节点的委托与寻址（polaris 已删，仅 domain/noop）
-  pkg/worker/       runtime worker MVP（2026-10-19）：Streams 取单/租约 Lua/状态写回/事件/取消/心跳
-  cmd/plaita-worker/  worker 入口（env 配置，影子键前缀可覆写）
+  pkg/worker/       runtime worker（2026-10-19 MVP + 二期）：Streams 取单/租约 Lua/状态写回/事件/取消/心跳 +
+                    orphan watch/resume 载体语义(A47-F2)/dispatch_ledger/DLQ replay+守卫恢复/drain 三态/节点级重试预算
+  cmd/plaita-worker/  worker 入口（env 配置，影子键前缀可覆写；-dlq-replay 单向回灌）
   pkg/llm/          LLM provider 链（OpenAI/Anthropic 兼容）
   docs/WORKER_PROTOCOL.md  worker 协议权威文档（田野调查，实现与影子对账的验收基准）
 规划中：
-  worker 二期      orphan watch/resume 载体语义(A47-F2)/dispatch_ledger/DLQ replay/drain 三态/节点级重试预算
+  worker 三期      步界 checkpoint 落盘/checkpoint 恢复（M6，解锁 hitl_await/event 唤醒）/task age gate/租户配额/dedup
   server/       console BFF 契约只读子集（execution 查询/事件流）
   沙箱           Docker driver 优先 + AGS HTTP API（lease 与 worker 租约同族设计）
 ```
@@ -50,6 +51,17 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
 - loop 无 `condition` = 恒真（零值 Condition 不再报"invalid expression type"）
 
 **golden 测试**（pkg/ir/ir_test.go + testdata/）：assignment_flow.json 是 console 真实导出；loop_flow/parallel_flow/child_flow 由 **plaita 编译器实编**（`flow_from_source` → `compile_source`），在 Go 引擎执行并断言输出——「Python codeFlow 产 IR → Go 跑」已实证。改契约前先重跑这组。
+
+## worker 二期（2026-10-19，分支 feat/worker-phase2）
+
+六项全部落在 `pkg/worker/`，测试全 miniredis。与协议（docs/WORKER_PROTOCOL.md）的对应与**刻意偏差**：
+
+- **orphan watch**（§3.4/§8.2，orphan.go）：看门狗 renew 失败 → 先发布一次进度心跳（fenced CAS；fence 键比租约多活 7 天，旧世代仍可写）→ 标记 lease_lost、中止当前步 → 观察集只发心跳，不续租、不再 cancel、不写终态。执行结束/fence 换代/行终态即摘除。目的：keeper §8.2 判据在「租约已丢但执行仍在跑」窗口不误杀。
+- **resume 载体语义**（A47-F2/§9.2，worker.go handleResume）：决议载体（event/timeout/cancel）租约冲突窗口**无条件不 ack**；终态执行幂等 ack（不覆写终态）；cancel 标志或 `resume_type=cancel` 压过 suspended 短路（租约内终态化 cancelled）；suspended+continue/retry 不取租约、幂等 ack，但若有 `dispatch_pending` 凭据则做一次补偿派发（RPUSH `{prefix}:{subtype}:queue`，成功后清凭据，失败不 ack）。running 上的 event/timeout 载体按 §9.2/#258 归一化重投 continue 载体（先入队后 ack）。**唤醒路径仍确定性失败**（`resume_not_supported`）——引擎无 checkpoint 恢复（M6）。
+- **dispatch_ledger**（§6.3，ledger.go）：`{prefix}:dispatch:ledger` 只增 Stream，`payload` JSON + `schema_version`；`EnqueueWithLedger` 是入队+记账唯一入口（target 同源写入消息体与台账，结构上不可能分叉）；`Read`/`Parity` 读侧对坏行/故障不抛。TaskNotForThisWorker 完整交接（worker.go handleForeignTarget）：目标不在册/非 running → 剥 target 广播重投；在册 running → 按 `{ns}:execution:affinityhandover:{id}` 计数（INCR+7d），≤3 enqueue→ack，达限终态化 `AffinityHandoverExhausted` 并留 pending；计数不可用 fail-closed 留 pending；**全程不 DLQ**。
+- **DLQ replay + 守卫恢复**（§2.4/§9.2，dlqreplay.go）：`ReplayDeadLetter` 幂等标记 `{prefix}:dlq:replay:{dlq_key}:{id}`（SET NX 7d，force 覆盖）、源信封 schema_version 继承（超版本入队前拒绝）、无 id 的 start 用 uuid5 确定性铸造、墓碑拒复活、审计 `{prefix}:dlq:replay:audit`、DLQ 原条不删。死信守卫：schema 拒收/终态/墓碑放行不克隆；租约在/读失败跳过；running 且节点预算耗尽（noderetry max ≥ max_deliveries 或 noderefetch ≥100）→ 终态化 `node_retry_budget_exhausted`；其余非终态+租约空 → 克隆源 payload（继承信封版本）后再放行死信。
+- **drain 三态**（§9.3，drain.go）：`RequestDrain`（D1，幂等，注册表 draining 立即 flush 3 重试 + 有界定时器）→ `ForceStop`（D2，无条件停领取 + 取消在途 run + 打断重试退避）→ 信号只调 RequestDrain（D3，main.go 二次信号强退）。drain 后读到的消息不 dispatch/不 ack 留 PEL；D2 中止的步**不写终态**、留 pending（本 build 无硬中断，保住可续跑/可重投优先）。
+- **节点级重试预算**（§9.1，retry.go）：`noderetry:{id}:{node}`（预算=max_deliveries）/`noderefetch:{id}`（100）/`nofail:{id}`（12）三层，INCR+7d；可重试判据 = 有失败节点 + 非超时/取消 + `workflow.IsRetryableError`；放行则指数退避 `min(30s, 1s·2^(n-1))`（0.2s 分片可被 D2 打断）→ enqueue→ack。预算耗尽/兜底上限 → 终态化 `node_retry_budget_exhausted`（code=-520）。成功推进清节点键；整跑 completed 再清连续失败计数。**偏差**：重投载体保持 start（同 execution_id 整条重放）——引擎无 checkpoint 恢复，转 resume 会立刻 `resume_not_supported`；M6 后改回协议 §9.1 的 start→resume/continue 转换。
 
 ## 常用命令
 

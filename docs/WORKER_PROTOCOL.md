@@ -437,24 +437,29 @@ EventSubscription: {subscription_id, event_type(非空强制), filter_condition?
 
 ## 10. Go 移植注意
 
-### 10.1 plaita-go 现状（据其 AGENTS.md @ 2026-10-19）
+### 10.1 plaita-go 现状（@ 2026-10-19，worker 二期 B2 收口）
 
-- 引擎侧已落地：`pkg/ir`（部署 JSON → Workflow，fail-closed 拒载清单）、表达式对齐（golden 45/45）、agentproc spawn 节点、gate/rate_limit/report/hitl（阻塞版）/decision/llm/notify/api_request/parse_json/capture 等节点。
-- **worker 面整体缺失**（AGENTS.md「规划中」：`runtime/ worker、队列接入、租约、事件持久化（对齐 plaita server/ 语义）`、`server/ console BFF 只读子集`）。无队列消费、无租约、无状态写回、无取消、无注册表。
+- **MVP（一期）已落地**：`pkg/worker`（Stream 消费 + reclaim + DLQ 信封/schema 拒收/残留 sweep、三段租约 Lua + fence CAS 写、ExecutionState 字段级写回 + timeline/node_timings、取消标志轮询、注册表心跳 + 容量块、flow 来源读路径 + v2 指纹）、`cmd/plaita-worker`（env 配置 + 影子前缀）。
+- **二期（M4）已落地**：orphan watch（失租后仅进度心跳）、resume 载体语义（A47-F2：决议载体冲突窗口不 ack / 终态幂等 ack / suspended+continue 短路 + dispatch_pending 补偿 / event/timeout 归一化 continue）、dispatch_ledger（§6.3 schema + 入队唯一入口 + 读/对账）+ TaskNotForThisWorker 有界交接、DLQ replay（幂等标记 + 审计 + 确定性 id + schema 继承 + 墓碑）+ 死信守卫恢复克隆/预算终态化、drain 三态（D1/D2/D3）+ 信号优雅退出、节点级三层重试预算 + 退避重投。
+- **刻意偏差（等 M6 checkpoint 恢复后回收）**：resume 唤醒路径仍写 `resume_not_supported` 确定性终态（引擎无挂起恢复）；节点重投载体保持 start（同 execution_id 整条重放），不转 resume/continue；D2 中止的步不写终态、留 pending（无硬中断 B18-01）。以上三项已在 AGENTS.md「worker 二期」章节逐条声明。
 
 ### 10.2 缺口清单（按本协议文档逐章）
 
-| 协议面 | 缺口 | 建议优先级 |
-|---|---|---|
-| §2 队列 | XREADGROUP 消费组 + reclaim（游标轮转 + 租约闸）+ DLQ（信封 schema/裁剪/守卫）+ schema_version 拒收 + 残留 sweep | P0（影子对账的最小面） |
-| §3 租约 | 三个 Lua 逐字移植 + holder token 格式（16 位 hex 末段是反解协议的一部分）+ fencegen 语义 + fenced CAS 存储 + 看门狗 | P0 |
-| §5 写回 | ExecutionState JSON 字段级兼容（Python `model_dump` 的 camel/snake 混合——`node_timings`/`timeline` 键名以本文 §5.1 为准，落地前用真实 Redis 快照对拍）；终态 TTL；索引 ZSET；StatePersistError/StateSerializationError 二分 | P0 |
-| §4 取消 | 取消标志键轮询（步界 + 步内两个层次）+ cancel resume 载体 + 终态写回 | P1（步界版先够对账） |
-| §7 flow 来源 | RedisFlowStorage 读路径（`{ns}:flow:{id}:{ver}` + flow_list/flow_versions SET + latest/数字版本序）；指纹算法（sort_keys JSON sha256 + algo v2 标记）——指纹是 resume 硬门，Go 必须同口径 | P0（同 Redis 即可对跑） |
-| §8 心跳 | 注册表键 + ServiceInfo JSON（status 生命周期、worker_capacity 块）+ 进度心跳（node_timings 在跑节点 `ended_at=""` 约定） | P1（keeper 误杀风险，随影子上线即需要） |
-| §6 事件 | Go worker 第一阶段可只读不写业务事件；`timeline`/`node_timings` 落盘必须有（keeper 判据）；SSE 发布可后置 | P2 |
-| §9 退避/drain | 三层重试预算键 + 显式重投（先入队后 ack）+ resume 载体转换 + 信号处理 | P1 |
-| 控制面 | stop/status Pub/Sub 命令（`plaita:control:{instance}`）、`/metrics` | P3 |
+状态列 = plaita-go 实现进度（2026-10-19 B2 收口）。
+
+| 协议面 | 缺口 | 建议优先级 | Go 状态 |
+|---|---|---|---|
+| §2 队列 | XREADGROUP 消费组 + reclaim（游标轮转 + 租约闸）+ DLQ（信封 schema/裁剪/守卫）+ schema_version 拒收 + 残留 sweep | P0（影子对账的最小面） | ✅ 一期；守卫恢复克隆/预算终态化 = 二期 |
+| §3 租约 | 三个 Lua 逐字移植 + holder token 格式（16 位 hex 末段是反解协议的一部分）+ fencegen 语义 + fenced CAS 存储 + 看门狗 | P0 | ✅ 一期；orphan watch = 二期 |
+| §5 写回 | ExecutionState JSON 字段级兼容（Python `model_dump` 的 camel/snake 混合——`node_timings`/`timeline` 键名以本文 §5.1 为准，落地前用真实 Redis 快照对拍）；终态 TTL；索引 ZSET；StatePersistError/StateSerializationError 二分 | P0 | ✅（步界持久化/checkpoint 恢复 = M6） |
+| §4 取消 | 取消标志键轮询（步界 + 步内两个层次）+ cancel resume 载体 + 终态写回 | P1（步界版先够对账） | ✅ 步内轮询 + 入口/租约内检查点 |
+| §7 flow 来源 | RedisFlowStorage 读路径（`{ns}:flow:{id}:{ver}` + flow_list/flow_versions SET + latest/数字版本序）；指纹算法（sort_keys JSON sha256 + algo v2 标记）——指纹是 resume 硬门，Go 必须同口径 | P0（同 Redis 即可对跑） | ✅ 读/指纹；resume 流程指纹校验随 M6 |
+| §8 心跳 | 注册表键 + ServiceInfo JSON（status 生命周期、worker_capacity 块）+ 进度心跳（node_timings 在跑节点 `ended_at=""` 约定） | P1（keeper 误杀风险，随影子上线即需要） | ✅ 三层（含失租 orphan watch） |
+| §6 事件 | Go worker 第一阶段可只读不写业务事件；`timeline`/`node_timings` 落盘必须有（keeper 判据）；SSE 发布可后置 | P2 | ✅ timeline/耗时落盘 + execution events PUBLISH；业务事件写 = M6 |
+| §9 退避/drain | 三层重试预算键 + 显式重投（先入队后 ack）+ resume 载体转换 + 信号处理 | P1 | ✅ 三层预算 + 退避重投 + drain 三态；载体转换等 M6 |
+| §6.3 派发台账 | 台账 Stream + 入队唯一入口 + TaskNotForThisWorker 有界交接 | P1 | ✅ 二期 |
+| 控制面 | stop/status Pub/Sub 命令（`plaita:control:{instance}`）、`/metrics` | P3 | ❌ 未做 |
+
 
 ### 10.3 建议 Go 包切分
 

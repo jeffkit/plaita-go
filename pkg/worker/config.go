@@ -34,6 +34,29 @@ const (
 	ShadowKeyPrefix = "plaita-go-shadow"
 
 	fenceKeyTTLSeconds = 7 * 86400 // §3.2 FENCE_KEY_TTL_SECONDS
+
+	// counterTTLSeconds is the sliding TTL of every worker-side counter key
+	// (§8.3: retry/handover/dedup counters all live 7 days).
+	counterTTLSeconds = 7 * 86400
+
+	// DefaultNodeAbortCode is plaita's DEFAULT_NODE_ABORT_CODE
+	// (core/errors.py:102), used by worker-judged node-abort terminals (§5.4).
+	DefaultNodeAbortCode = -520
+
+	// AffinityHandoverMax bounds TaskNotForThisWorker handovers per execution
+	// (§9.2, AFFINITY_HANDOVER_MAX=3).
+	AffinityHandoverMax = 3
+
+	// NodeRetryTotalMax is the fallback total retry ceiling per execution
+	// (§9.1 layer 2, NODE_RETRY_TOTAL_MAX=100).
+	NodeRetryTotalMax = 100
+
+	// DeterministicFailureMax is the consecutive deterministic-node-failure
+	// ceiling (§9.1 layer 3, DETERMINISTIC_FAILURE_MAX=12).
+	DeterministicFailureMax = 12
+
+	// ledgerSchemaVersion is the dispatch-ledger entry schema version (§6.3).
+	ledgerSchemaVersion = 1
 )
 
 // Config carries every knob of the worker. All fields are overridable through
@@ -100,6 +123,13 @@ type Config struct {
 	// 100 entries / 300s).
 	FlowCacheSize int
 	FlowCacheTTL  time.Duration
+	// DispatchLedgerKey: PLAITA_DISPATCH_LEDGER_KEY (default
+	// <KeyPrefix>:dispatch:ledger) — the append-only dispatch ledger stream
+	// (§6.3). Overridden per key so a shadow run stays in its own namespace.
+	DispatchLedgerKey string
+	// DispatcherID: PLAITA_DISPATCHER_ID (default hostname) — the
+	// "who dispatched" half of a ledger entry (§6.3).
+	DispatcherID string
 }
 
 // DefaultConfig returns the protocol-default configuration for the current
@@ -132,6 +162,8 @@ func configFromEnv(getenv func(string) string) *Config {
 		DrainTimeout:      time.Duration(envFloat(getenv, "PLAITA_WORKER_DRAIN_TIMEOUT", 30.0) * float64(time.Second)),
 		FlowCacheSize:     envInt(getenv, "PLAITA_FLOW_CACHE_SIZE", 100),
 		FlowCacheTTL:      time.Duration(envInt(getenv, "PLAITA_FLOW_CACHE_TTL_SECONDS", 300)) * time.Second,
+		DispatchLedgerKey: getenv("PLAITA_DISPATCH_LEDGER_KEY"),
+		DispatcherID:      getenv("PLAITA_DISPATCHER_ID"),
 	}
 	cfg.normalize()
 	return cfg
@@ -213,6 +245,12 @@ func (c *Config) normalize() {
 	if c.FlowCacheTTL <= 0 {
 		c.FlowCacheTTL = 300 * time.Second
 	}
+	if c.DispatchLedgerKey == "" {
+		c.DispatchLedgerKey = c.KeyPrefix + ":dispatch:ledger"
+	}
+	if c.DispatcherID == "" {
+		c.DispatcherID = hostnameOrUnknown()
+	}
 }
 
 // Namespace returns the tenant-routed key namespace (§3.1): the plain prefix
@@ -238,6 +276,18 @@ func (c *Config) ApplyShadow() {
 	if c.DLQKey == c.QueueName+":dlq" || c.DLQKey == DefaultKeyPrefix+":flow:queue:dlq" {
 		c.DLQKey = c.QueueName + ":dlq"
 	}
+	if c.DispatchLedgerKey == DefaultKeyPrefix+":dispatch:ledger" ||
+		c.DispatchLedgerKey == ShadowKeyPrefix+":dispatch:ledger" {
+		c.DispatchLedgerKey = ShadowKeyPrefix + ":dispatch:ledger"
+	}
+}
+
+// hostnameOrUnknown is dispatcher_id_from_env's fallback (§6.3).
+func hostnameOrUnknown() string {
+	if h, err := os.Hostname(); err == nil && h != "" {
+		return h
+	}
+	return "unknown-dispatcher"
 }
 
 func envInt(getenv func(string) string, key string, def int) int {
