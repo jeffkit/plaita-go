@@ -15,11 +15,17 @@ func fakeBin(t *testing.T, resultJSON string) (bin string, argvFile string) {
 	t.Helper()
 	dir := t.TempDir()
 	argvFile = filepath.Join(dir, "argv")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + argvFile + "\nprintf '%s\\n' '" + resultJSON + "'\n"
+	outFile := filepath.Join(dir, "stdout.txt")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + argvFile + "\nprintf '%s\\n' '" + resultJSON + "' | tee " + outFile + "\n"
 	bin = filepath.Join(dir, "recbin")
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if data, err := os.ReadFile(outFile); err == nil {
+			t.Logf("fake stdout: %s", data)
+		}
+	})
 	return bin, argvFile
 }
 

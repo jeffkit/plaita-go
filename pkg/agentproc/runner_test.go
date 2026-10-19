@@ -22,7 +22,7 @@ func runScript(t *testing.T, script string, opts RunOptions, timeout time.Durati
 }
 
 func TestRunResultOnly(t *testing.T) {
-	res, err := runScript(t, `printf '%s\n' '{"type":"result","text":"hello world"}'`, RunOptions{Message: "hi", Streaming: true}, 0)
+	res, err := runScript(t, `IFS= read -r _ || true; printf '%s\n' '{"type":"result","text":"hello world"}'`, RunOptions{Message: "hi", Streaming: true}, 0)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -32,7 +32,7 @@ func TestRunResultOnly(t *testing.T) {
 }
 
 func TestRunStreamingAssembly(t *testing.T) {
-	script := `printf '%s\n' '{"type":"partial","text":"hel"}' '{"type":"partial","text":"lo "}' '{"type":"result","text":"hello world FULL"}'`
+	script := `IFS= read -r _ || true; printf '%s\n' '{"type":"partial","text":"hel"}' '{"type":"partial","text":"lo "}' '{"type":"result","text":"hello world FULL"}'`
 	res, err := runScript(t, script, RunOptions{Message: "hi", Streaming: true}, 0)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -44,7 +44,7 @@ func TestRunStreamingAssembly(t *testing.T) {
 }
 
 func TestRunNonStreamingUsesResultText(t *testing.T) {
-	script := `printf '%s\n' '{"type":"partial","text":"ignored"}' '{"type":"result","text":"final"}'`
+	script := `IFS= read -r _ || true; printf '%s\n' '{"type":"partial","text":"ignored"}' '{"type":"result","text":"final"}'`
 	res, err := runScript(t, script, RunOptions{Message: "hi", Streaming: false}, 0)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -55,7 +55,7 @@ func TestRunNonStreamingUsesResultText(t *testing.T) {
 }
 
 func TestRunErrorEventIsTerminalEvenWithExitZero(t *testing.T) {
-	script := `printf '%s\n' '{"type":"partial","text":"half "}' '{"type":"error","message":"upstream rate limited"}'; exit 0`
+	script := `IFS= read -r _ || true; printf '%s\n' '{"type":"partial","text":"half "}' '{"type":"error","message":"upstream rate limited"}'; exit 0`
 	res, err := runScript(t, script, RunOptions{Message: "hi", Streaming: true}, 0)
 	if err == nil {
 		t.Fatal("expected failure on error event")
@@ -69,7 +69,7 @@ func TestRunErrorEventIsTerminalEvenWithExitZero(t *testing.T) {
 }
 
 func TestRunNoResultExitZeroSucceeds(t *testing.T) {
-	res, err := runScript(t, `exit 0`, RunOptions{Message: "hi", Streaming: true}, 0)
+	res, err := runScript(t, `IFS= read -r _ || true; exit 0`, RunOptions{Message: "hi", Streaming: true}, 0)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -79,14 +79,14 @@ func TestRunNoResultExitZeroSucceeds(t *testing.T) {
 }
 
 func TestRunNonZeroExitWithoutErrorEvent(t *testing.T) {
-	_, err := runScript(t, `exit 3`, RunOptions{Message: "hi"}, 0)
+	_, err := runScript(t, `IFS= read -r _ || true; exit 3`, RunOptions{Message: "hi"}, 0)
 	if err == nil || !strings.Contains(err.Error(), "code 3") {
 		t.Fatalf("err = %v, want exit code 3", err)
 	}
 }
 
 func TestRunSessionFirstNonEmptyWins(t *testing.T) {
-	script := `printf '%s\n' '{"type":"partial","text":"a","session_id":"sess-1"}' '{"type":"result","text":"x","session_id":"sess-2"}'`
+	script := `IFS= read -r _ || true; printf '%s\n' '{"type":"partial","text":"a","session_id":"sess-1"}' '{"type":"result","text":"x","session_id":"sess-2"}'`
 	res, err := runScript(t, script, RunOptions{Message: "hi"}, 0)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -97,7 +97,7 @@ func TestRunSessionFirstNonEmptyWins(t *testing.T) {
 }
 
 func TestRunSessionInboundPreservedWhenEventsSilent(t *testing.T) {
-	res, err := runScript(t, `exit 0`, RunOptions{Message: "hi", SessionID: "inbound-1"}, 0)
+	res, err := runScript(t, `IFS= read -r _ || true; exit 0`, RunOptions{Message: "hi", SessionID: "inbound-1"}, 0)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestRunSessionInboundPreservedWhenEventsSilent(t *testing.T) {
 }
 
 func TestRunInvalidSessionDropped(t *testing.T) {
-	script := `printf '%s\n' '{"type":"result","text":"x","session_id":"a/b"}'`
+	script := `IFS= read -r _ || true; printf '%s\n' '{"type":"result","text":"x","session_id":"a/b"}'`
 	res, err := runScript(t, script, RunOptions{Message: "hi"}, 0)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -118,7 +118,7 @@ func TestRunInvalidSessionDropped(t *testing.T) {
 }
 
 func TestRunMalformedLinesIgnored(t *testing.T) {
-	script := `printf '%s\n' 'not json' '{"type":"what"}' '[]' '{"type":"result","text":"ok"}'`
+	script := `IFS= read -r _ || true; printf '%s\n' 'not json' '{"type":"what"}' '[]' '{"type":"result","text":"ok"}'`
 	res, err := runScript(t, script, RunOptions{Message: "hi"}, 0)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -129,7 +129,7 @@ func TestRunMalformedLinesIgnored(t *testing.T) {
 }
 
 func TestRunUsageCaptured(t *testing.T) {
-	script := `printf '%s\n' '{"type":"result","text":"x","usage":{"input_tokens":12,"output_tokens":34}}'`
+	script := `IFS= read -r _ || true; printf '%s\n' '{"type":"result","text":"x","usage":{"input_tokens":12,"output_tokens":34}}'`
 	res, err := runScript(t, script, RunOptions{Message: "hi"}, 0)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -164,7 +164,7 @@ func TestRunTimeoutKillsProcessGroup(t *testing.T) {
 }
 
 func TestRunDetailsCollected(t *testing.T) {
-	script := `printf '%s\n' '{"type":"partial","text":"a"}' '{"type":"result","text":"b"}'`
+	script := `IFS= read -r _ || true; printf '%s\n' '{"type":"partial","text":"a"}' '{"type":"result","text":"b"}'`
 	res, err := runScript(t, script, RunOptions{Message: "hi", CollectDetails: true}, 0)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
