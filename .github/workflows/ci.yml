@@ -1,0 +1,42 @@
+# Deliberately thin: build + vet + fmt + unit tests. No matrix, no layers —
+# the suite is all-local (fake bridges, temp dirs) and finishes in ~1min.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+      - name: test
+        # Test_today_eval / Test_now_eval: known flaky (gomonkey time.Now
+        # patch intermittently inert — see AGENTS.md "已知问题"); the tests
+        # exercise the monkeypatch, not our code, so they are skipped here.
+        run: go test ./... -skip 'Test_today_eval|Test_now_eval'

@@ -31,15 +31,17 @@ const testProviders = `{"providers": {
 func TestResolveRecursiveWithProvider(t *testing.T) {
 	r := writeConfig(t, `{"agents": {
     "glm53": {"executor": "recursive", "provider": "glm", "model": "glm-5.3-flash",
-      "command": "python3", "args": ["/hub/recursive/bridge.py"], "env": {"RECURSIVE_MAX_TOKENS": "65536"}}
+      "env": {"RECURSIVE_MAX_TOKENS": "65536"}}
   }}`, testProviders)
 
 	spec, err := r.ResolveAgent("glm53")
 	if err != nil {
 		t.Fatalf("ResolveAgent: %v", err)
 	}
-	if spec.Command != "python3" || len(spec.Args) != 1 || spec.Args[0] != "/hub/recursive/bridge.py" {
-		t.Errorf("spawn config = %s %v", spec.Command, spec.Args)
+	// recursive is aliased to the native recursive-direct executor: no
+	// command needed, argv built per turn
+	if spec.Mode != ModeRecursiveDirect {
+		t.Errorf("mode = %q, want recursive-direct", spec.Mode)
 	}
 	for _, want := range [][2]string{
 		{"RECURSIVE_PROVIDER_TYPE", "anthropic"},
@@ -54,6 +56,20 @@ func TestResolveRecursiveWithProvider(t *testing.T) {
 	}
 	if spec.Model != "glm-5.3-flash" {
 		t.Errorf("model = %q", spec.Model)
+	}
+}
+
+func TestResolveCommandPassthrough(t *testing.T) {
+	r := writeConfig(t, `{"agents": {
+    "cc": {"executor": "claude", "provider": "glm", "command": "python3",
+      "args": ["/hub/claude-code/bridge.py"], "extraArgs": ["--flag"]}
+  }}`, testProviders)
+	spec, err := r.ResolveAgent("cc")
+	if err != nil {
+		t.Fatalf("ResolveAgent: %v", err)
+	}
+	if spec.Command != "python3" || len(spec.Args) != 2 || spec.Args[0] != "/hub/claude-code/bridge.py" || spec.Args[1] != "--flag" {
+		t.Errorf("spawn config = %s %v", spec.Command, spec.Args)
 	}
 }
 
@@ -84,7 +100,9 @@ func TestResolveLockedExecutorRejectsProvider(t *testing.T) {
 }
 
 func TestResolveMissingCommandFailsClosed(t *testing.T) {
-	r := writeConfig(t, `{"agents": {"a": {"executor": "recursive"}}}`, "")
+	// protocol-path executors need an explicit spawn command; recursive is
+	// aliased to the native recursive-direct executor and needs none
+	r := writeConfig(t, `{"agents": {"a": {"executor": "cursor"}}}`, "")
 	_, err := r.ResolveAgent("a")
 	if err == nil || !strings.Contains(err.Error(), "missing command") {
 		t.Fatalf("err = %v, want missing command", err)
@@ -108,7 +126,7 @@ func TestResolveKeyEnv(t *testing.T) {
 func TestResolveVarExpansion(t *testing.T) {
 	t.Setenv("TEST_HUB_DIR", "/opt/hub")
 	r := writeConfig(t, `{"agents": {
-    "a": {"executor": "recursive", "command": "python3", "args": ["${TEST_HUB_DIR}/bridge.py"], "env": {"W": "${TEST_HUB_DIR}"}}
+    "a": {"executor": "cursor", "command": "python3", "args": ["${TEST_HUB_DIR}/bridge.py"], "env": {"W": "${TEST_HUB_DIR}"}}
   }}`, "")
 	spec, err := r.ResolveAgent("a")
 	if err != nil {

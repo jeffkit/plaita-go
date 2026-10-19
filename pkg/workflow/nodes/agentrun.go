@@ -145,6 +145,13 @@ func (a *AgentRun) Execute(ctx context.Context) (*workflow.ExecuteResult, error)
 	if err != nil {
 		return nil, fmt.Errorf("agentrun %q: %w", a.ID, err)
 	}
+	// Python-node parity: the recursive bridge takes its workspace from
+	// RECURSIVE_WORKSPACE (setdefault semantics — an explicit entry env wins).
+	if repo != "" {
+		if _, exists := spec.Env["RECURSIVE_WORKSPACE"]; !exists {
+			spec.Env["RECURSIVE_WORKSPACE"] = repo
+		}
+	}
 
 	runResult, err := agentproc.Run(ctx, spec, agentproc.RunOptions{
 		Message:        prompt,

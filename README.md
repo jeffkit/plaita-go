@@ -1,5 +1,7 @@
 # plaita-go
 
+[![ci](https://github.com/jeffkit/plaita-go/actions/workflows/ci.yml/badge.svg)](https://github.com/jeffkit/plaita-go/actions/workflows/ci.yml)
+
 plaita 的 Golang 引擎 + worker 运行时。内核为自底向上的 flow 引擎实现。
 
 - 定位、决策、对齐矩阵：见 [AGENTS.md](AGENTS.md)

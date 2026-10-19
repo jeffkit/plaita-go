@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -67,11 +68,22 @@ func Run(ctx context.Context, spec *AgentSpec, opts RunOptions) (*RunResult, err
 	if strings.TrimSpace(opts.Message) == "" {
 		return nil, fmt.Errorf("agentproc: empty turn (message is required)")
 	}
-	if spec == nil || spec.Command == "" {
+	if spec == nil {
+		return nil, fmt.Errorf("agentproc: nil agent spec")
+	}
+
+	args := spec.Args
+	if spec.Mode == ModeRecursiveDirect {
+		// native recursive-direct executor: argv is built per turn (the
+		// message rides in argv — the spec's bounded exception), plain stdout
+		built := buildRecursiveDirectArgs(spec.Env, opts.Message, opts.SessionID)
+		spec.Command, args = built[0], built[1:]
+	}
+	if spec.Command == "" {
 		return nil, fmt.Errorf("agentproc: agent spec has no command")
 	}
 
-	cmd := exec.Command(spec.Command, spec.Args...) // #nosec G204 — command comes from the operator's agents.json
+	cmd := exec.Command(spec.Command, args...) // #nosec G204 — command comes from the operator's agents.json
 	cmd.Dir = opts.Dir
 	cmd.Env = composeEnv(spec.Env)
 	// Own process group so the timeout/cancel path can kill the agent AND
@@ -92,25 +104,99 @@ func Run(ctx context.Context, spec *AgentSpec, opts RunOptions) (*RunResult, err
 		return nil, fmt.Errorf("agentproc: spawn %q: %w", spec.Command, err)
 	}
 
-	// Exactly one turn line, then EOF (permission channel not used by this host).
-	turn, err := json.Marshal(map[string]any{
-		"type":             "turn",
-		"message":          opts.Message,
-		"session_id":       opts.SessionID,
-		"protocol_version": protocolVersion,
-	})
-	if err == nil {
-		_, err = stdin.Write(append(turn, '\n'))
+	// Protocol path: exactly one turn line, then EOF (permission channel not
+	// used by this host). The recursive-direct path carries the message in
+	// argv and leaves stdin closed from the start.
+	var writeErr error
+	if spec.Mode != ModeRecursiveDirect {
+		var turn []byte
+		turn, writeErr = json.Marshal(map[string]any{
+			"type":             "turn",
+			"message":          opts.Message,
+			"session_id":       opts.SessionID,
+			"protocol_version": protocolVersion,
+		})
+		if writeErr == nil {
+			_, writeErr = stdin.Write(append(turn, '\n'))
+		}
 	}
-	if closeErr := stdin.Close(); err == nil {
-		err = closeErr
+	if closeErr := stdin.Close(); writeErr == nil && !errors.Is(closeErr, os.ErrClosed) {
+		// exec's Wait may close the write end first when the agent exits
+		// immediately — that race is a successful close, not an error.
+		writeErr = closeErr
 	}
-	if err != nil {
+	if writeErr != nil {
 		killGroup(cmd)
 		_, _ = cmd.Process.Wait()
-		return nil, fmt.Errorf("agentproc: write turn: %w", err)
+		return nil, fmt.Errorf("agentproc: write turn: %w", writeErr)
+	}
+	if spec.Mode == ModeRecursiveDirect {
+		return readPlain(ctx, cmd, stdout, opts)
 	}
 	return readEvents(ctx, cmd, stdout, opts)
+}
+
+// readPlain handles the plain stdout path (recursive-direct): accumulate
+// everything, then extract the trailing JSON result object.
+func readPlain(ctx context.Context, cmd *exec.Cmd, stdout interface{ Read([]byte) (int, error) }, opts RunOptions) (*RunResult, error) {
+	var body strings.Builder
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 0, 64*1024), 32*1024*1024)
+		for scanner.Scan() {
+			body.Write(scanner.Bytes())
+			body.WriteByte('\n')
+		}
+	}()
+
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = time.Hour * 24
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+
+	var waitErr error
+	select {
+	case waitErr = <-waitCh:
+	case <-timer.C:
+		killGroup(cmd)
+		<-waitCh
+		return nil, fmt.Errorf("agentproc: timeout after %s (process group killed)", timeout)
+	case <-ctx.Done():
+		killGroup(cmd)
+		<-waitCh
+		return nil, fmt.Errorf("agentproc: canceled: %w", ctx.Err())
+	}
+	<-done
+
+	res := &RunResult{SessionID: opts.SessionID}
+	obj := extractRecursiveResult(body.String())
+	if v, ok := obj["session_id"].(string); ok && v != "" && res.SessionID == "" {
+		res.SessionID = v
+	}
+	if v, ok := obj["usage"].(map[string]any); ok {
+		res.Usage = v
+	}
+	if isErr, _ := obj["is_error"].(bool); isErr {
+		msg := fmt.Sprint(obj["result"])
+		return res, fmt.Errorf("agentproc: error: %s", msg)
+	}
+	if raw, _ := obj["raw"].(bool); raw {
+		res.Text = strings.TrimSpace(obj["result"].(string))
+	} else {
+		res.Text, _ = obj["result"].(string)
+	}
+	if waitErr != nil {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok && res.Text == "" {
+			return res, fmt.Errorf("agentproc: agent exited with code %d", exitErr.ExitCode())
+		}
+	}
+	return res, nil
 }
 
 // turnOutcome accumulates the event-stream state machine.

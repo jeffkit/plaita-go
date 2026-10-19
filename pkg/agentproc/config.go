@@ -39,6 +39,10 @@ type AgentSpec struct {
 	Command  string
 	Args     []string
 	Env      map[string]string
+	// Mode selects the spawn shape. "" (or ModeProtocol) runs the
+	// command/args bridge and speaks stdin-turn/NDJSON-events; the
+	// recursive-direct mode runs the recursive CLI natively (plain stdout).
+	Mode string
 }
 
 // Registry resolves agent names against the plaita config home
@@ -70,6 +74,15 @@ func (r *Registry) ResolveAgent(name string) (*AgentSpec, error) {
 	if spec.Executor == "" {
 		return nil, fmt.Errorf("agent %q: missing executor field", name)
 	}
+	rawExecutor := spec.Executor
+	// executor aliases — the same table the Python runtime applies
+	// (plaita-nodes config.EXECUTOR_ALIASES).
+	if aliased, ok := executorAliases[spec.Executor]; ok {
+		spec.Executor = aliased
+	}
+	if spec.Executor == ModeRecursiveDirect {
+		spec.Mode = ModeRecursiveDirect
+	}
 
 	// provider → executor env translation. A locked CLI (no translator)
 	// must not declare a provider, mirroring the Python rule.
@@ -78,7 +91,8 @@ func (r *Registry) ResolveAgent(name string) (*AgentSpec, error) {
 		if err != nil {
 			return nil, fmt.Errorf("agent %q: %v", name, err)
 		}
-		translate, ok := envTranslators[spec.Executor]
+		// translators are keyed by the pre-alias executor name
+		translate, ok := envTranslators[rawExecutor]
 		if !ok {
 			return nil, fmt.Errorf("agent %q: executor %q is a locked CLI and cannot take provider %q",
 				name, spec.Executor, providerName)
@@ -97,10 +111,12 @@ func (r *Registry) ResolveAgent(name string) (*AgentSpec, error) {
 		spec.Env[k] = v
 	}
 
-	spec.Command, _ = raw["command"].(string)
-	if spec.Command == "" {
-		return nil, fmt.Errorf("agent %q: missing command (the Go engine spawns the agentproc bridge; "+
-			"add command/args to the agents.json entry, e.g. python3 <hub>/<executor>/bridge.py)", name)
+	if spec.Mode != ModeRecursiveDirect {
+		spec.Command, _ = raw["command"].(string)
+		if spec.Command == "" {
+			return nil, fmt.Errorf("agent %q: missing command (the Go engine spawns the agentproc bridge; "+
+				"add command/args to the agents.json entry, e.g. python3 <hub>/<executor>/bridge.py)", name)
+		}
 	}
 	for _, a := range listField(raw, "args") {
 		spec.Args = append(spec.Args, a)
@@ -173,6 +189,13 @@ func (r *Registry) resolveProvider(name string) (*providerBundle, error) {
 		}
 	}
 	return bundle, nil
+}
+
+// executorAliases mirrors plaita-nodes config.EXECUTOR_ALIASES.
+var executorAliases = map[string]string{
+	"claude":    "claude-code",
+	"gemini":    "gemini-cli",
+	"recursive": ModeRecursiveDirect,
 }
 
 // envTranslators maps an executor to its provider env translation — the

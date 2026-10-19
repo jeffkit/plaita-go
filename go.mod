@@ -1,6 +1,6 @@
 module github.com/jeffkit/plaita-go
 
-go 1.21
+go 1.24
 
 require (
 	github.com/Masterminds/semver/v3 v3.2.1
