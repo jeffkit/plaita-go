@@ -33,8 +33,8 @@ func (sw *Switch) Validate() error {
 		}
 	}
 
-	if defaultBranchCount != 1 {
-		return fmt.Errorf("there should be exactly one default branch in switch node: %q", sw.GetID())
+	if defaultBranchCount > 1 {
+		return fmt.Errorf("there should be at most one default branch in switch node: %q", sw.GetID())
 	}
 	return nil
 }
@@ -82,6 +82,9 @@ func (sw *Switch) Execute(ctx context.Context) (*workflow.ExecuteResult, error) 
 
 	if selectedBranch == nil {
 		selectedBranch = sw.defaultBranch()
+	}
+	if selectedBranch == nil {
+		return nil, fmt.Errorf("execute switch node (%q): no branch matched and no default branch", sw.GetID())
 	}
 
 	values := workflowContext.GetCurrentNodeContext(extraResultKey)

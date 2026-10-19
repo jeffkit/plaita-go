@@ -105,9 +105,18 @@ func (p *Parallel) execJoinBranches(ctx context.Context, joinBranches []Parallel
 			pb.Flow.Timeout = p.Timeout
 		}
 
-		subWorkflowInput, err := expression.Eval(branchCtx, pb.Input)
-		if err != nil {
-			return nil, err
+		// plaita semantics: a branch without an explicit input inherits the
+		// parent workflow input ($INPUT stays visible inside the branch).
+		var subWorkflowInput any
+		if pb.Input != nil {
+			var err error
+			subWorkflowInput, err = expression.Eval(branchCtx, pb.Input)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if subWorkflowInput == nil {
+			subWorkflowInput = runtime.WorkflowRuntimeContext(ctx).WorkflowInput
 		}
 		return pb.Flow.Execute(branchCtx, subWorkflowInput)
 	})

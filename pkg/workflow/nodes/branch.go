@@ -45,33 +45,41 @@ type ComparisonOperator string
 
 // ComparisonOperator enums
 const (
-	Gt         ComparisonOperator = "gt"
-	Gte        ComparisonOperator = "gte"
-	Lt         ComparisonOperator = "lt"
-	Lte        ComparisonOperator = "lte"
-	Eq         ComparisonOperator = "eq"
-	Ne         ComparisonOperator = "ne"
-	Between    ComparisonOperator = "between"
-	NotBetween ComparisonOperator = "notBetween"
-	In         ComparisonOperator = "in"
-	NotIn      ComparisonOperator = "notIn"
-	Like       ComparisonOperator = "like"
+	Gt          ComparisonOperator = "gt"
+	Gte         ComparisonOperator = "gte"
+	Lt          ComparisonOperator = "lt"
+	Lte         ComparisonOperator = "lte"
+	Eq          ComparisonOperator = "eq"
+	Ne          ComparisonOperator = "ne"
+	Between     ComparisonOperator = "between"
+	NotBetween  ComparisonOperator = "notBetween"
+	In          ComparisonOperator = "in"
+	NotIn       ComparisonOperator = "notIn"
+	Like        ComparisonOperator = "like"
+	Contains    ComparisonOperator = "contains"
+	NotContains ComparisonOperator = "notContains"
+	Truthy      ComparisonOperator = "truthy"
+	Falsy       ComparisonOperator = "falsy"
 )
 
 type compareFunc func(l, r any) (bool, error)
 
 var comparisonOperations = map[ComparisonOperator]compareFunc{
-	Gt:         gt,
-	Gte:        gte,
-	Lt:         lt,
-	Lte:        lte,
-	Eq:         eq,
-	Ne:         ne,
-	Between:    between,
-	NotBetween: notBetween,
-	In:         in,
-	NotIn:      notIn,
-	Like:       like,
+	Gt:          gt,
+	Gte:         gte,
+	Lt:          lt,
+	Lte:         lte,
+	Eq:          eq,
+	Ne:          ne,
+	Between:     between,
+	NotBetween:  notBetween,
+	In:          in,
+	NotIn:       notIn,
+	Like:        like,
+	Contains:    contains,
+	NotContains: notContains,
+	Truthy:      truthy,
+	Falsy:       falsy,
 }
 
 // ConditionElement defines a condition element.
@@ -115,6 +123,17 @@ func (l LogicCondition) MatchContext(ctx context.Context) (bool, *MatchInfo, err
 		return false, info, err
 	}
 	info.Actual = lhs
+
+	// truthy/falsy never consult the value (plaita semantics); their JSON
+	// condition frequently carries no value at all.
+	if l.Operator == Truthy || l.Operator == Falsy {
+		matched := isTruthy(lhs)
+		if l.Operator == Falsy {
+			matched = !matched
+		}
+		info.Matched = matched
+		return matched, info, nil
+	}
 
 	rhs, err := expression.Eval(ctx, l.Value)
 	if err != nil {
@@ -311,6 +330,98 @@ func like(l, r any) (bool, error) {
 
 	return strings.Contains(lhs, rhs), nil
 }
+
+// contains follows plaita semantics: the right side is contained in the left
+// (string substring, slice element, or map key).
+func contains(l, r any) (bool, error) {
+	switch lhs := l.(type) {
+	case string:
+		rhs, err := cast.ToStringE(r)
+		if err != nil {
+			return false, err
+		}
+		return strings.Contains(lhs, rhs), nil
+	case []any:
+		for _, v := range lhs {
+			if equals, _ := eq(v, r); equals {
+				return true, nil
+			}
+		}
+		return false, nil
+	case map[string]any:
+		key, err := cast.ToStringE(r)
+		if err != nil {
+			return false, err
+		}
+		_, ok := lhs[key]
+		return ok, nil
+	default:
+		s, err := cast.ToSliceE(l)
+		if err != nil {
+			return false, fmt.Errorf("contains: left operand must be string/array/map, got %T", l)
+		}
+		for _, v := range s {
+			if equals, _ := eq(v, r); equals {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+}
+
+func notContains(l, r any) (bool, error) {
+	b, err := contains(l, r)
+	if err != nil {
+		return false, err
+	}
+	return !b, nil
+}
+
+// isTruthy mirrors Python truthiness for the JSON value domain: nil, zero
+// numbers, empty string/slice/map and false are falsy; everything else truthy.
+func isTruthy(v any) bool {
+	switch t := v.(type) {
+	case nil:
+		return false
+	case bool:
+		return t
+	case string:
+		return t != ""
+	case json.Number:
+		f, err := t.Float64()
+		return err == nil && f != 0
+	case int:
+		return t != 0
+	case int64:
+		return t != 0
+	case float64:
+		return t != 0
+	case []any:
+		return len(t) > 0
+	case map[string]any:
+		return len(t) > 0
+	default:
+		rv := reflect.ValueOf(v)
+		switch rv.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			return rv.Int() != 0
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			return rv.Uint() != 0
+		case reflect.Float32, reflect.Float64:
+			return rv.Float() != 0
+		case reflect.Slice, reflect.Map, reflect.Array:
+			return rv.Len() > 0
+		case reflect.Ptr, reflect.Interface:
+			return !rv.IsNil()
+		default:
+			return true
+		}
+	}
+}
+
+func truthy(l, _ any) (bool, error) { return isTruthy(l), nil }
+
+func falsy(l, _ any) (bool, error) { return !isTruthy(l), nil }
 
 // Expression returns the expression of the condition.
 // TODO: 尝试使用表达式引擎完成逻辑运算
@@ -544,6 +655,11 @@ func (c *Condition) UnmarshalJSON(data []byte) error {
 
 // MatchContext matches the condition with the workflow node context.
 func (c *Condition) MatchContext(ctx context.Context) (bool, *MatchInfo, error) {
+	if c.ConditionType == conditionTypeLogicCondition &&
+		c.LogicCondition.Field == "" && c.LogicCondition.Operator == "" {
+		// zero-value condition (e.g. a plaita loop without one): always match
+		return true, &MatchInfo{Matched: true}, nil
+	}
 	switch c.ConditionType {
 	case conditionTypeLogicCondition:
 		return c.LogicCondition.MatchContext(ctx)

@@ -109,6 +109,7 @@ func (l *Loop) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
 	}
 
 	// Loop through the collection
+	var lastResult any
 	for index, item := range collection {
 		if l.Collection.IsArray() && l.ItemType.ValidateValue(item) != nil {
 			return nil, fmt.Errorf("invalid loop item value: %v", item)
@@ -131,6 +132,7 @@ func (l *Loop) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
 
 		// Store the result of the child flow
 		runtimeCtx.WithCurrentNodeContext(loopResultKey, childResult)
+		lastResult = childResult
 		// Check the loop condition
 		matched, _, execErr := l.Condition.MatchContext(ctx)
 		if execErr != nil {
@@ -142,7 +144,9 @@ func (l *Loop) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
 	}
 
 	if l.Output == nil {
-		return &workflow.ExecuteResult{NextNode: l.NextNode()}, nil
+		// plaita semantics: the loop node's output is the last child result
+		// ($NODE.<loop>), nil when the collection was empty.
+		return &workflow.ExecuteResult{Result: lastResult, NextNode: l.NextNode()}, nil
 	}
 
 	// Evaluate and validate the output

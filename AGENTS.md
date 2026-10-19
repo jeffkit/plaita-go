@@ -21,11 +21,31 @@ engine 侧（现 pkg/，内核自 前身引擎）：
   pkg/model, pkg/parser, pkg/providers/  流程模型、解析、flow 来源（fs/memory）
   pkg/delegate, pkg/discovery/           http 节点的委托与寻址（polaris 已删，仅 domain/noop）
 规划中：
-  engine/ir/    plaita 部署 JSON 的 schema + 解析 + 校验（契约层，优先级最高）
   nodes/agentproc/  agentproc stdin/stdout NDJSON 客户端 → agent 节点
   runtime/      worker、队列接入、租约、事件持久化（对齐 plaita server/ 语义）
   server/       console BFF 契约只读子集（execution 查询/事件流）
 ```
+
+## IR 契约层（pkg/ir，已落地 2026-10-19）
+
+`ir.Load(data) (*workflow.Workflow, error)`：plaita 部署 JSON → 引擎 Workflow。管线 = 归一化 → 结构校验 → 引擎反序列化。
+
+**权威契约 = plaita codeflow 编译器 `compile_source` 的产物**（顶层 `flow_id/inputType/nodes/runtime`；camel 为主、`source_line` 等 snake 残留双键都收；console 旧导出的 `id`/`required`/`default`/`children` 也归一）。`model_dump(by_alias=True)` 是 snake_case，**不是**发布形态。
+
+**归一化规则**（pkg/ir/normalize.go）：flow_id|flowId|id（flow_id 优先）；无 id 合成（根=`plaita-flow`，嵌入=`<node>.childFlow`/`<node>.branch.<name>`，引擎要求非空 id）；`global_context`→`context.global`；handler `continue_with`→`continue-with`、plaita 的 `code`/`message` 落 metadata 防丢失；timeout 毫秒数→ISO8601；Property 的 `type/title/description/default/children`→引擎拼写；switch 分支 `next` 空时回落 `name`（branch_name_as_target 语义）。
+
+**校验子集**（pkg/ir/validate.go，对应 ir_validate DEFAULT_RULES）：唯一 start + 全图可达（R1）、next/分支引用存在（R3）、嵌入流程可达 end（R2）、`joinBranches ⊆ branches[].name`（R4 语义）。表达式级校验（R5）随表达式对齐工作流补。
+
+**fail-closed 拒载清单**：decision（plaita-nodes）/ map/filter/find/reduce/while / if / case / calculate / event / mock / reference（需 provider）/ code 非 javascript / `sandbox_backend` / end `nop` / http 的 `allowedHosts`/`deniedHosts`/`blockPrivateNetworks`（SSRF 护栏未移植，靠它保护的 flow 不许静默降级）/ parallel 分支 input 非 dict。
+
+**随 ir 对齐落地的引擎语义修正**（plaita 语义为基准）：
+- loop：`$NODE.<loop>` = 末次子结果（原 前身引擎 为 nil）
+- switch：default 分支 0..1 个（原强制恰好 1）；无匹配且无 default → 执行期显式报错
+- 条件算子补齐 plaita 集：`contains`（右∈左：串子串/切片元素/map 键）/`notContains`/`truthy`/`falsy`（Python 真值语义，value 不参与）
+- parallel：分支无 `input` 时继承父 `$INPUT`（原为 nil）
+- loop 无 `condition` = 恒真（零值 Condition 不再报"invalid expression type"）
+
+**golden 测试**（pkg/ir/ir_test.go + testdata/）：assignment_flow.json 是 console 真实导出；loop_flow/parallel_flow/child_flow 由 **plaita 编译器实编**（`flow_from_source` → `compile_source`），在 Go 引擎执行并断言输出——「Python codeFlow 产 IR → Go 跑」已实证。改契约前先重跑这组。
 
 ## 常用命令
 
@@ -40,17 +60,17 @@ make test   # 已封装代理
 
 | plaita (Python) | plaita-go（前身引擎 内核） | 状态 |
 |---|---|---|
-| assignment | assignment | 有，语义待对齐（输出包裹 `$F.concat` 差异待核） |
-| decide | branch（`switch` JSON type） | 有，语义待对齐 |
-| concurrent | parallel | 有 |
-| loop | loop | 有 |
-| http | http | 有（已改 net/http） |
-| redis | redis | 有 |
-| code | code（goja JS + yeagi Go） | 有，plaita 侧是 Python 语义，**需定义 Go 版 code 节点契约** |
-| child | child | 有 |
-| start/end/start→end | start/end | 有 |
-| mock / event_node / calculate / basic | — | 缺 |
-| —（plaita-nodes 仓） | — | 缺：agent（agentproc）、gate、rate_limit、report、hitl、hitl_await 等 22 节点 |
+| assignment | assignment | ✅ ir 对齐（golden 过） |
+| decide（switch） | switch | ✅ ir 对齐 + 条件算子补齐（golden 过） |
+| concurrent（parallel） | parallel | ✅ ir 对齐 + 分支输入继承（golden 过） |
+| loop（基础 for-in） | loop | ✅ ir 对齐 + 末次结果语义（golden 过）；map/filter/find/reduce/while 拒载 |
+| child（inline） | child | ✅ ir 对齐（golden 过）；reference 拒载 |
+| http | http | ✅ ir 收录；SSRF 护栏字段拒载；golden 待补（执行面已有 nodes 测试） |
+| redis | redis | ✅ ir 收录，字段同形 |
+| start/end | start/end | ✅ ir 对齐；end nop 拒载 |
+| code（python） | code（javascript） | ⚠️ 仅 javascript；Python 语义不可移植，Go 版 code 契约待定 |
+| mock / event / calculate | — | 拒载（清单见上） |
+| —（plaita-nodes 仓：decision/agent/gate/rate_limit/report/hitl/hitl_await 等） | — | 缺：decision 已在拒载清单带提示 |
 | trpc / mdb（前身引擎 特有） | 已删 | 不移植（公司内网设施） |
 
 ## 表达式对齐（缺口清单）
