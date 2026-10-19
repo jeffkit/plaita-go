@@ -111,9 +111,11 @@ agentrun `workspace=` 分支从「拒载」改为「计划支持」。**对齐�
 
 **golden 跑批**：`pkg/expression/golden_test.go` + `testdata/expression_golden.json`（45 条，由 `scripts/export_golden.py` 从 `plaita/tests/unit/test_expression_golden.py` 程序化导出，回灌校验后落盘）。**改表达式任何行为前先跑它**；Python 侧语义升级后重新导出：`cd ~/projects/infra4agent/plaita && python3 ~/projects/plaita-go/scripts/export_golden.py`。3 条依赖自定义注册表的用例不可导出（schema 无 registry 字段）；2 条 parse_function API 用例 runner 跳过（门面对应的是 evaluate 路径）。
 
-## 已知问题（上游带入）
+## 已知问题
 
-- `TestWorkflow_Execute/test_execute_workflow_with_error_node` 红（got 1003 want 1002）——**原仓同样红**，非清理引入，修复前先在原仓确权。
+- ~~error_node 上游遗留红~~ **已修平（2026-10-19 audit wave，#12/#13 http 契约修复顺带解决；撤代理后 1002=期望）**。
+- `test_execute_workflow_with_http_request_info`：live-network 测试（断言真实出网失败），结果取决于出口网络状态——CI 以 -skip 排除。
+- `Test_today_eval`/`Test_now_eval`：gomonkey time.Now 补丁抖动（测的是补丁不是代码），CI -skip。
 - `go vet`：pkg/providers/memory、filesystem 有 lock 值拷贝告警（上游质量噪音）。
 
 ## 约定

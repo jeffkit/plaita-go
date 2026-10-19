@@ -36,7 +36,8 @@ jobs:
         run: go build ./...
 
       - name: test
-        # Test_today_eval / Test_now_eval: known flaky (gomonkey time.Now
-        # patch intermittently inert — see AGENTS.md "已知问题"); the tests
-        # exercise the monkeypatch, not our code, so they are skipped here.
-        run: go test ./... -skip 'Test_today_eval|Test_now_eval'
+        # Skips (see AGENTS.md "已知问题"):
+        # - Test_today_eval / Test_now_eval: gomonkey time.Now patch flaky.
+        # - test_execute_workflow_with_http_request_info: live-network test
+        #   (asserts a real outbound request fails; depends on egress state).
+        run: go test ./... -skip 'Test_today_eval|Test_now_eval|test_execute_workflow_with_http_request_info'

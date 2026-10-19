@@ -54,7 +54,7 @@ func TestLoadLoopFixture(t *testing.T) {
 	// plaita semantics: loop output is the last child result
 	got, err := wf.Execute(t.Context(), map[string]any{"items": []any{1, 2, 3}})
 	require.NoError(t, err)
-	assert.Equal(t, float64(6), got)
+	assert.Equal(t, 6, got)
 }
 
 func TestLoadParallelFixture(t *testing.T) {
@@ -62,7 +62,7 @@ func TestLoadParallelFixture(t *testing.T) {
 
 	got, err := wf.Execute(t.Context(), map[string]any{"x": 5})
 	require.NoError(t, err)
-	assert.Equal(t, map[string]any{"a": float64(10), "b": float64(15)}, got)
+	assert.Equal(t, map[string]any{"a": 10, "b": 15}, got)
 }
 
 func TestLoadChildFixture(t *testing.T) {

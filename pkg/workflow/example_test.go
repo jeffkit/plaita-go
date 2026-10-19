@@ -173,7 +173,7 @@ func TestWorkflowUseFunction(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, map[string]any{
 		"upper_name":  "NICK",
-		"double_age":  float64(20),
+		"double_age":  20,
 		"first_hobby": "sports",
 		"brothers":    []any{"jack", "peter"},
 		"name":        "NICK",
@@ -194,5 +194,5 @@ func TestWorkflowHttpError(t *testing.T) {
 		},
 	)
 	require.NoError(t, err)
-	require.Equal(t, float64(1002), result)
+	require.Equal(t, 1002, result)
 }
