@@ -1,4 +1,4 @@
-// Package version contains build information about Plaita.
+// Package version contains build information about plaita-go.
 package version
 
 import (
@@ -11,7 +11,7 @@ import (
 	"github.com/Masterminds/semver/v3"
 )
 
-// Version contains build information about Plaita.
+// Version contains build information about plaita-go.
 type Version struct {
 	Version     *semver.Version `json:"version"`
 	BuildBranch string          `json:"BuildBranch"`

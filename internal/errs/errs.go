@@ -1,4 +1,4 @@
-// Package errs plaita internal error implementation
+// Package errs engine internal error implementation
 package errs
 
 import (
@@ -6,14 +6,14 @@ import (
 	"fmt"
 )
 
-// plaita internal error code
+// engine internal error code
 const (
 	RetOK = 0 // success
 
 	RuntimeErrorCode = 10000 // runtime error code
 )
 
-// Error represents plaita internal error
+// Error represents engine internal error
 type Error struct {
 	Code    int    `json:"code" structs:"code"`       // error code
 	Message string `json:"message" structs:"message"` // error message
@@ -34,7 +34,7 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("code: %d, message: %s, info: %v", e.Code, e.Message, e.Info)
 }
 
-// Wrap error by plaita error
+// Wrap error by engine error
 func Wrap(err error, code int, message string) error {
 	return &Error{
 		Code:    code,
@@ -43,7 +43,7 @@ func Wrap(err error, code int, message string) error {
 	}
 }
 
-// WrapWithInfo error by plaita error with extra info
+// WrapWithInfo error by engine error with extra info
 func WrapWithInfo(err error, code int, message string, info any) error {
 	return &Error{
 		Code:    code,
@@ -59,13 +59,13 @@ func Internal(err error) *Error {
 		return nil
 	}
 
-	// plaita error
+	// engine error
 	var e *Error
 	if errors.As(err, &e) {
 		return e
 	}
 
-	// non plaita error
+	// non engine error
 	return &Error{
 		Code:    RuntimeErrorCode,
 		Message: err.Error(),

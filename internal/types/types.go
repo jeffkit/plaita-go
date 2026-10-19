@@ -1,4 +1,4 @@
-// Package types defines plaita types
+// Package types defines engine types
 package types
 
 // NodeID is a unique identifier for a node in a workflow.

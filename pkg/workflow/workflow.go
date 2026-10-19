@@ -1,4 +1,4 @@
-// Package workflow provides plaita workflow
+// Package workflow provides the plaita-go workflow engine
 package workflow
 
 import (
@@ -16,10 +16,10 @@ import (
 	"github.com/jeffkit/plaita-go/pkg/duration"
 )
 
-// RuntimeType represents the runtime type of the plaita workflow.
+// RuntimeType represents the runtime type of a plaita-go workflow.
 type RuntimeType string
 
-// RuntimeType supported by Plaita.
+// RuntimeType supported by plaita-go.
 const (
 	RuntimeGo         = "go"
 	RuntimeGEngine    = "gengine"
@@ -68,7 +68,7 @@ func (e *Executor) NextStep() Step {
 	return <-e.results
 }
 
-// Workflow represents Plaita Workflow DSL definition.
+// Workflow represents the plaita-go Workflow DSL definition.
 type Workflow struct {
 	ID                  ID                           `json:"id"`                       // workflow id
 	Name                string                       `json:"name,omitempty"`           // workflow名称

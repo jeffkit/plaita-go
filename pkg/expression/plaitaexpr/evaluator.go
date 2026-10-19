@@ -1,4 +1,4 @@
-// Package plaitaexpr provides plaita expression
+// Package plaitaexpr provides the plaita expression language
 package plaitaexpr
 
 import (
@@ -18,7 +18,7 @@ import (
 	"github.com/jeffkit/plaita-go/pkg/model"
 )
 
-// Evaluator plaita expression evaluator
+// Evaluator evaluates plaita expressions
 type Evaluator struct{}
 
 // NewEvaluator creates a new plaita expression evaluator

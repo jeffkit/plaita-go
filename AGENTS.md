@@ -6,14 +6,14 @@
 
 ## 已拍板的三个决策（2026-10-19）
 
-1. **表达式语言 = plaita 现行**（`$INPUT/$NODE/$PARENT/$GLOBAL/$ENV` + `$F.fn()` + `{% ... %}` 模板插值），不做 JS 方言。plaitaexpr 与 plaita 是同族语言（变量根完全一致），对齐成本低；缺口清单见下文「表达式对齐」。
+1. **表达式语言 = plaita 现行**（`$INPUT/$NODE/$PARENT/$GLOBAL/$ENV` + `$F.fn()` + `{% ... %}` 模板插值），不做 JS 方言。前身引擎的表达式语言与 plaita 同族（变量根完全一致），对齐成本低；缺口清单见下文「表达式对齐」。
 2. **权威 IR = plaita 部署形态的 camelCase JSON**（`tests/fixture/assigment.json`、`examples/agent/flows/router.json` 即此形态）。@flow Python 源码只是前端写法，编译产物交给本引擎跑。snake_case 的 pydantic model_dump 是 Python 内部模型，不是契约。**禁止**在本仓再引入第三种表示；schema 变更必须同步 ir_validate 语义与往返 golden 测试（吸取 plaita「DSL 三表示往返无不变量 ~20 单」的教训）。
 3. **来源已清理**：模块路径 `github.com/jeffkit/plaita-go`，git 历史不带入，腾讯内网依赖全删。
 
 ## 仓库结构
 
 ```
-engine 侧（现 pkg/，内核自 前身引擎）：
+engine 侧（现 pkg/，内核自前身引擎清理）：
   pkg/workflow/       Workflow/Node 接口/registry/retry/timeout/event 回调
   pkg/workflow/nodes/ 内置节点（assignment/branch/http/loop/parallel/redis/code/child/end）
   pkg/expression/     plaitaexpr（$ 变量 + $F 函数，goval 求值）
@@ -39,7 +39,7 @@ engine 侧（现 pkg/，内核自 前身引擎）：
 **fail-closed 拒载清单**：decision（plaita-nodes）/ map/filter/find/reduce/while / if / case / calculate / event / mock / reference（需 provider）/ code 非 javascript / `sandbox_backend` / end `nop` / http 的 `allowedHosts`/`deniedHosts`/`blockPrivateNetworks`（SSRF 护栏未移植，靠它保护的 flow 不许静默降级）/ parallel 分支 input 非 dict。
 
 **随 ir 对齐落地的引擎语义修正**（plaita 语义为基准）：
-- loop：`$NODE.<loop>` = 末次子结果（原 前身引擎 为 nil）
+- loop：`$NODE.<loop>` = 末次子结果（前身引擎为 nil）
 - switch：default 分支 0..1 个（原强制恰好 1）；无匹配且无 default → 执行期显式报错
 - 条件算子补齐 plaita 集：`contains`（右∈左：串子串/切片元素/map 键）/`notContains`/`truthy`/`falsy`（Python 真值语义，value 不参与）
 - parallel：分支无 `input` 时继承父 `$INPUT`（原为 nil）
@@ -58,7 +58,7 @@ make test   # 已封装代理
 
 ## 节点对齐矩阵（现状）
 
-| plaita (Python) | plaita-go（前身引擎 内核） | 状态 |
+| plaita (Python) | plaita-go | 状态 |
 |---|---|---|
 | assignment | assignment | ✅ ir 对齐（golden 过） |
 | decide（switch） | switch | ✅ ir 对齐 + 条件算子补齐（golden 过） |
@@ -71,18 +71,18 @@ make test   # 已封装代理
 | code（python） | code（javascript） | ⚠️ 仅 javascript；Python 语义不可移植，Go 版 code 契约待定 |
 | mock / event / calculate | — | 拒载（清单见上） |
 | —（plaita-nodes 仓：decision/agent/gate/rate_limit/report/hitl/hitl_await 等） | — | 缺：decision 已在拒载清单带提示 |
-| trpc / mdb（前身引擎 特有） | 已删 | 不移植（公司内网设施） |
+| trpc / mdb（前身引擎特有） | 已删 | 不移植（公司内网设施） |
 
 ## 表达式对齐（已落地 2026-10-19，golden 45/45 绿）
 
-变量根一致：`INPUT/NODE/PARENT/GLOBAL/ENV`（plaitaexpr 另有 `ERROR/NULL/EMPTYSTRING`，保留）。
+变量根一致：`INPUT/NODE/PARENT/GLOBAL/ENV`（引擎另有 `ERROR/NULL/EMPTYSTRING`，保留）。
 
 **已对齐**（语义权威 = `plaita/core/expression_parser.py` docstring + golden）：
 - **`$F` 函数**：补齐 `eq/ne/gt/gte/lt/lte`（跨类型数值+容器深比较）、`ifelse`（急切）、`notContains`、`getDictValues`、`pop`（list/dict 双形态）；`and/or/not` 改 Python 真值语义（`or` 返回首个真值参数的**值**）；`concat`/`get`/`getDictValue` 变参+默认参可用（适配器支持 variadic，nil 实参→参数零值）。
 - **`{% ... %}` 模板插值**：门面分发——`$` 开头=整串表达式（原类型返回）；含 `{% %}`=模板（内层须 `$` 前缀且可解析才插值，否则字面）；其余原样。nil 透传。
 - **未知函数 = 报错**（不采 scoped registry 的 `"undefined"` 哨兵）：plaita 默认注册表 NameError + did-you-mean，部署 flow 用默认注册表，fail-closed 同仓规。goval 自带 `no such function` panic→error。
 - **`$NODE.raw.<node>`** 免评估旁路（#130，含同名 `raw` 节点冲突规则）；**缺键语义**：缺根=error（KeyError 口径），已存在对象缺字段=nil，索引 miss=error，负索引 `[-1]` 支持。
-- **语句变量预解析架构**（plaitaexpr.go `preResolveStatementVariables`）：`$F` 语句里的内建根变量先经 plaita 遍历求值、注入合成标识符，goval 只做函数调用——方括号 `X[0]`/`[-1]`（parser 归一为 `.#N`）、raw 修饰符、缺键语义在语句里与纯变量路径完全一致；`$PARENT.` 链整段吸收走 goval 导航。
+- **语句变量预解析架构**（plaitaexpr/evaluator.go `preResolveStatementVariables`）：`$F` 语句里的内建根变量先经 plaita 遍历求值、注入合成标识符，goval 只做函数调用——方括号 `X[0]`/`[-1]`（parser 归一为 `.#N`）、raw 修饰符、缺键语义在语句里与纯变量路径完全一致；`$PARENT.` 链整段吸收走 goval 导航。
 - **parser**：单引号字面量→双引号转换（goval 无单引号 token）、尾逗号剔除、字面量掩码防误改。
 
 **golden 跑批**：`pkg/expression/golden_test.go` + `testdata/expression_golden.json`（45 条，由 `scripts/export_golden.py` 从 `plaita/tests/unit/test_expression_golden.py` 程序化导出，回灌校验后落盘）。**改表达式任何行为前先跑它**；Python 侧语义升级后重新导出：`cd ~/projects/infra4agent/plaita && python3 ~/projects/plaita-go/scripts/export_golden.py`。3 条依赖自定义注册表的用例不可导出（schema 无 registry 字段）；2 条 parse_function API 用例 runner 跳过（门面对应的是 evaluate 路径）。

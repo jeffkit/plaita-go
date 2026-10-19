@@ -1,4 +1,4 @@
-// Package parser defines plaita expression parser
+// Package parser defines the plaita expression parser
 package parser
 
 import (

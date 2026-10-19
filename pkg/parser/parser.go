@@ -1,4 +1,4 @@
-// Package parser parse the struct of plaita workflow
+// Package parser parse the struct of the plaita workflow
 package parser
 
 import (
@@ -25,7 +25,7 @@ const (
 // SupportedExts Supported file extensions.
 var SupportedExts = []FileExt{YAMLExt, YMLExt, JSONExt}
 
-// FromYAMLSource parses the given Plaita Workflow YAML/YML source into the Workflow type.
+// FromYAMLSource parses the given plaita Workflow YAML/YML source into the Workflow type.
 func FromYAMLSource(source []byte) (*workflow.Workflow, error) {
 	jsonSource, err := yaml.YAMLToJSON(source)
 	if err != nil {
@@ -34,7 +34,7 @@ func FromYAMLSource(source []byte) (*workflow.Workflow, error) {
 	return FromJSONSource(jsonSource)
 }
 
-// FromJSONSource parses the given Plaita Workflow JSON source into the Workflow type.
+// FromJSONSource parses the given plaita Workflow JSON source into the Workflow type.
 func FromJSONSource(source []byte) (*workflow.Workflow, error) {
 	wf := new(workflow.Workflow)
 	if err := json.Unmarshal(source, wf); err != nil {
@@ -46,7 +46,7 @@ func FromJSONSource(source []byte) (*workflow.Workflow, error) {
 	return wf, nil
 }
 
-// FromFile parses the given Plaita Workflow file into the Workflow type.
+// FromFile parses the given plaita Workflow file into the Workflow type.
 func FromFile(path string) (*workflow.Workflow, error) {
 	if err := checkFilePath(path); err != nil {
 		return nil, err
