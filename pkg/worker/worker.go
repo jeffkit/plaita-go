@@ -50,14 +50,29 @@ import (
 //	node retry budgets (§9.1)     — per-node/refetch/nofail counters, see
 //	                                retry.go.
 //
+// M6 checkpoint v1.5 (2026-10-19, this build):
+//
+//	suspend    — a node declaring IsSuspending() parks the flow; the engine
+//	             registers its wake-up subscription, snapshots the context
+//	             (cycle-safe / depth-capped) and writes
+//	             {ns}:execution:checkpoint:{id}. The worker writes the
+//	             status=suspended row (§5.2).
+//	resume     — event/timeout carriers restore the checkpoint, dispatch to
+//	             the node's Resume(event|timeout|cancel) and keep stepping.
+//	             Suspended + continue/retry stays a no-op carrier.
+//	wake-ups   — Redis Pub/Sub {ns}:events:* plus the subscription timeout
+//	             index enqueue the decision carriers (see eventbus.go).
+//
 // Still out of scope (phase 3):
 //
 //	TODO(phase-3): per-step state persistence (PERSIST_EVERY_N_STEPS=1, §5.2)
 //	        — the progress heartbeat (ttl/3) stands in for it.
 //	TODO(phase-3): task age gate (PLAITA_TASK_MAX_AGE_SECONDS, §1.2) and the
 //	        tenant quota / dedup-key idempotency paths.
-//	TODO(phase-3): checkpoint resume (M6) — swap the retry carrier back to the
-//	        protocol's start→resume/continue conversion once it exists.
+//	TODO(phase-3): node-retry carrier conversion — a retryable node failure
+//	        still re-enqueues a start carrier (whole-flow replay) because an
+//	        error execution has no checkpoint; the start→resume/continue
+//	        conversion waits for per-step checkpoints.
 
 // runContextKey carries the executionRun through the engine execution
 // context so the global engine event listeners can correlate events to the
@@ -92,6 +107,11 @@ type Worker struct {
 	ledger   *DispatchLedger
 	retries  *RetryBudgets
 
+	// M6 checkpoint v1.5: resumable snapshots + suspended-node wake-up
+	// subscriptions (§9.2 decision carriers).
+	checkpoints *RedisCheckpointStore
+	eventSubs   *EventSubscriptions
+
 	active       atomic.Int64
 	runCtx       context.Context
 	runCtxCancel context.CancelFunc
@@ -120,6 +140,9 @@ func New(cfg *Config, rdb *redis.Client, logger Logger) *Worker {
 		ledger:   NewDispatchLedger(rdb, cfg, logger),
 		retries:  NewRetryBudgets(rdb, cfg, logger),
 		orphans:  map[string]*orphanEntry{},
+
+		checkpoints: NewRedisCheckpointStore(rdb, cfg),
+		eventSubs:   NewEventSubscriptions(rdb, cfg, logger),
 	}
 	w.drainState.activeRuns = map[*executionRun]context.CancelFunc{}
 	w.queue.SetDeadLetterGuard(w.deadLetterGuard)
@@ -194,7 +217,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 	w.registry.SetStatus(ctx, RegStatusRunning)
 
-	w.wg.Add(3)
+	w.wg.Add(5)
 	go func() {
 		defer w.wg.Done()
 		w.registry.HeartbeatLoop(ctx)
@@ -206,6 +229,14 @@ func (w *Worker) Run(ctx context.Context) error {
 	go func() {
 		defer w.wg.Done()
 		w.orphanLoop(ctx)
+	}()
+	go func() {
+		defer w.wg.Done()
+		w.eventBridgeLoop(ctx)
+	}()
+	go func() {
+		defer w.wg.Done()
+		w.eventTimeoutLoop(ctx)
 	}()
 	defer func() {
 		w.runCtxCancel()
@@ -362,6 +393,18 @@ func (w *Worker) handleStart(ctx context.Context, task *Task) error {
 		return fmt.Errorf("state probe: %w", perr)
 	} else if prev == nil {
 		_ = w.retries.ResetAll(ctx, tenant, executionID)
+		// A brand-new execution id must not inherit a stale checkpoint from a
+		// previous life of the same id.
+		w.deleteCheckpoint(ctx, tenant, executionID)
+	} else if prev.Status == StatusSuspended {
+		// M6: a start carrier for an already-suspended execution must not
+		// replay the flow from scratch — that would re-run the nodes before
+		// the suspend point and leak the old subscription. The only valid
+		// advance is a decision carrier (event/timeout/cancel).
+		_ = w.lease.Release(ctx, handle)
+		w.logger.Info("start carrier for a suspended execution, idempotent ack (use a resume carrier to wake it)",
+			"execution_id", executionID)
+		return nil
 	}
 
 	// Flow definition (§7). Missing = deterministic (poison ack after an
@@ -401,6 +444,16 @@ type executePlan struct {
 	def    *FlowDefinition
 	handle *LeaseHandle
 	state  *ExecutionState
+	// resume, when non-nil, turns the engine call into Workflow.Resume
+	// (suspended → event/timeout/cancel carrier) instead of Workflow.Execute.
+	resume *resumeInput
+}
+
+// resumeInput carries the checkpoint + carrier for a resume execution.
+type resumeInput struct {
+	checkpoint *workflow.Checkpoint
+	resumeType string
+	data       map[string]any
 }
 
 // persistCancelAtEntry terminalizes a start task that was cancelled before
@@ -432,6 +485,12 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 		nodeTimings: map[string]map[string]any{},
 		enqueuedAt:  task.Timestamp,
 	}
+	if plan.resume != nil {
+		// A resume is a continuation of the same execution: carry the
+		// suspended row's node timings + timeline forward so the terminal
+		// write does not erase the pre-suspend history (§5.1).
+		seedRunFromState(run, plan.state)
+	}
 	if wait, ok := queueWaitMillis(task.Timestamp); ok {
 		run.queueWaitMS = &wait
 	}
@@ -443,6 +502,15 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 	// engine returns (by cancellation, lease loss or plain completion).
 	loopCtx := ctx
 	ctx = withRun(runCtx, run)
+	// M6: the engine writes the checkpoint and registers the wake-up
+	// subscription at a suspend boundary; the worker owns both stores.
+	ctx = workflow.WithSuspendOptions(ctx, &workflow.SuspendOptions{
+		ExecutionID:   task.ExecutionID,
+		TenantID:      tenant,
+		FlowID:        task.FlowID,
+		Store:         w.checkpoints,
+		Subscriptions: w.eventSubs,
+	})
 	w.registerRun(run, cancelRun)
 	defer w.unregisterRun(run)
 	defer w.dropOrphan(task.ExecutionID, "run ended")
@@ -539,7 +607,14 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 		}
 	}()
 
-	result, execErr := def.Workflow.Execute(ctx, task.Params)
+	var result any
+	var execErr error
+	if plan.resume != nil {
+		result, execErr = def.Workflow.Resume(ctx, plan.resume.checkpoint, plan.resume.resumeType, plan.resume.data)
+	} else {
+		result, execErr = def.Workflow.Execute(ctx, task.Params)
+	}
+	susp := workflow.AsSuspend(execErr)
 	close(pollDone)
 	close(watchDone)
 	pollWG.Wait()
@@ -579,6 +654,7 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 			_ = w.lease.Release(loopCtx, handle)
 			return fmt.Errorf("cancelled persist: %w", err)
 		}
+		w.deleteCheckpoint(loopCtx, tenant, task.ExecutionID)
 	case execErr != nil && run.drainAborted():
 		// §9.3 D2: the step was abandoned by force-stop. Deliberately NO
 		// terminal write — the execution stays resumable and the message
@@ -590,6 +666,30 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 			"execution_id", task.ExecutionID)
 		_ = w.lease.Release(loopCtx, handle)
 		return ErrDrainAborted
+	case plan.resume != nil && isResumeCarrierRejection(execErr):
+		// A stale/invalid carrier (ResumeGuardError) or a failing node resume
+		// handler (ResumeError) is not an execution failure: the run stays
+		// suspended and the message must stay pending so the real decision
+		// carrier can still arrive (§9.2 "execution stays suspended").
+		run.markFinished()
+		_ = w.lease.Release(loopCtx, handle)
+		w.logger.Warn("resume carrier rejected; execution stays suspended, message left pending",
+			"execution_id", task.ExecutionID, "resume_type", task.ResumeType, "error", execErr)
+		return fmt.Errorf("resume carrier rejected: %w", execErr)
+	case susp != nil:
+		// §5.2 suspended: the node parked the flow after the engine wrote the
+		// checkpoint + registered the wake-up subscription. The row keeps
+		// status=suspended with no end_time; the lease is released so the
+		// resume carrier can take it.
+		w.logger.Info("execution suspended", "execution_id", task.ExecutionID,
+			"node", string(susp.NodeID), "resume_type", "event")
+		err := run.finalize(func() error {
+			return w.persistSuspended(loopCtx, tenant, handle, plan.state, run, susp)
+		})
+		if err != nil {
+			_ = w.lease.Release(loopCtx, handle)
+			return fmt.Errorf("suspended persist: %w", err)
+		}
 	case execErr != nil:
 		terminalized, retryErr, err := w.classifyNodeFailure(loopCtx, tenant, handle, plan.state, run, execErr)
 		if err != nil {
@@ -619,6 +719,7 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 			_ = w.lease.Release(loopCtx, handle)
 			return fmt.Errorf("completed persist: %w", err)
 		}
+		w.deleteCheckpoint(loopCtx, tenant, task.ExecutionID)
 	}
 
 	if err := w.lease.Release(loopCtx, handle); err != nil {
@@ -627,13 +728,205 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 	return nil
 }
 
+// seedRunFromState carries the persisted timeline + node timings of a
+// suspended execution into the resume run. The timeline sequence stays
+// monotonic so the final row reads as one execution, not two.
+func seedRunFromState(run *executionRun, state *ExecutionState) {
+	if run == nil || state == nil {
+		return
+	}
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	for nodeID, raw := range state.NodeTimings {
+		entry, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		clone := make(map[string]any, len(entry))
+		for k, v := range entry {
+			clone[k] = v
+		}
+		run.nodeTimings[nodeID] = clone
+	}
+	if state.Timeline == nil {
+		return
+	}
+	run.dropped = toInt(state.Timeline["dropped"])
+	events, _ := state.Timeline["events"].([]any)
+	for _, raw := range events {
+		event, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		run.events = append(run.events, event)
+		if seq := toInt(event["seq"]); seq > int(run.seq) {
+			run.seq = int64(seq)
+		}
+	}
+}
+
+// persistSuspended writes the §5.2 suspended row: no end_time, the engine's
+// checkpoint as the context, and the node timings/timeline collected so far.
+// The checkpoint itself was already written by the engine at the suspend
+// boundary; it is re-saved through the worker store so the key layout is
+// owned by the worker even if a different store was injected.
+func (w *Worker) persistSuspended(ctx context.Context, tenant string, handle *LeaseHandle,
+	state *ExecutionState, run *executionRun, susp *workflow.SuspendError) error {
+	cp := susp.Checkpoint
+	if cp == nil {
+		return fmt.Errorf("%w: suspension carried no checkpoint", ErrStatePersist)
+	}
+	state.Status = StatusSuspended
+	state.LastUpdateTime = nowISO()
+	state.EndTime = ""
+	state.Context = cp.Context
+	state.Error = nil
+	if run != nil {
+		state.NodeTimings = run.snapshotNodeTimings()
+		state.Timeline = run.snapshotTimeline()
+	}
+	if err := w.checkpoints.SaveCheckpoint(ctx, cp); err != nil {
+		return err
+	}
+	return w.store.SaveExecutionState(ctx, tenant, state, handle.FenceToken)
+}
+
+// deleteCheckpoint removes the execution's checkpoint after a terminal write.
+// A failure only warns: the state row is authoritative and the key expires
+// with the execution's lifecycle (no checkpoint TTL is set while suspended).
+func (w *Worker) deleteCheckpoint(ctx context.Context, tenant, executionID string) {
+	if err := w.checkpoints.DeleteCheckpoint(ctx, tenant, executionID); err != nil {
+		w.logger.Warn("checkpoint cleanup failed", "execution_id", executionID, "error", err)
+	}
+}
+
+// resumeSuspended performs the real M6 wake-up: load the flow + checkpoint,
+// mark the row running, and execute Workflow.Resume under the already-held
+// lease (executeAndFinalize owns the terminal write and the release).
+func (w *Worker) resumeSuspended(ctx context.Context, task *Task, state *ExecutionState, handle *LeaseHandle) error {
+	tenant := task.TenantID
+	flowID := task.FlowID
+	if flowID == "" {
+		flowID = state.FlowID
+	}
+	// §7: resume uses the version recorded on the state row, not "latest".
+	def, err := w.flows.GetFlowDefinition(ctx, tenant, flowID, state.FlowVersion)
+	if err != nil {
+		if errors.Is(err, ErrFlowNotFound) {
+			w.logger.Error("resume: flow definition not loadable, error terminal",
+				"flow_id", flowID, "version", state.FlowVersion, "error", err)
+			ne := WorkerError("flow_not_found", flowErrorCode, err.Error())
+			w.deleteCheckpoint(ctx, tenant, task.ExecutionID)
+			return w.persistErrorTerminal(ctx, tenant, handle.FenceToken, state, nil, ne)
+		}
+		return fmt.Errorf("resume flow load: %w", err)
+	}
+
+	// §7 flow-fingerprint hard gate: resuming a checkpoint against a changed
+	// flow silently corrupts the run. The explicit opt-out is the carrier's
+	// allow_flow_hash_change (Python data.allow_flow_hash_change).
+	allowHashChange, _ := task.Data["allow_flow_hash_change"].(bool)
+	if !allowHashChange && state.FlowHash != "" && def.Hash != "" && state.FlowHash != def.Hash {
+		w.logger.Error("resume: flow definition changed since the checkpoint was written",
+			"execution_id", task.ExecutionID,
+			"stored_flow_hash", state.FlowHash, "current_flow_hash", def.Hash)
+		ne := WorkerError("flow_hash_mismatch", flowErrorCode, fmt.Sprintf(
+			"flow definition changed since execution %s started (stored=%s current=%s); "+
+				"resume refused (set allow_flow_hash_change=true on the carrier to override)",
+			task.ExecutionID, state.FlowHash, def.Hash))
+		ne.Details = map[string]any{
+			"stored_flow_hash":       state.FlowHash,
+			"current_flow_hash":      def.Hash,
+			"stored_flow_hash_algo":  state.FlowHashAlgo,
+			"current_flow_hash_algo": def.HashAlgo,
+			"upgrade_suspected":      state.FlowHashAlgo != "" && def.HashAlgo != "" && state.FlowHashAlgo != def.HashAlgo,
+		}
+		return w.persistErrorTerminal(ctx, tenant, handle.FenceToken, state, nil, ne)
+	}
+
+	checkpoint, err := w.checkpoints.LoadCheckpoint(ctx, tenant, task.ExecutionID)
+	if err != nil {
+		return err
+	}
+	if checkpoint == nil {
+		// Fallback: older workers only kept the checkpoint inside the state
+		// row's context (§5.1). A context without $LAST_NODE cannot express a
+		// resume position, so it is treated as missing.
+		checkpoint = checkpointFromStateContext(state, task.ExecutionID)
+	}
+	if checkpoint == nil {
+		w.logger.Error("resume: no checkpoint for suspended execution",
+			"execution_id", task.ExecutionID, "resume_type", task.ResumeType)
+		ne := WorkerError("resume_checkpoint_missing", flowErrorCode, fmt.Sprintf(
+			"resume carrier (type=%s) cannot advance execution %s: no checkpoint found",
+			task.ResumeType, task.ExecutionID))
+		w.deleteCheckpoint(ctx, tenant, task.ExecutionID)
+		return w.persistErrorTerminal(ctx, tenant, handle.FenceToken, state, nil, ne)
+	}
+
+	// The row stays suspended while the resume carrier is being applied: if
+	// the carrier is stale (ResumeGuardError) or the node's resume handler
+	// fails (ResumeError), the execution must remain resumable and the
+	// message stays pending. A terminal outcome overwrites the status below.
+	return w.executeAndFinalize(ctx, executePlan{
+		task:   task,
+		def:    def,
+		handle: handle,
+		state:  state,
+		resume: &resumeInput{
+			checkpoint: checkpoint,
+			resumeType: task.ResumeType,
+			data:       task.Data,
+		},
+	})
+}
+
+// checkpointFromStateContext rebuilds a minimal checkpoint from a state row's
+// context (legacy carriers). The dedicated checkpoint key is authoritative.
+func checkpointFromStateContext(state *ExecutionState, executionID string) *workflow.Checkpoint {
+	if state == nil || len(state.Context) == 0 {
+		return nil
+	}
+	lastNode, _ := state.Context["$LAST_NODE"].(string)
+	if lastNode == "" {
+		return nil
+	}
+	return &workflow.Checkpoint{
+		SchemaVersion: workflow.CheckpointSchemaVersion,
+		ExecutionID:   executionID,
+		TenantID:      state.TenantID,
+		FlowID:        state.FlowID,
+		SuspendedNode: workflow.NodeID(lastNode),
+		ResumeType:    workflow.ResumeEvent,
+		Context:       state.Context,
+		CreatedAt:     nowISO(),
+	}
+}
+
+// isResumeCarrierRejection reports the engine's resume-admission failures: a
+// stale carrier (ResumeGuardError) or a node resume handler failure
+// (ResumeError). Neither is a flow failure — the execution stays suspended.
+func isResumeCarrierRejection(err error) bool {
+	if err == nil {
+		return false
+	}
+	var guard *workflow.ResumeGuardError
+	if errors.As(err, &guard) {
+		return true
+	}
+	var resumeErr *workflow.ResumeError
+	return errors.As(err, &resumeErr)
+}
+
 // classifyNodeFailure applies the §9.1 node-retry decision to an engine
-// failure. It returns:
+
+// terminalized=true  — the error terminal (normal OR budget-exhausted) was
 //
-//	terminalized=true  — the error terminal (normal OR budget-exhausted) was
-//	                     written; the caller only releases the lease.
-//	terminalized=false — a retryable failure below budget; retryErr carries
-//	                     the NodeRetryableError for the re-enqueue path.
+//	written; the caller only releases the lease.
+//
+// terminalized=false — a retryable failure below budget; retryErr carries
+//
+//	the NodeRetryableError for the re-enqueue path.
 func (w *Worker) classifyNodeFailure(ctx context.Context, tenant string, handle *LeaseHandle,
 	state *ExecutionState, run *executionRun, execErr error) (bool, error, error) {
 	if !isRetryableNodeFailure(execErr, run) {
@@ -733,7 +1026,11 @@ func (w *Worker) persistErrorTerminal(ctx context.Context, tenant string, fenceG
 	state.EndTime = nowISO()
 	state.LastUpdateTime = state.EndTime
 	state.Error = terminalErrorState(ne)
-	return w.store.SaveExecutionState(ctx, tenant, state, fenceGen)
+	if err := w.store.SaveExecutionState(ctx, tenant, state, fenceGen); err != nil {
+		return err
+	}
+	w.deleteCheckpoint(ctx, tenant, state.ExecutionID)
+	return nil
 }
 
 // progressHeartbeat merges the current node_timings snapshot + fresh
@@ -793,16 +1090,17 @@ func (w *Worker) leaseConflictDisposition(ctx context.Context, task *Task) error
 }
 
 // handleResume implements the A47-F2 carrier semantics (§3.5, §4.2 #5, §5.3,
-// §9.2). The engine has no suspend/resume yet, so the *wake-up* path still
-// fails deterministically (resume_not_supported); what phase 2 aligns is the
-// ack / re-delivery / dead-letter disposition:
+// §9.2) on top of M6 checkpoint resume:
 //
 //   - terminal executions short-circuit idempotently (already_terminal);
 //   - cancel intent (flag or resume_type=cancel) wins over every shortcut;
 //   - suspended + continue/retry is a no-op short-circuit that takes NO lease,
 //     except to compensate a pending suspend service dispatch (plaita#233);
 //   - an event/timeout carrier on a *running* execution missed the suspend
-//     point and is normalized to a continue carrier (enqueue → ack, #258).
+//     point and is normalized to a continue carrier (enqueue → ack, #258);
+//   - an event/timeout carrier on a *suspended* execution performs the real
+//     wake-up: restore the checkpoint, call the node's Resume handler and
+//     keep stepping (resumeSuspended).
 func (w *Worker) handleResume(ctx context.Context, task *Task) error {
 	tenant := task.TenantID
 	executionID := task.ExecutionID
@@ -910,15 +1208,24 @@ func (w *Worker) resumeUnderLease(ctx context.Context, task *Task) error {
 		return w.requeueNormalizedContinue(ctx, task)
 	}
 
-	// Engine has no suspend/resume yet (checkpoint v1.5 = M6): the wake-up
-	// cannot be applied; write the deterministic failure terminal.
-	ne := WorkerError("resume_not_supported", flowErrorCode,
-		fmt.Sprintf("resume carrier (type=%s) cannot advance execution: plaita-go engine has no checkpoint resume yet (A47-F2 wake-up path pending M6)", task.ResumeType))
+	if state.Status == StatusSuspended &&
+		(task.ResumeType == workflow.ResumeEvent || task.ResumeType == workflow.ResumeTimeout) {
+		// M6: real wake-up — restore the checkpoint, dispatch to the suspended
+		// node's Resume and continue the flow.
+		return w.resumeSuspended(ctx, task, state, handle)
+	}
+
+	// Any other carrier/state combination has no advance semantics in this
+	// build (an error execution has no checkpoint to retry from; a running
+	// one is not suspended). Fail closed with an observable terminal instead
+	// of acking the carrier silently.
+	ne := WorkerError("resume_not_supported", flowErrorCode, fmt.Sprintf(
+		"resume carrier (type=%s) cannot advance an execution in status %s", task.ResumeType, state.Status))
 	if err := w.persistErrorTerminal(ctx, tenant, handle.FenceToken, state, nil, ne); err != nil {
 		return err
 	}
-	w.logger.Warn("resume wake-up not supported, deterministic error terminal written",
-		"execution_id", executionID, "resume_type", task.ResumeType)
+	w.logger.Warn("resume carrier has no applicable state transition, deterministic error terminal written",
+		"execution_id", executionID, "resume_type", task.ResumeType, "status", state.Status)
 	return nil
 }
 
@@ -968,6 +1275,7 @@ func (w *Worker) writeResumeCancelled(ctx context.Context, tenant, executionID s
 	if err := w.store.SaveExecutionState(ctx, tenant, state, fenceGen); err != nil {
 		return err
 	}
+	w.deleteCheckpoint(ctx, tenant, executionID)
 	w.logger.Info("resume terminalized cancelled execution", "execution_id", executionID)
 	return nil
 }
@@ -1422,10 +1730,15 @@ func (w *Worker) buildCheckpoint(run *executionRun, seed map[string]any) map[str
 		rc := runtime.WorkflowRuntimeContext(ctx)
 		if rc != nil {
 			out["$INPUT"] = rc.WorkflowInput
-			out["$NODE"] = rc.CurrentNodeContext
+			// $NODE is the expression root: the map of executed node results.
+			// (CurrentNodeContext is per-node scratch and lives under $CURRENT.)
+			out["$NODE"] = rc.ExecuteNodeResults
 			out["$LAST_NODE"] = string(rc.LastNodeID)
 			out["$ENV"] = rc.EnvVariables
 			out["$GLOBAL"] = rc.GlobalVariables
+			if len(rc.CurrentNodeContext) > 0 {
+				out["$CURRENT"] = rc.CurrentNodeContext
+			}
 			if len(rc.ExecuteNodeErrors) > 0 {
 				out["$ERROR"] = rc.ExecuteNodeErrors
 			}

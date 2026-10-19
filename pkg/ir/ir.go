@@ -100,6 +100,10 @@ var supportedNodeTypes = map[string]bool{
 	"llm":            true,
 	"decision":       true,
 	"hitl":           true,
+
+	// M6 checkpoint v1.5（2026-10-19）：挂起恢复地基解锁的挂起节点
+	"event":      true,
+	"hitl_await": true,
 }
 
 // knownUnsupported types carry a targeted hint; anything else unknown gets a
@@ -114,7 +118,6 @@ var knownUnsupported = map[string]string{
 	"if":        "bool branch node, use switch",
 	"case":      "legacy switch dialect, use switch",
 	"calculate": "calculate node is not ported yet",
-	"event":     "suspending event node is not ported yet",
 	"mock":      "mock node is not ported yet",
 	"reference": "provider-based child flow reference is not ported yet (use inline childFlow)",
 	"sleep":     "sleep node is not part of the plaita dialect",

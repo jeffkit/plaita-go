@@ -154,14 +154,17 @@ func TestResumeEventOnRunningNormalizesToContinue(t *testing.T) {
 	}
 }
 
-// TestResumeSuspendedEventFailsDeterministically: the wake-up path has no
-// engine support yet → resume_not_supported error terminal (B2 scope).
-func TestResumeSuspendedEventFailsDeterministically(t *testing.T) {
+// TestResumeSuspendedWithoutCheckpointFailsDeterministically: M6 resumes a
+// suspended execution from its checkpoint. A suspended row with no checkpoint
+// can never advance — the carrier is acked with an observable error terminal
+// (not left pending forever).
+func TestResumeSuspendedWithoutCheckpointFailsDeterministically(t *testing.T) {
 	w, rdb, _, cfg := newTestWorker(t)
 	ctx := context.Background()
+	presetHelloWorld(t, w)
 	executionID := newExecutionID()
 	rdb.Set(ctx, stateKeyOf(cfg, executionID),
-		fmt.Sprintf(`{"execution_id":%q,"status":"suspended"}`, executionID), 0)
+		fmt.Sprintf(`{"execution_id":%q,"flow_id":"hello_world_go","status":"suspended"}`, executionID), 0)
 
 	payload := baseStartPayload(executionID)
 	payload["type"] = "resume"
@@ -172,8 +175,8 @@ func TestResumeSuspendedEventFailsDeterministically(t *testing.T) {
 		t.Fatalf("ProcessOne: %v", err)
 	}
 	state := loadStateRow(t, rdb, cfg, executionID)
-	if state.Status != StatusError || state.Error["error_type"] != "resume_not_supported" {
-		t.Fatalf("state = %+v, want error/resume_not_supported", state)
+	if state.Status != StatusError || state.Error["error_type"] != "resume_checkpoint_missing" {
+		t.Fatalf("state = %+v, want error/resume_checkpoint_missing", state)
 	}
 	if n := streamLen(t, rdb, cfg.QueueName); n != 0 {
 		t.Fatalf("queue XLEN = %d, want 0", n)

@@ -433,15 +433,41 @@ EventSubscription: {subscription_id, event_type(非空强制), filter_condition?
 - **`stop(wait=)`**（:6970-7052）：顺序 = draining → 有界等 in-flight（预算=drain timeout 剩余量）→ 停注册重试 → 停看门狗 → 停取消监听 → 停 metrics/告警 → 停控制监听 → 注册表 stopping 立即落盘 → `_mark_registry_closed`（迟到写入全 no-op）→ `unregister_service`（写 stopped 墓碑 SETEX 5s 再 DEL，`registry.py:257-349`）→ 关日志 handler。
 - 未收尾步的消息留 pending，由其他 worker XCLAIM 从**步界检查点**续跑（该步重放，业务节点须幂等——文档级契约，:735-737,6857 注释）。
 
+### 9.4 checkpoint v1.5（plaita-go M6 实现，2026-10-19）
+
+本节记录 Go worker 的挂起恢复落地形态；语义基准是 `core/strategies.py` 的 `_execute_current_node` / `_handle_resume` 与 `core/state.py`。
+
+**键名**（全部在 `{ns}=cfg.Namespace(tenant)` 下；影子运行只需 `PLAITA_KEY_PREFIX=plaita-go-shadow`）：
+
+| 键 | 值 | 用途 |
+|---|---|---|
+| `{ns}:execution:checkpoint:{execution_id}` | `Checkpoint` JSON（`schema_version` / `execution_id` / `tenant_id` / `flow_id` / `suspended_node` / `next_node` / `resume_type` / `context` / `created_at`） | 挂起边界快照；无 TTL（人工审批可等任意久），终态写回后删除 |
+| `{ns}:event:subscriptions:{subscription_id}` | 订阅 JSON（event_type/filter/correlation_id/flow_id/node_id/tenant_id/timeout_at） | 挂起节点的唤醒订阅，TTL = `EventTTLSeconds`（默认 7d） |
+| `{ns}:event:subscriptions:type:{event_type}` | SET(subscription_id) | 事件分发按类型索引 |
+| `{ns}:event:subscriptions:timeouts` | ZSET(sub key → timeout_at 秒) | 超时检查器索引 |
+| `{ns}:event_filter:dedup:{event_id}:{sub_id}` | `"1"`，TTL 1h | 事件去重（对齐 `event_filter.py:222-225`） |
+| `{ns}:event_filter:timeout:{sub_id}` | `"1"`，TTL 1h | 超时去重（对齐 `event_filter.py:333-336`） |
+
+**语义**：
+
+- **挂起**：节点实现 `workflow.Suspender`（`IsSuspending()`）；`Workflow.Execute` 在其返回 `status=pending` 后注册订阅、写快照、返回 `*SuspendError`。worker 写 `status=suspended` 行（无 `end_time`，context=快照），ack 载体并释放租约。订阅注册失败拒绝挂起（plaita「不得悬挂在无唤醒源的执行上」）。
+- **快照**：`$INPUT/$NODE/$GLOBAL/$ENV/$ERROR/$CURRENT/$LAST_NODE/$PARENT` 深度物化；容器环以 `<recursive: $['a'][0]>` 截断，深度 > 10000 抛 `StateSnapshotError`；非字符串 map 键具名拒绝。
+- **恢复**：`event`/`timeout` 载体在 `status=suspended` 上执行真恢复（`Workflow.Resume` → 节点 `Resume(resume_type, data)` → 从 `next` 继续）；`cancel` 仍走终态化 `cancelled`；`suspended + continue/retry` 保持 B2 的幂等短路。事件/超时载体必须绑定挂起时写入 `$NODE.<node>.subscription_id`（`event` 另比对 `event_type`），不匹配 → `ResumeGuardError`：**执行保持 suspended、消息留 pending**，绝不终态化（plaita#221）。
+- **唤醒**：Redis `PUBLISH {ns}:events:{event_type}`（`EventPublisher` 双写）→ worker 事件桥（`PSUBSCRIBE`）→ 匹配租户/execution/filter → `resume_type=event` 载体；订阅超时索引 → `resume_type=timeout` 载体。核心字段对齐 `event_filter.py:227-262` 的 `data={event_id,event_type,event_data,subscription_id}`。
+- **start 载体重投**：目标执行已 `suspended` 时幂等 ack（不重放流程）；真正推进只能靠决议载体。**偏差**：Python §7.6 的「start 查盘转 resume」未做（相位 3，需要每步 checkpoint）。
+- **节点结果写回**：`$NODE` 现在存**节点结果表**（`runtime.ExecuteNodeResults`）；此前 worker 的终态 context 误写 `CurrentNodeContext`，本轮修正，`$CURRENT` 单独保留。恢复运行会把挂起行的 `node_timings`/`timeline` 续接到终态行（seq 单调）。
+- **作用域**：仅根流程可挂起；child/loop/parallel 子流程内的挂起节点返回显式引擎错误（快照无法表达嵌套恢复位置）。
+
 ---
 
 ## 10. Go 移植注意
 
-### 10.1 plaita-go 现状（@ 2026-10-19，worker 二期 B2 收口）
+### 10.1 plaita-go 现状（@ 2026-10-19，M6 checkpoint v1.5 收口）
 
 - **MVP（一期）已落地**：`pkg/worker`（Stream 消费 + reclaim + DLQ 信封/schema 拒收/残留 sweep、三段租约 Lua + fence CAS 写、ExecutionState 字段级写回 + timeline/node_timings、取消标志轮询、注册表心跳 + 容量块、flow 来源读路径 + v2 指纹）、`cmd/plaita-worker`（env 配置 + 影子前缀）。
 - **二期（M4）已落地**：orphan watch（失租后仅进度心跳）、resume 载体语义（A47-F2：决议载体冲突窗口不 ack / 终态幂等 ack / suspended+continue 短路 + dispatch_pending 补偿 / event/timeout 归一化 continue）、dispatch_ledger（§6.3 schema + 入队唯一入口 + 读/对账）+ TaskNotForThisWorker 有界交接、DLQ replay（幂等标记 + 审计 + 确定性 id + schema 继承 + 墓碑）+ 死信守卫恢复克隆/预算终态化、drain 三态（D1/D2/D3）+ 信号优雅退出、节点级三层重试预算 + 退避重投。
-- **刻意偏差（等 M6 checkpoint 恢复后回收）**：resume 唤醒路径仍写 `resume_not_supported` 确定性终态（引擎无挂起恢复）；节点重投载体保持 start（同 execution_id 整条重放），不转 resume/continue；D2 中止的步不写终态、留 pending（无硬中断 B18-01）。以上三项已在 AGENTS.md「worker 二期」章节逐条声明。
+- **M6 checkpoint v1.5 已落地**（见 §9.4）：挂起边界快照（环安全/深度上限）、event/hitl_await 挂起节点、event/timeout 真恢复、Redis Pub/Sub 唤醒 + 订阅超时检查器、start 载体命中 suspended 幂等 ack。
+- **刻意偏差**：节点重投载体保持 start（同 execution_id 整条重放），不转 resume/continue（错误执行没有 checkpoint，需每步 checkpoint）；D2 中止的步不写终态、留 pending（无硬中断 B18-01）；仅根流程可挂起；事件 Pub/Sub 无回扫器（订阅超时/状态双写保证至少一次唤醒）。以上已在 AGENTS.md 对应章节逐条声明。
 
 ### 10.2 缺口清单（按本协议文档逐章）
 
@@ -451,12 +477,12 @@ EventSubscription: {subscription_id, event_type(非空强制), filter_condition?
 |---|---|---|---|
 | §2 队列 | XREADGROUP 消费组 + reclaim（游标轮转 + 租约闸）+ DLQ（信封 schema/裁剪/守卫）+ schema_version 拒收 + 残留 sweep | P0（影子对账的最小面） | ✅ 一期；守卫恢复克隆/预算终态化 = 二期 |
 | §3 租约 | 三个 Lua 逐字移植 + holder token 格式（16 位 hex 末段是反解协议的一部分）+ fencegen 语义 + fenced CAS 存储 + 看门狗 | P0 | ✅ 一期；orphan watch = 二期 |
-| §5 写回 | ExecutionState JSON 字段级兼容（Python `model_dump` 的 camel/snake 混合——`node_timings`/`timeline` 键名以本文 §5.1 为准，落地前用真实 Redis 快照对拍）；终态 TTL；索引 ZSET；StatePersistError/StateSerializationError 二分 | P0 | ✅（步界持久化/checkpoint 恢复 = M6） |
+| §5 写回 | ExecutionState JSON 字段级兼容（Python `model_dump` 的 camel/snake 混合——`node_timings`/`timeline` 键名以本文 §5.1 为准，落地前用真实 Redis 快照对拍）；终态 TTL；索引 ZSET；StatePersistError/StateSerializationError 二分 | P0 | ✅；挂起边界 checkpoint + 恢复（M6 §9.4），每步持久化未做（三期） |
 | §4 取消 | 取消标志键轮询（步界 + 步内两个层次）+ cancel resume 载体 + 终态写回 | P1（步界版先够对账） | ✅ 步内轮询 + 入口/租约内检查点 |
-| §7 flow 来源 | RedisFlowStorage 读路径（`{ns}:flow:{id}:{ver}` + flow_list/flow_versions SET + latest/数字版本序）；指纹算法（sort_keys JSON sha256 + algo v2 标记）——指纹是 resume 硬门，Go 必须同口径 | P0（同 Redis 即可对跑） | ✅ 读/指纹；resume 流程指纹校验随 M6 |
+| §7 flow 来源 | RedisFlowStorage 读路径（`{ns}:flow:{id}:{ver}` + flow_list/flow_versions SET + latest/数字版本序）；指纹算法（sort_keys JSON sha256 + algo v2 标记）——指纹是 resume 硬门，Go 必须同口径 | P0（同 Redis 即可对跑） | ✅ 读/指纹；resume 指纹硬门（flow_hash_mismatch + allow_flow_hash_change 放行）已落 |
 | §8 心跳 | 注册表键 + ServiceInfo JSON（status 生命周期、worker_capacity 块）+ 进度心跳（node_timings 在跑节点 `ended_at=""` 约定） | P1（keeper 误杀风险，随影子上线即需要） | ✅ 三层（含失租 orphan watch） |
-| §6 事件 | Go worker 第一阶段可只读不写业务事件；`timeline`/`node_timings` 落盘必须有（keeper 判据）；SSE 发布可后置 | P2 | ✅ timeline/耗时落盘 + execution events PUBLISH；业务事件写 = M6 |
-| §9 退避/drain | 三层重试预算键 + 显式重投（先入队后 ack）+ resume 载体转换 + 信号处理 | P1 | ✅ 三层预算 + 退避重投 + drain 三态；载体转换等 M6 |
+| §6 事件 | Go worker 第一阶段可只读不写业务事件；`timeline`/`node_timings` 落盘必须有（keeper 判据）；SSE 发布可后置 | P2 | ✅ timeline/耗时落盘 + execution events PUBLISH；业务事件 PUBLISH/订阅/唤醒（M6 §9.4） |
+| §9 退避/drain | 三层重试预算键 + 显式重投（先入队后 ack）+ resume 载体转换 + 信号处理 | P1 | ✅ 三层预算 + 退避重投 + drain 三态；重投载体仍为 start（无每步 checkpoint，三期转换） |
 | §6.3 派发台账 | 台账 Stream + 入队唯一入口 + TaskNotForThisWorker 有界交接 | P1 | ✅ 二期 |
 | 控制面 | stop/status Pub/Sub 命令（`plaita:control:{instance}`）、`/metrics` | P3 | ❌ 未做 |
 

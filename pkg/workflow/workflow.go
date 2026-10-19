@@ -178,6 +178,15 @@ func (f *Workflow) Execute(ctx context.Context, args ExecuteArgs) (any, error) {
 		} else {
 			result, err = f.execute(ctx, args)
 		}
+		// A suspension is a normal park, not a failed attempt: no flow-end
+		// error marker (which would make the worker append a failed
+		// run_end(final=false)) and no flow-level retry — re-executing a
+		// parked flow would re-run the nodes before the suspend point. The
+		// error still travels up so the worker can write the suspended row.
+		if susp := AsSuspend(err); susp != nil {
+			triggerFlowEnd(ctx, f, nil, nil)
+			return susp
+		}
 		triggerFlowEnd(ctx, f, result, err)
 		if err == nil {
 			return nil
@@ -252,11 +261,26 @@ func (f *Workflow) execute(ctx context.Context, _ ExecuteArgs) (result any, err 
 	if !ok {
 		return nil, ErrStartNodeNotFound
 	}
+	return f.runNodes(ctx, startNode)
+}
 
-	for node := startNode; node != nil; {
+// runNodes advances the flow from node. It is shared by the start path
+// (execute) and the resume path (Resume continues from the resumed node's
+// next pointer), so both use exactly the same step bookkeeping and suspend
+// detection.
+func (f *Workflow) runNodes(ctx context.Context, node Node) (any, error) {
+	for node != nil {
 		result, err := f.executeNode(ctx, node)
 		if err != nil {
 			return nil, err
+		}
+
+		// plaita `is_suspending`: an executing node parks the flow BEFORE the
+		// end-node check and before advancing. The node result (status
+		// "pending") is already staged in $NODE by suspend(), so the
+		// checkpoint carries the admission state a resume will verify.
+		if suspender, ok := node.(Suspender); ok && suspender.IsSuspending() {
+			return nil, f.suspend(ctx, node, result)
 		}
 
 		if isEndNode(node) {
@@ -294,6 +318,15 @@ func (f *Workflow) ExecuteGenerator(ctx context.Context, executor *Executor) {
 			result, err := f.executeNode(ctx, node)
 			if err != nil {
 				results <- Step{Error: err}
+				return
+			}
+
+			// The debug generator only advances step by step inside one
+			// process; it has no checkpoint store and no resume entry. A
+			// suspending node would be silently stepped past, so fail closed.
+			if suspender, ok := node.(Suspender); ok && suspender.IsSuspending() {
+				results <- Step{Error: fmt.Errorf(
+					"node %s suspends; the debug generator cannot park a flow (use Workflow.Execute/Resume)", node.GetID())}
 				return
 			}
 
