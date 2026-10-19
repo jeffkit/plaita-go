@@ -78,6 +78,17 @@ var builtinFuncs = map[string]ExpressionFunc{
 	"notIn":      mustToExpressionFunc(notIn),
 	"contains":   mustToExpressionFunc(contains),
 	"like":       mustToExpressionFunc(contains),
+	// plaita comparison / flow / container functions
+	"eq":            mustToExpressionFunc(eq),
+	"ne":            mustToExpressionFunc(ne),
+	"gt":            mustToExpressionFunc(gt),
+	"gte":           mustToExpressionFunc(gte),
+	"lt":            mustToExpressionFunc(lt),
+	"lte":           mustToExpressionFunc(lte),
+	"ifelse":        mustToExpressionFunc(ifelse),
+	"notContains":   mustToExpressionFunc(notContains),
+	"getDictValues": mustToExpressionFunc(values),
+	"pop":           mustToExpressionFunc(pop),
 }
 
 func init() {
