@@ -58,6 +58,9 @@ func gitPublishSetupRepo(t *testing.T) (wt, remote string) {
 	gitPublishTestGit(t, wt, "commit", "-m", "init")
 	gitPublishTestGit(t, wt, "remote", "add", "origin", remote)
 	gitPublishTestGit(t, wt, "push", "-u", "origin", "main")
+	// bare 远端 init 后 HEAD 停在 init.defaultBranch（CI=master），push 不改它；
+	// 不显式指向 main 的话，后续 git clone 在部分 git 版本上不含 main 分支
+	gitPublishTestGit(t, remote, "symbolic-ref", "HEAD", "refs/heads/main")
 	return wt, remote
 }
 
