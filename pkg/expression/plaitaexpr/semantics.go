@@ -6,87 +6,34 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-
-	"github.com/maja42/goval"
 )
 
 // This file implements plaita engine-level expression semantics on top of
 // goval (semantic authority: plaita/core/expression_parser.py module
 // docstring + plaita/tests/unit/test_expression_golden.py):
 //
-//  1. unknown functions fall back to the "undefined" sentinel instead of
-//     failing (plaita _UNDEFINED: `lambda *args, **kwargs: "undefined"`);
+//  1. unknown functions fail loudly (plaita's default registry raises
+//     NameError with did-you-mean; goval panics with "no such function",
+//     recovered as an error by its caller);
 //  2. `$NODE.raw.<node>[.path...]` is an explicit verbatim accessor that
 //     bypasses any re-evaluation (plaita#130);
 //  3. missing-key semantics: a missing root key is an error (plaita
 //     KeyError), while a missing field on an existing object yields nil and
 //     further field access through nil keeps yielding nil (plaita
 //     `_get_attr(None, ...) -> None`); index misses are errors (plaita
-//     IndexError/TypeError/KeyError).
+//     IndexError/TypeError/KeyError);
+//  4. function statements have their built-in-root variables pre-resolved
+//     with the plaita traversal (`#N` bracket-index segments, raw modifier,
+//     missing-key semantics) before goval sees them.
 
-// undefinedSentinelValue is the exact sentinel plaita returns for unknown
-// function calls: the string "undefined" (plaita _UNDEFINED lambda).
-const undefinedSentinelValue = "undefined"
-
-// undefinedSentinelFunc is injected for every unregistered function name
-// referenced by a statement. goval resolves `functions[name]` at call time,
-// *after* evaluating the arguments, so argument evaluation stays eager and a
-// failing argument (e.g. a missing root) still errors before the sentinel is
-// produced — exactly plaita's order (args are evaluated before the registry
-// lookup).
-func undefinedSentinelFunc(_ ...interface{}) (interface{}, error) {
-	return undefinedSentinelValue, nil
-}
-
-// funcHeadRe matches a function-call head `name(` inside a compiled
-// statement (the goval statement form has no "$" left in it).
-var funcHeadRe = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+// indexSegmentPrefix marks a bracket-index segment produced by the parser
+// (`X[0]` / `X[-1]` normalize to `X.#0` / `X.#-1`).
+const indexSegmentPrefix = "#"
 
 // quotedSpanRe matches single- or double-quoted string literals (with
-// backslash escapes) so call-like text inside literals cannot inject or
-// shadow functions during the unknown-function scan.
+// backslash escapes). It is reused both for masking literals during bracket
+// normalization and for call-like text inside literals.
 var quotedSpanRe = regexp.MustCompile(`"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'`)
-
-// resolveFunctions returns the function map to evaluate a statement with:
-// the registered functions, plus an "undefined" sentinel for every function
-// name the statement calls that is not registered. When nothing is unknown
-// the registered map is returned as-is (no copy on the hot path).
-func resolveFunctions(statement string, registered map[string]goval.ExpressionFunction) map[string]goval.ExpressionFunction {
-	unknown := scanUnknownFunctions(statement, registered)
-	if len(unknown) == 0 {
-		return registered
-	}
-	functions := make(map[string]goval.ExpressionFunction, len(registered)+len(unknown))
-	for name, fn := range registered {
-		functions[name] = fn
-	}
-	for _, name := range unknown {
-		functions[name] = undefinedSentinelFunc
-	}
-	return functions
-}
-
-// scanUnknownFunctions returns the deduplicated names of functions called by
-// a compiled statement that are missing from the registered map. Quoted
-// string literals are stripped first so `"add("` inside a literal neither
-// registers a bogus sentinel nor could shadow a real function.
-func scanUnknownFunctions(statement string, registered map[string]goval.ExpressionFunction) []string {
-	stripped := quotedSpanRe.ReplaceAllString(statement, "")
-	seen := make(map[string]struct{})
-	var unknown []string
-	for _, match := range funcHeadRe.FindAllStringSubmatch(stripped, -1) {
-		name := match[1]
-		if _, ok := registered[name]; ok {
-			continue
-		}
-		if _, dup := seen[name]; dup {
-			continue
-		}
-		seen[name] = struct{}{}
-		unknown = append(unknown, name)
-	}
-	return unknown
-}
 
 // rawPathModifier is the explicit verbatim accessor segment of plaita#130.
 const rawPathModifier = "raw"
@@ -146,6 +93,10 @@ func lookupPathPlaita(root any, path string, rootMissIsError bool) (any, error) 
 	var cur any = root
 	for i, seg := range segments {
 		isIndex := indexSegmentRe.MatchString(seg)
+		if strings.HasPrefix(seg, indexSegmentPrefix) {
+			seg = strings.TrimPrefix(seg, indexSegmentPrefix)
+			isIndex = true
+		}
 		if cur == nil {
 			// cur became nil through a field miss: plaita keeps returning
 			// None for field access on None but errors on indexing None.
@@ -193,6 +144,10 @@ func traverseSegment(cur any, seg string, isIndex bool) (any, bool) {
 			// A field read on a list yields nil (plaita: a list is neither
 			// a mapping nor has attributes).
 			return nil, true
+		}
+		if idx < 0 {
+			// plaita negative index: count from the end (`$INPUT[-1]`).
+			idx += rv.Len()
 		}
 		if idx < 0 || idx >= rv.Len() {
 			return nil, true

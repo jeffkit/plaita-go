@@ -1,18 +1,27 @@
 package plaitaexpr
 
-func and(a, b bool) bool {
-	return a && b
-}
+// and/or/not follow plaita's Python-truthiness semantics: any value usable as
+// a condition (0/""/[]/{}/nil are falsy), and `or` returns the first truthy
+// argument's VALUE — Python `or` semantics, not a bool fold.
 
-func or(args ...bool) bool {
-	for _, arg := range args {
-		if arg {
-			return true
-		}
+func and(a, b any) any {
+	if !isTruthy(a) {
+		return a
 	}
-	return false
+	return b
 }
 
-func not(a bool) bool {
-	return !a
+func or(args ...any) any {
+	var last any
+	for _, arg := range args {
+		if isTruthy(arg) {
+			return arg
+		}
+		last = arg
+	}
+	return last
+}
+
+func not(a any) bool {
+	return !isTruthy(a)
 }

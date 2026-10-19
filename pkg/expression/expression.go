@@ -63,6 +63,8 @@ var templateFragmentRe = regexp.MustCompile(`\{%([^\{\}]+)%\}`)
 //   - non-string scalars pass through unchanged.
 func Eval(ctx context.Context, expr any) (any, error) {
 	switch e := expr.(type) {
+	case nil:
+		return nil, nil
 	case string:
 		return evalString(ctx, e)
 	case model.Value:

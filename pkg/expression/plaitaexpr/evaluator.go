@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/jinzhu/copier"
@@ -73,75 +75,89 @@ func (e *Evaluator) evalFunc(
 ) (model.Value, error) {
 	execArgs := execArgsFromRuntimeCtx(ctx)
 	deepCopy(parameters, &execArgs)
-	applyNodeRawAccessorToExecArgs(expr, execArgs)
-	// Unknown $F.<name> calls resolve to the "undefined" sentinel instead of
-	// failing (plaita semantics); see semantics.go. Arguments stay eager:
-	// goval evaluates them before resolving the function, so a failing
-	// argument still errors like plaita's KeyError does.
-	functions := resolveFunctions(expr.Statement(), AllFunctions())
-	result, err := goval.NewEvaluator().Evaluate(expr.Statement(), execArgs, functions)
+	statement, err := preResolveStatementVariables(expr, expr.Statement(), execArgs)
+	if err != nil {
+		return model.Value{}, err
+	}
+	// Unknown $F.<name> calls fail loudly: goval panics with
+	// `no such function` and its caller recovers it as an error — plaita's
+	// default-registry NameError. Arguments stay eager: goval evaluates them
+	// before resolving the function, so a failing argument errors first.
+	result, err := goval.NewEvaluator().Evaluate(statement, execArgs, AllFunctions())
 	return model.NewValue(result), err
 }
 
-// applyNodeRawAccessorToExecArgs materializes the `$NODE.raw.<node>...`
-// variables of a function statement into the exec args copy. goval resolves
-// statement variables by plain map navigation, which cannot interpret the
-// plaita#130 raw modifier, so each raw path is pre-resolved with the plaita
-// traversal and materialized under a synthetic `raw` subtree of a copied NODE
-// map (the real node results container is never mutated).
-func applyNodeRawAccessorToExecArgs(expr parser.Expr, execArgs map[string]any) {
-	results, _ := execArgs[string(parser.ValueSourceNode)].(map[string]any)
-	if results == nil {
-		return
+// preResolvedPrefix is the synthetic identifier prefix under which
+// pre-resolved statement variables are stored in the exec args.
+const preResolvedPrefix = "__pv"
+
+// preResolveStatementVariables resolves every built-in-root variable of a
+// function statement with the plaita traversal (raw modifier, bracket index
+// segments, missing-key semantics) and rewrites the statement so goval only
+// sees plain synthetic identifiers. goval's own member navigation cannot
+// interpret plaita path semantics; $PARENT variables and parameter
+// identifiers keep goval's navigation.
+func preResolveStatementVariables(expr parser.Expr, statement string, execArgs map[string]any) (string, error) {
+	vars := expr.Variables()
+	if len(vars) == 0 {
+		return statement, nil
 	}
-	var synthetic map[string]any
-	for _, variable := range expr.Variables() {
-		if variable.Source != parser.ValueSourceNode {
+
+	type rewrite struct{ from, to string }
+	var rewrites []rewrite
+	// longest paths first so INPUT.a.b is rewritten before INPUT.a
+	sorted := make([]parser.VariableExpr, len(vars))
+	copy(sorted, vars)
+	sort.Slice(sorted, func(i, j int) bool { return len(sorted[i].Variable) > len(sorted[j].Variable) })
+
+	for i, v := range sorted {
+		if !isBuiltinStatementSource(v.Source) {
 			continue
 		}
-		// Function-statement variables carry the full dotted path (source
-		// prefix included) in Variable; WithoutSourceVariable is unset.
-		nodePath := strings.TrimPrefix(variable.Variable, string(parser.ValueSourceNode)+".")
-		rawPath, ok := nodeRawAccessorPath(results, nodePath)
-		if !ok {
-			continue
+		// a whole-root variable ($INPUT itself) has an empty path
+		pathOnly := ""
+		if rest, ok := strings.CutPrefix(v.Variable, string(v.Source)+"."); ok {
+			pathOnly = rest
 		}
-		val, err := lookupPathPlaita(results, rawPath, false)
+		container := execArgs[string(v.Source)]
+		if v.Source == parser.ValueSourceNode {
+			if results, ok := container.(map[string]any); ok {
+				if rawPath, ok2 := nodeRawAccessorPath(results, pathOnly); ok2 {
+					pathOnly = rawPath
+				}
+			}
+		}
+		val, err := lookupPathPlaita(container, pathOnly, false)
 		if err != nil {
-			val = nil
+			return "", fmt.Errorf("failed to lookup $%s: %w", v.Variable, err)
 		}
-		if synthetic == nil {
-			synthetic = make(map[string]any)
-		}
-		setNestedValue(synthetic, strings.Split(rawPath, "."), val)
+		synthetic := fmt.Sprintf("%s%d", preResolvedPrefix, i)
+		execArgs[synthetic] = val
+		rewrites = append(rewrites, rewrite{from: v.Variable, to: synthetic})
 	}
-	if synthetic == nil {
-		return
+
+	for _, r := range rewrites {
+		statement = replaceStatementVariable(statement, r.from, r.to)
 	}
-	nodeCopy := make(map[string]any, len(results)+1)
-	for k, v := range results {
-		nodeCopy[k] = v
-	}
-	nodeCopy[rawPathModifier] = synthetic
-	execArgs[string(parser.ValueSourceNode)] = nodeCopy
+	return statement, nil
 }
 
-// setNestedValue writes value into m at the given segment path, creating
-// intermediate maps as needed.
-func setNestedValue(m map[string]any, segments []string, value any) {
-	cur := m
-	for i, seg := range segments {
-		if i == len(segments)-1 {
-			cur[seg] = value
-			return
-		}
-		next, ok := cur[seg].(map[string]any)
-		if !ok {
-			next = make(map[string]any)
-			cur[seg] = next
-		}
-		cur = next
+// isBuiltinStatementSource reports whether a statement variable addresses a
+// runtime-context root that the plaita traversal should resolve.
+func isBuiltinStatementSource(source parser.ValueSource) bool {
+	switch source {
+	case parser.ValueSourceInput, parser.ValueSourceNode, parser.ValueSourceENV,
+		parser.ValueSourceGlobal, parser.ValueSourceERROR:
+		return true
 	}
+	return false
+}
+
+// replaceStatementVariable replaces every boundary-safe occurrence of the
+// dotted variable path with the synthetic identifier.
+func replaceStatementVariable(statement, from, to string) string {
+	re := regexp.MustCompile(`(^|[^A-Za-z0-9_])` + regexp.QuoteMeta(from) + `($|[^A-Za-z0-9_])`)
+	return re.ReplaceAllString(statement, "${1}"+to+"${2}")
 }
 
 func (e *Evaluator) evalVariable(

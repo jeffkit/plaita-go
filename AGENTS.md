@@ -73,13 +73,19 @@ make test   # 已封装代理
 | —（plaita-nodes 仓：decision/agent/gate/rate_limit/report/hitl/hitl_await 等） | — | 缺：decision 已在拒载清单带提示 |
 | trpc / mdb（前身引擎 特有） | 已删 | 不移植（公司内网设施） |
 
-## 表达式对齐（缺口清单）
+## 表达式对齐（已落地 2026-10-19，golden 45/45 绿）
 
 变量根一致：`INPUT/NODE/PARENT/GLOBAL/ENV`（plaitaexpr 另有 `ERROR/NULL/EMPTYSTRING`，保留）。
 
-plaita 有而 plaitaexpr 缺的 `$F` 函数：`eq, gt, gte, lt, lte, ne, ifelse, notContains, strip, getDictValues, pop`。
-引擎级差异：`{% ... %}` 模板插值（plaitaexpr 无）；未知函数回落 `"undefined"` 哨兵（goval 是报错，需改）；缺根 key 报错语义对齐 plaita KeyError 口径；`$NODE.raw.<node>` 免评估旁路。
-验收方法：从 `plaita/tests/unit/test_expression_golden.py` 导出 golden 用例为 JSON，Go 侧跑同一份。
+**已对齐**（语义权威 = `plaita/core/expression_parser.py` docstring + golden）：
+- **`$F` 函数**：补齐 `eq/ne/gt/gte/lt/lte`（跨类型数值+容器深比较）、`ifelse`（急切）、`notContains`、`getDictValues`、`pop`（list/dict 双形态）；`and/or/not` 改 Python 真值语义（`or` 返回首个真值参数的**值**）；`concat`/`get`/`getDictValue` 变参+默认参可用（适配器支持 variadic，nil 实参→参数零值）。
+- **`{% ... %}` 模板插值**：门面分发——`$` 开头=整串表达式（原类型返回）；含 `{% %}`=模板（内层须 `$` 前缀且可解析才插值，否则字面）；其余原样。nil 透传。
+- **未知函数 = 报错**（不采 scoped registry 的 `"undefined"` 哨兵）：plaita 默认注册表 NameError + did-you-mean，部署 flow 用默认注册表，fail-closed 同仓规。goval 自带 `no such function` panic→error。
+- **`$NODE.raw.<node>`** 免评估旁路（#130，含同名 `raw` 节点冲突规则）；**缺键语义**：缺根=error（KeyError 口径），已存在对象缺字段=nil，索引 miss=error，负索引 `[-1]` 支持。
+- **语句变量预解析架构**（plaitaexpr.go `preResolveStatementVariables`）：`$F` 语句里的内建根变量先经 plaita 遍历求值、注入合成标识符，goval 只做函数调用——方括号 `X[0]`/`[-1]`（parser 归一为 `.#N`）、raw 修饰符、缺键语义在语句里与纯变量路径完全一致；`$PARENT.` 链整段吸收走 goval 导航。
+- **parser**：单引号字面量→双引号转换（goval 无单引号 token）、尾逗号剔除、字面量掩码防误改。
+
+**golden 跑批**：`pkg/expression/golden_test.go` + `testdata/expression_golden.json`（45 条，由 `scripts/export_golden.py` 从 `plaita/tests/unit/test_expression_golden.py` 程序化导出，回灌校验后落盘）。**改表达式任何行为前先跑它**；Python 侧语义升级后重新导出：`cd ~/projects/infra4agent/plaita && python3 ~/projects/plaita-go/scripts/export_golden.py`。3 条依赖自定义注册表的用例不可导出（schema 无 registry 字段）；2 条 parse_function API 用例 runner 跳过（门面对应的是 evaluate 路径）。
 
 ## 已知问题（上游带入）
 

@@ -103,12 +103,10 @@ func mustToExpressionFunc(f any) ExpressionFunc {
 	}
 
 	return func(args ...any) (any, error) {
-		var values []reflect.Value
-		for _, v := range args {
-			values = append(values, reflect.ValueOf(v))
+		result, err := callFuncReflect(f, rt, args)
+		if err != nil {
+			return nil, err
 		}
-
-		result := reflect.ValueOf(f).Call(values)
 		switch len(result) {
 		case 0:
 			return nil, nil
@@ -124,4 +122,74 @@ func mustToExpressionFunc(f any) ExpressionFunc {
 			panic("unreachable: function must return 0, 1 or 2 values")
 		}
 	}
+}
+
+// callFuncReflect invokes f with args through reflect, supporting variadic
+// functions (plaita's concat/or/getDictValue take optional or variadic
+// arguments). A type mismatch or nil argument surfaces as an error instead
+// of a reflect panic.
+func callFuncReflect(f any, rt reflect.Type, args []any) ([]reflect.Value, error) {
+	fn := reflect.ValueOf(f)
+	// A nil argument (a plaita field-miss yields nil) becomes the zero value
+	// of the target parameter type, mirroring Python passing None into the
+	// function and letting the function decide.
+	if !rt.IsVariadic() {
+		if len(args) != rt.NumIn() {
+			return nil, fmt.Errorf("function expects %d arguments, got %d", rt.NumIn(), len(args))
+		}
+		values := make([]reflect.Value, 0, len(args))
+		for i, v := range args {
+			values = append(values, argReflectValue(v, rt.In(i)))
+		}
+		return safeCall(fn, values)
+	}
+
+	numFixed := rt.NumIn() - 1
+	if len(args) < numFixed {
+		return nil, fmt.Errorf("function expects at least %d arguments, got %d", numFixed, len(args))
+	}
+	values := make([]reflect.Value, 0, numFixed+1)
+	for i := 0; i < numFixed; i++ {
+		values = append(values, argReflectValue(args[i], rt.In(i)))
+	}
+	elemType := rt.In(numFixed).Elem()
+	rest := args[numFixed:]
+	slice := reflect.MakeSlice(reflect.SliceOf(elemType), len(rest), len(rest))
+	for i, a := range rest {
+		slice.Index(i).Set(argReflectValue(a, elemType))
+	}
+	values = append(values, slice)
+	return safeCallSlice(fn, values)
+}
+
+func safeCall(fn reflect.Value, values []reflect.Value) (result []reflect.Value, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%v", r)
+		}
+	}()
+	return fn.Call(values), nil
+}
+
+func safeCallSlice(fn reflect.Value, values []reflect.Value) (result []reflect.Value, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%v", r)
+		}
+	}()
+	return fn.CallSlice(values), nil
+}
+
+// argReflectValue converts a generic argument into a reflect value of the
+// target parameter type; an untyped nil becomes the target's zero value.
+func argReflectValue(v any, targetType reflect.Type) reflect.Value {
+	if v == nil {
+		return reflect.Zero(targetType)
+	}
+	rv := reflect.ValueOf(v)
+	if !rv.Type().AssignableTo(targetType) && targetType.Kind() != reflect.Interface {
+		// best effort: rely on safeCall's recover when reflect rejects it
+		return rv
+	}
+	return rv
 }

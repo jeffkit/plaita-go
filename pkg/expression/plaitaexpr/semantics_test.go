@@ -3,10 +3,10 @@ package plaitaexpr
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/jeffkit/plaita-go/internal/runtime"
-	"github.com/jeffkit/plaita-go/pkg/model"
 )
 
 // evalHelper evaluates expr against a runtime context.
@@ -21,12 +21,12 @@ func evalHelper(t *testing.T, runtimeCtx *runtime.Context, expr string) (any, er
 	return v.AsAny(), nil
 }
 
-// TestUnknownFunctionUndefinedSentinel pins the plaita unknown-function
-// semantics: an unregistered $F.<name> call evaluates to the string
-// "undefined" instead of failing, nested calls see the sentinel value as a
-// normal argument, and a failing argument still errors before the sentinel
-// is produced (plaita evaluates arguments before resolving the function).
-func TestUnknownFunctionUndefinedSentinel(t *testing.T) {
+// TestUnknownFunctionErrors pins the plaita unknown-function semantics of
+// the default registry: an unregistered $F.<name> call is a loud error
+// (plaita raises NameError with did-you-mean; goval panics "no such
+// function", recovered as an error), and a failing argument errors before
+// the function resolves (arguments evaluate first, as in plaita).
+func TestUnknownFunctionErrors(t *testing.T) {
 	runtimeCtx := &runtime.Context{
 		WorkflowInput: map[string]any{
 			"a": 1.0,
@@ -39,14 +39,14 @@ func TestUnknownFunctionUndefinedSentinel(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name: "unknown function returns undefined string",
-			expr: "$F.definitely_not_registered(1, 2)",
-			want: "undefined",
+			name:    "unknown function errors",
+			expr:    "$F.definitely_not_registered(1, 2)",
+			wantErr: true,
 		},
 		{
-			name: "unknown function nested in known call receives sentinel value",
-			expr: `$F.concat($F.definitely_not_registered("a"), "-b")`,
-			want: "undefined-b",
+			name:    "unknown function nested in known call errors",
+			expr:    `$F.concat($F.definitely_not_registered("a"), "-b")`,
+			wantErr: true,
 		},
 		{
 			name: "unknown function with failing argument errors",
@@ -345,18 +345,14 @@ func TestRawAccessorInFunctionArg(t *testing.T) {
 	}
 }
 
-// TestValueStringified checks model.Value wrapping of the sentinel.
-func TestSentinelValueKind(t *testing.T) {
-	v, err := evalHelper(t, &runtime.Context{}, "$F.definitely_not_registered()")
-	if err != nil {
-		t.Fatalf("Eval() error = %v", err)
+// TestUnknownFunctionErrorMessage checks the error names the function,
+// mirroring plaita's NameError naming the missing callable.
+func TestUnknownFunctionErrorMessage(t *testing.T) {
+	_, err := evalHelper(t, &runtime.Context{}, "$F.definitely_not_registered()")
+	if err == nil {
+		t.Fatal("expected an error for an unknown function")
 	}
-	s, ok := v.(string)
-	if !ok {
-		t.Fatalf("sentinel type = %T, want string", v)
+	if !strings.Contains(err.Error(), "definitely_not_registered") {
+		t.Errorf("error %q does not name the unknown function", err)
 	}
-	if s != "undefined" {
-		t.Errorf("sentinel = %q, want %q", s, "undefined")
-	}
-	_ = model.NewValue(s)
 }

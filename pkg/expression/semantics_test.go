@@ -115,9 +115,9 @@ func TestEval_PlaitaStringDispatch(t *testing.T) {
 			want: "{user.name}",
 		},
 		{
-			name: "unknown function inside fragment interpolates sentinel",
-			expr: "x {% $F.definitely_not_registered(1) %}",
-			want: "x undefined",
+			name:    "unknown function inside fragment is an error",
+			expr:    "x {% $F.definitely_not_registered(1) %}",
+			wantErr: true,
 		},
 		{
 			name:    "missing root inside fragment is an error",
