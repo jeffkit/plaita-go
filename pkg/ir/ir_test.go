@@ -143,8 +143,8 @@ func TestLoadRejects(t *testing.T) {
 	}{
 		{
 			name: "unsupported known type",
-			doc:  `{"nodes":[{"type":"start","id":"s","next":"d"},{"type":"hitl_await","id":"d"}]}`,
-			want: "hitl_await",
+			doc:  `{"nodes":[{"type":"start","id":"s","next":"d"},{"type":"mock","id":"d"}]}`,
+			want: "mock",
 		},
 		{
 			name: "unknown type",

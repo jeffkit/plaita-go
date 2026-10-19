@@ -14,21 +14,23 @@
 
 ```
 engine 侧（现 pkg/，内核自前身引擎清理）：
-  pkg/workflow/       Workflow/Node 接口/registry/retry/timeout/event 回调
-  pkg/workflow/nodes/ 内置节点（assignment/branch/http/loop/parallel/redis/code/child/end）
+  pkg/workflow/       Workflow/Node 接口/registry/retry/timeout/event 回调 +
+                      checkpoint.go（环安全/深度上限快照 + CheckpointStore）/suspend.go（Suspender/Resumer/Resume 入口）
+  pkg/workflow/nodes/ 内置节点（assignment/branch/http/loop/parallel/redis/code/child/end/event/hitl/hitl_await…）
   pkg/expression/     plaitaexpr（$ 变量 + $F 函数，goval 求值）
   internal/interpreter/ goja（JS）/ yeagi（Go 源码）解释器，code 节点用
   pkg/model, pkg/parser, pkg/providers/  流程模型、解析、flow 来源（fs/memory）
   pkg/delegate, pkg/discovery/           http 节点的委托与寻址（polaris 已删，仅 domain/noop）
-  pkg/worker/       runtime worker（2026-10-19 MVP + 二期）：Streams 取单/租约 Lua/状态写回/事件/取消/心跳 +
-                    orphan watch/resume 载体语义(A47-F2)/dispatch_ledger/DLQ replay+守卫恢复/drain 三态/节点级重试预算
+  pkg/worker/       runtime worker（2026-10-19 MVP + 二期 + M6）：Streams 取单/租约 Lua/状态写回/事件/取消/心跳 +
+                    orphan watch/resume 载体语义(A47-F2)/dispatch_ledger/DLQ replay+守卫恢复/drain 三态/节点级重试预算 +
+                    checkpointstore.go（`{ns}:execution:checkpoint:{id}`）/eventbus.go（订阅/事件桥/超时检查器）
   cmd/plaita-worker/  worker 入口（env 配置，影子键前缀可覆写；-dlq-replay 单向回灌）
   pkg/shadow/       M2 双跑对账 harness（Python sidecar / Go 节点轨迹+值比对 / 16 纯计算样本）
   cmd/shadow-compare/  对账 CLI（样本集或 -flow 单流程），一致率报告 docs/SHADOW_REPORT.md
   pkg/llm/          LLM provider 链（OpenAI/Anthropic 兼容）
-  docs/WORKER_PROTOCOL.md  worker 协议权威文档（田野调查，实现与影子对账的验收基准）
+  docs/WORKER_PROTOCOL.md  worker 协议权威文档（田野调查 + §9.4 M6 键名/语义，实现与影子对账的验收基准）
 规划中：
-  worker 三期      步界 checkpoint 落盘/checkpoint 恢复（M6，解锁 hitl_await/event 唤醒）/task age gate/租户配额/dedup
+  worker 三期      task age gate/租户配额/dedup/每步 checkpoint（M6 v1.5 只做挂起边界 checkpoint）
   server/       console BFF 契约只读子集（execution 查询/事件流）
   沙箱           Docker driver 优先 + AGS HTTP API（lease 与 worker 租约同族设计）
 ```
@@ -43,7 +45,7 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
 
 **校验子集**（pkg/ir/validate.go，对应 ir_validate DEFAULT_RULES）：唯一 start + 全图可达（R1）、next/分支引用存在（R3）、嵌入流程可达 end（R2）、`joinBranches ⊆ branches[].name`（R4 语义）。表达式级校验（R5）随表达式对齐工作流补。
 
-**fail-closed 拒载清单**：decision（plaita-nodes）/ map/filter/find/reduce/while / if / case / calculate / event / mock / reference（需 provider）/ code 非 javascript / `sandbox_backend` / end `nop` / http 的 `allowedHosts`/`deniedHosts`/`blockPrivateNetworks`（SSRF 护栏未移植，靠它保护的 flow 不许静默降级）/ parallel 分支 input 非 dict。
+**fail-closed 拒载清单**：decision（plaita-nodes）/ map/filter/find/reduce/while / if / case / calculate / mock / reference（需 provider）/ code 非 javascript / `sandbox_backend` / end `nop` / http 的 `allowedHosts`/`deniedHosts`/`blockPrivateNetworks`（SSRF 护栏未移植，靠它保护的 flow 不许静默降级）/ parallel 分支 input 非 dict。**M6 起 event / hitl_await 已转正**（挂起节点；仅有根流程挂起语义）。
 
 **随 ir 对齐落地的引擎语义修正**（plaita 语义为基准）：
 - loop：`$NODE.<loop>` = 末次子结果（前身引擎为 nil）
@@ -59,11 +61,22 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
 六项全部落在 `pkg/worker/`，测试全 miniredis。与协议（docs/WORKER_PROTOCOL.md）的对应与**刻意偏差**：
 
 - **orphan watch**（§3.4/§8.2，orphan.go）：看门狗 renew 失败 → 先发布一次进度心跳（fenced CAS；fence 键比租约多活 7 天，旧世代仍可写）→ 标记 lease_lost、中止当前步 → 观察集只发心跳，不续租、不再 cancel、不写终态。执行结束/fence 换代/行终态即摘除。目的：keeper §8.2 判据在「租约已丢但执行仍在跑」窗口不误杀。
-- **resume 载体语义**（A47-F2/§9.2，worker.go handleResume）：决议载体（event/timeout/cancel）租约冲突窗口**无条件不 ack**；终态执行幂等 ack（不覆写终态）；cancel 标志或 `resume_type=cancel` 压过 suspended 短路（租约内终态化 cancelled）；suspended+continue/retry 不取租约、幂等 ack，但若有 `dispatch_pending` 凭据则做一次补偿派发（RPUSH `{prefix}:{subtype}:queue`，成功后清凭据，失败不 ack）。running 上的 event/timeout 载体按 §9.2/#258 归一化重投 continue 载体（先入队后 ack）。**唤醒路径仍确定性失败**（`resume_not_supported`）——引擎无 checkpoint 恢复（M6）。
+- **resume 载体语义**（A47-F2/§9.2，worker.go handleResume）：决议载体（event/timeout/cancel）租约冲突窗口**无条件不 ack**；终态执行幂等 ack（不覆写终态）；cancel 标志或 `resume_type=cancel` 压过 suspended 短路（租约内终态化 cancelled）；suspended+continue/retry 不取租约、幂等 ack，但若有 `dispatch_pending` 凭据则做一次补偿派发（RPUSH `{prefix}:{subtype}:queue`，成功后清凭据，失败不 ack）。running 上的 event/timeout 载体按 §9.2/#258 归一化重投 continue 载体（先入队后 ack）。**M6 起 event/timeout 在 suspended 上真恢复**（检查点 → 节点 Resume → 继续步进）；陈旧载体/节点 resume 失败 = `ResumeGuardError`/`ResumeError`：执行保持 suspended、消息留 pending。
 - **dispatch_ledger**（§6.3，ledger.go）：`{prefix}:dispatch:ledger` 只增 Stream，`payload` JSON + `schema_version`；`EnqueueWithLedger` 是入队+记账唯一入口（target 同源写入消息体与台账，结构上不可能分叉）；`Read`/`Parity` 读侧对坏行/故障不抛。TaskNotForThisWorker 完整交接（worker.go handleForeignTarget）：目标不在册/非 running → 剥 target 广播重投；在册 running → 按 `{ns}:execution:affinityhandover:{id}` 计数（INCR+7d），≤3 enqueue→ack，达限终态化 `AffinityHandoverExhausted` 并留 pending；计数不可用 fail-closed 留 pending；**全程不 DLQ**。
 - **DLQ replay + 守卫恢复**（§2.4/§9.2，dlqreplay.go）：`ReplayDeadLetter` 幂等标记 `{prefix}:dlq:replay:{dlq_key}:{id}`（SET NX 7d，force 覆盖）、源信封 schema_version 继承（超版本入队前拒绝）、无 id 的 start 用 uuid5 确定性铸造、墓碑拒复活、审计 `{prefix}:dlq:replay:audit`、DLQ 原条不删。死信守卫：schema 拒收/终态/墓碑放行不克隆；租约在/读失败跳过；running 且节点预算耗尽（noderetry max ≥ max_deliveries 或 noderefetch ≥100）→ 终态化 `node_retry_budget_exhausted`；其余非终态+租约空 → 克隆源 payload（继承信封版本）后再放行死信。
 - **drain 三态**（§9.3，drain.go）：`RequestDrain`（D1，幂等，注册表 draining 立即 flush 3 重试 + 有界定时器）→ `ForceStop`（D2，无条件停领取 + 取消在途 run + 打断重试退避）→ 信号只调 RequestDrain（D3，main.go 二次信号强退）。drain 后读到的消息不 dispatch/不 ack 留 PEL；D2 中止的步**不写终态**、留 pending（本 build 无硬中断，保住可续跑/可重投优先）。
-- **节点级重试预算**（§9.1，retry.go）：`noderetry:{id}:{node}`（预算=max_deliveries）/`noderefetch:{id}`（100）/`nofail:{id}`（12）三层，INCR+7d；可重试判据 = 有失败节点 + 非超时/取消 + `workflow.IsRetryableError`；放行则指数退避 `min(30s, 1s·2^(n-1))`（0.2s 分片可被 D2 打断）→ enqueue→ack。预算耗尽/兜底上限 → 终态化 `node_retry_budget_exhausted`（code=-520）。成功推进清节点键；整跑 completed 再清连续失败计数。**偏差**：重投载体保持 start（同 execution_id 整条重放）——引擎无 checkpoint 恢复，转 resume 会立刻 `resume_not_supported`；M6 后改回协议 §9.1 的 start→resume/continue 转换。
+- **节点级重试预算**（§9.1，retry.go）：`noderetry:{id}:{node}`（预算=max_deliveries）/`noderefetch:{id}`（100）/`nofail:{id}`（12）三层，INCR+7d；可重试判据 = 有失败节点 + 非超时/取消 + `workflow.IsRetryableError`；放行则指数退避 `min(30s, 1s·2^(n-1))`（0.2s 分片可被 D2 打断）→ enqueue→ack。预算耗尽/兜底上限 → 终态化 `node_retry_budget_exhausted`（code=-520）。成功推进清节点键；整跑 completed 再清连续失败计数。**偏差**：重投载体保持 start（同 execution_id 整条重放）——错误执行没有 checkpoint；转 resume 需每步 checkpoint（三期）。
+
+## M6 checkpoint v1.5（2026-10-19，分支 feat/checkpoint-v15）
+
+挂起恢复最小完备；键名与语义权威见 docs/WORKER_PROTOCOL.md §9.4。
+
+- **快照**（pkg/workflow/checkpoint.go）：`SnapshotValue` 显式栈深物化（照 `state.py` `_snapshot_value`）——容器环 `<recursive: $['a'][0]>` 截断、深度上限 10000（`StateSnapshotError` 带路径）、非字符串 map 键具名拒绝、共享 DAG 不误判环（路径内 seen + ptr/length 身份）。`SnapshotRuntimeContext` 快照 `$INPUT/$NODE/$GLOBAL/$ENV/$ERROR/$CURRENT/$LAST_NODE/$PARENT`；`RestoreRuntimeContext` 重建（含 $PARENT 链）。`CheckpointStore` 接口 + `MemoryCheckpointStore`；Redis 实现在 pkg/worker/checkpointstore.go（`{ns}:execution:checkpoint:{id}`，无 TTL，终态删除）。
+- **挂起/恢复**（pkg/workflow/suspend.go）：`Suspender`（IsSuspending）/`Resumer`（Resume(ctx,resumeType,data)）/`SuspendDescriptor`（订阅规格）；`Workflow.suspend` 先注册订阅再写快照，失败拒挂；`*SuspendError` 作为错误穿透嵌套调用（`AsSuspend` 识别）。`Workflow.Resume` 恢复快照 → pending/订阅绑定准入（event/timeout 必须匹配 `subscription_id`，event 另比对 `event_type`）→ 节点多态 resume → 从 next 继续；触发 OnNodeEnd（收口节点 timing）。continue/retry 对挂起节点是 guard 错误。
+- **节点**：event（event_type 表达式/event_filter 点路径/subscription_timeout/三种恢复状态）与 hitl_await（hitl_client 复用；发消息拿 session_id 即 pending；hitl_reply/超时唤醒；resume 解嵌套 event_data）。ir supportedNodeTypes 转正 + translateEvent/translateHitlAwait（event_type 非空、timeout>0 在加载期拒绝）。
+- **worker**：eventbus.go（订阅 Redis 持久化 + `{ns}:events:*` Pub/Sub 桥 + 超时索引/检查器 + 事件去重）；handleResume 在 suspended 上真恢复（检查点 → Resume → 续步），复用 executeAndFinalize 的取消轮询/租约看门狗/终态分类；恢复运行续接挂起行的 node_timings/timeline（seq 单调）。start 载体命中 suspended 执行 → 幂等 ack（不重放）。
+- **修正**：终态 context 的 `$NODE` 改为节点结果表（原误写 `CurrentNodeContext`）；`$CURRENT` 单独保留。
+- **限制**：仅根流程可挂起（child/loop/parallel 内挂起显式报错）；retry 载体的 start→resume 转换未做；事件 Pub/Sub 无回扫器（订阅超时与执行状态双写仍保证至少一次唤醒）。
 
 ## 常用命令
 
@@ -88,17 +101,21 @@ make test   # 已封装代理
 | start/end | start/end | ✅ ir 对齐；end nop 拒载 |
 | code（python） | code（javascript） | ⚠️ 仅 javascript；Python 语义不可移植，Go 版 code 契约待定 |
 | agentrun（plaita-nodes） | agentrun（pkg/workflow/nodes/agentrun.go + pkg/agentproc） | ✅ spawn 路径落地（2026-10-19）；workspace 沙箱分支拒载 |
-| mock / event / calculate | — | 拒载（清单见上） |
-| —（plaita-nodes 仓：decision/agent/gate/rate_limit/report/hitl/hitl_await 等） | — | 缺：decision 已在拒载清单带提示 |
+| event（挂起） | event（pkg/workflow/nodes/event.go） | ✅ M6 落地（2026-10-19）：订阅/过滤/超时/event·timeout·cancel 恢复；仅根流程挂起 |
+| hitl_await（挂起） | hitl_await（pkg/workflow/nodes/hitl_await.go） | ✅ M6 落地（2026-10-19）：发消息拿 session_id 即 pending，hitl_reply 事件/超时唤醒 |
+| mock / calculate | — | 拒载（清单见上） |
+| —（plaita-nodes 仓：decision/agent/gate/rate_limit/report/hitl 等） | — | 缺：decision 已在拒载清单带提示 |
 | trpc / mdb（前身引擎特有） | 已删 | 不移植（公司内网设施） |
 
-### plaita-nodes 22 节点全量盘点（2026-10-19 清点；Wave 2.5/2.6 后 **20/22**，余 hitl_await+event 依赖挂起恢复地基）
+### plaita-nodes 22 节点全量盘点（2026-10-19 清点；M6 checkpoint v1.5 后 **22/22**）
 
 | 节点 | Go 状态 | 说明 |
 |---|---|---|
 | agentrun | ✅ 已落地 | spawn 路径 + recursive-direct；**workspace 沙箱分支待做**（见下） |
 | gate / rate_limit / report | ✅ 已落地（2026-10-19） | 语义逐行移植；gate 的 shlex/裁剪/重试、rate_limit 的 flock 计数、report 的 token 白名单全对齐；错误重试分类已落在错误值上，**引擎按类型分流的接线待做** |
-| hitl | ✅ 已落地（2026-10-19，阻塞版） | hitl-server 协议（send/轮询/图片降级）对齐；deadline→timeout 不抛错；凭据 env/宿主装配；hitl_await（挂起版）仍 ❌ 待挂起恢复地基 |
+| hitl | ✅ 已落地（2026-10-19，阻塞版） | hitl-server 协议（send/轮询/图片降级）对齐；deadline→timeout 不抛错；凭据 env/宿主装配 |
+| hitl_await | ✅ 已落地（2026-10-19，M6 挂起版） | execute 发消息拿 session_id 即 pending；hitl_reply 事件/订阅超时唤醒；resume 解 cancel/timeout/replied |
+| event | ✅ 已落地（2026-10-19，M6） | is_suspending；event_type 表达式/event_filter 点路径/subscription_timeout；Redis Pub/Sub 唤醒 |
 | decision | ✅ 已落地（2026-10-19） | 封闭决策空间/confidence 门控/批量 index 对齐/provider 注册表（llm+jev+jevlike stub）；DecisionError=可重试口径 |
 | llm | ✅ 已落地（2026-10-19） | pkg/llm 双协议客户端（OpenAI/Anthropic 兼容）+ 三级端点链（显式>providers.json>LLM_* env）；${ENV} 凭据插值零入库 |
 | notify / feishu_webhook / dingtalk_webhook / slack_webhook / wecom_webhook / generic_webhook / email_send | ✅ 已落地（2026-10-19） | payload/加签（钉钉 HMAC）/业务码分类（feishu code/wecom·dingtalk errcode/slack ok）对齐；凭据经 `NotifyCredentialStore` 接口（宿主装配，缺省 fail-closed）；URL 打码按 _redact |

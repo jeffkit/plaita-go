@@ -16,7 +16,7 @@ import (
 
 // hitl-server protocol shared layer, ported from plaita-nodes
 // _hitl_client.py (the client is shared by the blocking HitlNode and the
-// suspended HitlAwaitNode; this engine only ports the blocking variant).
+// suspended HitlAwaitNode; both are ported — hitl.go and hitl_await.go).
 //
 // Protocol (iLink channel, mirrors mediaflow scripts/hitl.js):
 //   - POST {base}/api/send  body {message, wait_reply, timeout, upstream:'ilink'}

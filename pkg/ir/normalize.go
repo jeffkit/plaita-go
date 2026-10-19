@@ -222,8 +222,75 @@ func normalizeNode(n map[string]any) error {
 		return translateEnd(n)
 	case "agentrun":
 		return translateAgentRun(n)
+	case "event":
+		return translateEvent(n)
+	case "hitl_await":
+		return translateHitlAwait(n)
 	}
 	return nil
+}
+
+// translateEvent folds the event node's camel spellings and validates the
+// fields plaita validates at build time: a non-empty event_type (empty would
+// be treated as a wildcard by the matcher) and a positive subscription
+// timeout (0 would expire the subscription immediately).
+func translateEvent(n map[string]any) error {
+	foldKey(n, "eventType", "event_type")
+	foldKey(n, "eventFilter", "event_filter")
+	foldKey(n, "subscriptionTimeout", "subscription_timeout")
+	eventType, _ := n["event_type"].(string)
+	if strings.TrimSpace(eventType) == "" {
+		return fmt.Errorf("event node requires a non-empty event_type (an empty type is treated as a wildcard)")
+	}
+	if v, ok := n["event_filter"]; ok && v != nil {
+		if _, isMap := v.(map[string]any); !isMap {
+			return fmt.Errorf("event_filter must be an object, got %T", v)
+		}
+	}
+	if v, ok := n["subscription_timeout"]; ok && v != nil {
+		seconds, valid := normalizeSeconds(v)
+		if !valid || seconds <= 0 {
+			return fmt.Errorf("subscription_timeout must be a positive number of seconds, got %v", v)
+		}
+	}
+	return nil
+}
+
+// translateHitlAwait folds the camel spellings of the suspending HITL node.
+// timeout_secs / event_type accept expressions, so they are not narrowed
+// here (the node falls back exactly like plaita's resolve_* helpers).
+func translateHitlAwait(n map[string]any) error {
+	foldKey(n, "baseUrl", "base_url")
+	foldKey(n, "timeoutSecs", "timeout_secs")
+	foldKey(n, "eventType", "event_type")
+	foldKey(n, "eventFilter", "event_filter")
+	foldKey(n, "dryRun", "dry_run")
+	if v, ok := n["event_filter"]; ok && v != nil {
+		if _, isMap := v.(map[string]any); !isMap {
+			return fmt.Errorf("event_filter must be an object, got %T", v)
+		}
+	}
+	return nil
+}
+
+// normalizeSeconds decodes a JSON number (the IR decoder uses json.Number)
+// into seconds. ok=false for non-numeric input.
+func normalizeSeconds(v any) (float64, bool) {
+	switch n := v.(type) {
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(n), 64)
+		return f, err == nil
+	}
+	return 0, false
 }
 
 // translateAgentRun folds the agentrun node's camel spellings into the

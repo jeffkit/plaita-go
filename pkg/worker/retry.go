@@ -205,12 +205,12 @@ func isRetryableNodeFailure(err error, run *executionRun) bool {
 // failure.
 //
 // Protocol §9.1 converts a start carrier into a resume/continue carrier when a
-// checkpoint row exists. This engine build has no checkpoint resume yet
-// (checkpoint v1.5 → M6), so a continue carrier would deterministically
-// terminalize as resume_not_supported and the retry would never happen. Until
-// resume lands the carrier stays a start copy of the same execution_id: the
-// budget/backoff/re-enqueue semantics are identical, only the replay起点
-// differs (whole-flow replay instead of step-boundary resume).
+// checkpoint row exists. M6 writes checkpoints only at suspend boundaries, so
+// an error execution has no resume position; a continue carrier would fail
+// admission. The carrier therefore stays a start copy of the same
+// execution_id: the budget/backoff/re-enqueue semantics are identical, only
+// the replay起点 differs (whole-flow replay instead of step-boundary resume).
+// The conversion returns once per-step checkpoints exist (phase 3).
 func (w *Worker) retryCarrierBody(ctx context.Context, task *Task) map[string]any {
 	body := map[string]any{
 		"type":         "start",
