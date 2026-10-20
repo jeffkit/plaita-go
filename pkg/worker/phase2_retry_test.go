@@ -403,16 +403,16 @@ func TestRetryCarrierBodyConversion(t *testing.T) {
 		}
 	})
 
-	t.Run("state read failure → start copy (fail-safe)", func(t *testing.T) {
+	t.Run("state read failure → error (fail closed, #29)", func(t *testing.T) {
 		// Corrupt row: LoadExecutionState errors instead of returning nil.
+		// The old "degrade to a start copy" fallback would be idempotently
+		// acked by the #29 start gate against the existing row, stranding the
+		// retry — so the conversion now fails closed and the original stays
+		// pending for reclaim.
 		rdb.Set(ctx, stateKeyOf(cfg, "e4"), "{not-json", 0)
 		task := &Task{Type: "start", FlowID: "f1", ExecutionID: "e4"}
-		body, err := w.retryCarrierBody(ctx, task)
-		if err != nil {
-			t.Fatalf("retryCarrierBody must degrade to a start copy, got %v", err)
-		}
-		if body["type"] != "start" {
-			t.Fatalf("carrier = %v, want the start copy on a read failure", body)
+		if _, err := w.retryCarrierBody(ctx, task); err == nil {
+			t.Fatal("expected the state read failure to surface (fail closed)")
 		}
 	})
 

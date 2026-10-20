@@ -57,6 +57,20 @@ const (
 
 	// ledgerSchemaVersion is the dispatch-ledger entry schema version (§6.3).
 	ledgerSchemaVersion = 1
+
+	// DefaultTaskMaxAgeSeconds is the message age-gate horizon (§1.2,
+	// PLAITA_TASK_MAX_AGE_SECONDS=2592000); a negative config disables the
+	// gate.
+	DefaultTaskMaxAgeSeconds = 30 * 86400
+
+	// DefaultTenantRunningTTLSeconds is the per-tenant start-slot entry TTL
+	// (tenant_quota.py DEFAULT_RUNNING_TTL_SECONDS) — the crash self-heal for
+	// a slot whose execution never reached a terminal write.
+	DefaultTenantRunningTTLSeconds = 86400
+
+	// DefaultQuotaDeferMax bounds over-quota tail re-enqueues per carrier
+	// (§1.2, PLAITA_TENANT_QUOTA_DEFER_MAX=64) before quota_bypass admits it.
+	DefaultQuotaDeferMax = 64
 )
 
 // Config carries every knob of the worker. All fields are overridable through
@@ -130,6 +144,27 @@ type Config struct {
 	// DispatcherID: PLAITA_DISPATCHER_ID (default hostname) — the
 	// "who dispatched" half of a ledger entry (§6.3).
 	DispatcherID string
+
+	// TaskMaxAgeSeconds: PLAITA_TASK_MAX_AGE_SECONDS (default 30 days) — the
+	// task age-gate horizon (#29): carriers older than this are acked without
+	// executing. A negative value disables the gate; 0 normalizes to the
+	// default.
+	TaskMaxAgeSeconds int
+
+	// TenantMaxRunning: PLAITA_TENANT_MAX_RUNNING (default 0 = UNLIMITED) —
+	// the global default cap of concurrent starts per tenant (#30). A
+	// per-tenant entry in the {prefix}:tenant_quota HASH overrides it.
+	// Enforcement requires an explicit value: unconfigured = no quota gate.
+	TenantMaxRunning int
+	// TenantRunningTTLSeconds: PLAITA_TENANT_RUNNING_TTL_SECONDS (default
+	// 86400) — the admitted-start slot TTL (crash self-heal).
+	TenantRunningTTLSeconds int
+	// QuotaDeferMax: PLAITA_TENANT_QUOTA_DEFER_MAX (default 64) — over-quota
+	// tail re-enqueues per carrier before it is admitted with quota_bypass.
+	QuotaDeferMax int
+	// DisableTenantQuota: PLAITA_DISABLE_TENANT_QUOTA=1 — rollback switch
+	// bypassing the whole tenant-quota gate.
+	DisableTenantQuota bool
 }
 
 // DefaultConfig returns the protocol-default configuration for the current
@@ -164,6 +199,12 @@ func configFromEnv(getenv func(string) string) *Config {
 		FlowCacheTTL:      time.Duration(envInt(getenv, "PLAITA_FLOW_CACHE_TTL_SECONDS", 300)) * time.Second,
 		DispatchLedgerKey: getenv("PLAITA_DISPATCH_LEDGER_KEY"),
 		DispatcherID:      getenv("PLAITA_DISPATCHER_ID"),
+
+		TaskMaxAgeSeconds:       envInt(getenv, "PLAITA_TASK_MAX_AGE_SECONDS", DefaultTaskMaxAgeSeconds),
+		TenantMaxRunning:        envInt(getenv, "PLAITA_TENANT_MAX_RUNNING", 0),
+		TenantRunningTTLSeconds: envInt(getenv, "PLAITA_TENANT_RUNNING_TTL_SECONDS", DefaultTenantRunningTTLSeconds),
+		QuotaDeferMax:           envInt(getenv, "PLAITA_TENANT_QUOTA_DEFER_MAX", DefaultQuotaDeferMax),
+		DisableTenantQuota:      getenv("PLAITA_DISABLE_TENANT_QUOTA") == "1",
 	}
 	cfg.normalize()
 	return cfg
@@ -250,6 +291,22 @@ func (c *Config) normalize() {
 	}
 	if c.DispatcherID == "" {
 		c.DispatcherID = hostnameOrUnknown()
+	}
+	// Age gate: 0 (unset struct literal) means the protocol default; only a
+	// negative value disables the gate (#29).
+	if c.TaskMaxAgeSeconds == 0 {
+		c.TaskMaxAgeSeconds = DefaultTaskMaxAgeSeconds
+	}
+	// Tenant quota (#30): defaults keep the deployment unlimited (cap 0) —
+	// explicit configuration is what turns the gate on.
+	if c.TenantRunningTTLSeconds <= 0 {
+		c.TenantRunningTTLSeconds = DefaultTenantRunningTTLSeconds
+	}
+	if c.TenantMaxRunning < 0 {
+		c.TenantMaxRunning = 0
+	}
+	if c.QuotaDeferMax <= 0 {
+		c.QuotaDeferMax = DefaultQuotaDeferMax
 	}
 }
 
