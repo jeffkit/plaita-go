@@ -45,7 +45,7 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
 
 **校验子集**（pkg/ir/validate.go，对应 ir_validate DEFAULT_RULES）：唯一 start + 全图可达（R1）、next/分支引用存在（R3）、嵌入流程可达 end（R2）、`joinBranches ⊆ branches[].name`（R4 语义）。表达式级校验（R5）随表达式对齐工作流补。
 
-**fail-closed 拒载清单**：decision（plaita-nodes）/ map/filter/find/reduce/while / if / case / calculate / mock / reference（需 provider）/ code 非 javascript / `sandbox_backend` / end `nop` / http 的 `allowedHosts`/`deniedHosts`/`blockPrivateNetworks`（SSRF 护栏未移植，靠它保护的 flow 不许静默降级）/ parallel 分支 input 非 dict。**M6 起 event / hitl_await 已转正**（挂起节点；仅有根流程挂起语义）。
+**fail-closed 拒载清单**：map/filter/find/reduce/while / if / case / calculate / mock / reference（需 provider）/ code 非 javascript / `sandbox_backend` / end `nop` / http 的 `allowedHosts`/`deniedHosts`/`blockPrivateNetworks`（SSRF 护栏未移植，靠它保护的 flow 不许静默降级）/ parallel 分支 input 非 dict。**M6 起 event / hitl_await 已转正**（挂起节点；仅有根流程挂起语义）。
 
 **随 ir 对齐落地的引擎语义修正**（plaita 语义为基准）：
 - loop：`$NODE.<loop>` = 末次子结果（前身引擎为 nil）
@@ -103,8 +103,8 @@ make test   # 已封装代理
 | agentrun（plaita-nodes） | agentrun（pkg/workflow/nodes/agentrun.go + pkg/agentproc） | ✅ spawn 路径落地（2026-10-19）；workspace 沙箱分支拒载 |
 | event（挂起） | event（pkg/workflow/nodes/event.go） | ✅ M6 落地（2026-10-19）：订阅/过滤/超时/event·timeout·cancel 恢复；仅根流程挂起 |
 | hitl_await（挂起） | hitl_await（pkg/workflow/nodes/hitl_await.go） | ✅ M6 落地（2026-10-19）：发消息拿 session_id 即 pending，hitl_reply 事件/超时唤醒 |
-| mock / calculate | — | 拒载（清单见上） |
-| —（plaita-nodes 仓：decision/agent/gate/rate_limit/report/hitl 等） | — | 缺：decision 已在拒载清单带提示 |
+| mock / calculate | — | 拒载（清单见上）；decision/llm/hitl 族已转正 |
+| —（plaita-nodes 仓余量） | agent/gate/rate_limit/report/notify 族等 | ✅ 已对齐（见上）|
 | trpc / mdb（前身引擎特有） | 已删 | 不移植（公司内网设施） |
 
 ### plaita-nodes 22 节点全量盘点（2026-10-19 清点；M6 checkpoint v1.5 后 **22/22**）
@@ -116,7 +116,6 @@ make test   # 已封装代理
 | hitl | ✅ 已落地（2026-10-19，阻塞版） | hitl-server 协议（send/轮询/图片降级）对齐；deadline→timeout 不抛错；凭据 env/宿主装配 |
 | hitl_await | ✅ 已落地（2026-10-19，M6 挂起版） | execute 发消息拿 session_id 即 pending；hitl_reply 事件/订阅超时唤醒；resume 解 cancel/timeout/replied |
 | event | ✅ 已落地（2026-10-19，M6） | is_suspending；event_type 表达式/event_filter 点路径/subscription_timeout；Redis Pub/Sub 唤醒 |
-| decision | ✅ 已落地（2026-10-19） | 封闭决策空间/confidence 门控/批量 index 对齐/provider 注册表（llm+jev+jevlike stub）；DecisionError=可重试口径 |
 | llm | ✅ 已落地（2026-10-19） | pkg/llm 双协议客户端（OpenAI/Anthropic 兼容）+ 三级端点链（显式>providers.json>LLM_* env）；${ENV} 凭据插值零入库 |
 | notify / feishu_webhook / dingtalk_webhook / slack_webhook / wecom_webhook / generic_webhook / email_send | ✅ 已落地（2026-10-19） | payload/加签（钉钉 HMAC）/业务码分类（feishu code/wecom·dingtalk errcode/slack ok）对齐；凭据经 `NotifyCredentialStore` 接口（宿主装配，缺省 fail-closed）；URL 打码按 _redact |
 | api_request / parse_json | ✅ 已落地（2026-10-19） | api_request：手动重定向（跨源剥头/303 规则/10 hop）、凭据经 resolver 接口 fail-closed、URL 打码；parse_json：候选提取（末行胜出，绝不用首个 `{`——#43）、verdict 白名单、join_fields |

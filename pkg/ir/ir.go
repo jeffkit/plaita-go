@@ -10,7 +10,7 @@
 // `required`/`default`/`children` property keys) are normalized too.
 //
 // The loader is a strict accept-list by design (fail-closed): plaita node
-// types that this engine has not ported (decision, collection variants,
+// types that this engine has not ported (collection variants,
 // python code, ...) are rejected at load with an explicit message instead of
 // being silently skipped. Contract changes must keep the round-trip with
 // plaita's ir_validate rules; see AGENTS.md at the repo root.
@@ -109,7 +109,6 @@ var supportedNodeTypes = map[string]bool{
 // knownUnsupported types carry a targeted hint; anything else unknown gets a
 // generic message listing what is available.
 var knownUnsupported = map[string]string{
-	"decision":  "structured decision node (plaita-nodes) is not ported yet",
 	"map":       "collection variant, not ported yet (base loop is supported)",
 	"filter":    "collection variant, not ported yet (base loop is supported)",
 	"find":      "collection variant, not ported yet (base loop is supported)",
