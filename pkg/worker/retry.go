@@ -218,11 +218,15 @@ func isRetryableNodeFailure(err error, run *executionRun) bool {
 //     deleted execution);
 //   - tombstone probe failure → (nil, err): fail closed, the original stays
 //     pending (Python raises in the same position — 绝不 fail-open 重排);
-//   - state read failure → start copy (fail-safe: the conversion is an
-//     optimization and must never cost the message its cadence);
+//   - state read failure → (nil, err): fail closed, the original stays
+//     pending and the reclaim retries the conversion. (#29: the old
+//     "degrade to a start copy" fallback would be idempotently-acked by the
+//     start gate against the existing row — the retry would be lost);
 //   - no state row (crash before the first persist) → start copy;
 //   - stored flow_id ≠ carrier flow_id → start copy (a converted copy would
-//     be poison-acked by the resume flow-id gate);
+//     be poison-acked by the resume flow-id gate, and the #29 gate's
+//     flow-conflict branch likewise — the copy redelivers into the same
+//     deterministic outcome);
 //   - a row exists → {"type":"resume","resume_type":"continue", …} with
 //     params passed through when non-empty (#122). The version is
 //     deliberately dropped: the resume path resolves the definition from the
@@ -247,10 +251,14 @@ func (w *Worker) retryCarrierBody(ctx context.Context, task *Task) (map[string]a
 	}
 	state, err := w.store.LoadExecutionState(ctx, task.TenantID, task.ExecutionID)
 	if err != nil {
-		// Read failure does not block the re-enqueue (原样 start, fail-safe).
-		w.logger.Warn("retry carrier state probe failed, re-enqueueing a start copy",
+		// #29: a read failure must NOT degrade to a start copy any more — the
+		// start idempotency gate would idempotently-ack that copy against the
+		// existing row and the retry would be stranded in running forever.
+		// Fail closed instead: the original stays pending and the next
+		// reclaim retries the conversion.
+		w.logger.Warn("retry carrier state probe failed; original left pending",
 			"execution_id", task.ExecutionID, "error", err)
-		return startCarrierBody(task), nil
+		return nil, err
 	}
 	if state == nil {
 		return startCarrierBody(task), nil

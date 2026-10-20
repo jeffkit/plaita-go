@@ -52,6 +52,11 @@ var (
 	// not be incremented — fail-closed, never hand over without a bound
 	// (§9.2).
 	ErrHandoverCounterUnavailable = errors.New("affinity handover counter unavailable")
+	// ErrTenantQuotaDeferred: the tenant's start quota is full (#30) — the
+	// carrier is re-enqueued at the stream tail (quota_defers counter) and
+	// the original acked; it is never executed nor dead-lettered by this
+	// path. After the defer budget the copy is admitted with quota_bypass.
+	ErrTenantQuotaDeferred = errors.New("tenant start quota full, carrier deferred")
 )
 
 // NodeRetryableError is the NodeExecutionRetryableError analogue (§9.1): the

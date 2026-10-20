@@ -77,6 +77,8 @@ type TaskQueue struct {
 	client *redis.Client
 	cfg    *Config
 	logger Logger
+	// metrics is the #31 observability face; always non-nil (no-op default).
+	metrics Metrics
 
 	reclaimCursor string
 	dlGuard       DeadLetterGuard
@@ -90,7 +92,22 @@ type Logger interface {
 }
 
 func NewTaskQueue(client *redis.Client, cfg *Config, logger Logger) *TaskQueue {
-	return &TaskQueue{client: client, cfg: cfg, logger: logger, reclaimCursor: "0"}
+	return &TaskQueue{client: client, cfg: cfg, logger: logger, metrics: NoopMetrics{}, reclaimCursor: "0"}
+}
+
+// SetMetrics swaps the metrics face (Worker.SetMetrics propagates its
+// injection so dlq_total lands on the host's collector).
+func (q *TaskQueue) SetMetrics(m Metrics) {
+	if m == nil {
+		m = NoopMetrics{}
+	}
+	q.metrics = m
+}
+
+// Depth reports the stream length (§2.4 queue.stats probe; the queue_depth
+// gauge source for #31). XLEN is O(1) and safe to sample per consume round.
+func (q *TaskQueue) Depth(ctx context.Context) (int64, error) {
+	return q.client.XLen(ctx, q.cfg.QueueName).Result()
 }
 
 // SetDeadLetterGuard wires the guarded dead-letter callback.
@@ -363,6 +380,8 @@ func (q *TaskQueue) Ack(ctx context.Context, messageID string) error {
 // otherwise the raw payload string. Malformed messages additionally carry
 // raw_fields (values truncated to 500 chars) + truncated.
 func (q *TaskQueue) deadLetter(ctx context.Context, env *Envelope, task *Task, deliveryCount int, reason string, rawFields map[string]any) {
+	// #31: the dead-letter counter (low-cardinality reason label).
+	q.metrics.IncCounter(MetricDLQTotal, metricLabels("reason", reason, "queue", q.cfg.QueueName))
 	entry := map[string]any{
 		"reason":           reason,
 		"source_stream":    q.cfg.QueueName,

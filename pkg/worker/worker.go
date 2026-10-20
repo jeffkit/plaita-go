@@ -68,8 +68,26 @@ import (
 //
 //	TODO(phase-3): per-step state persistence (PERSIST_EVERY_N_STEPS=1, §5.2)
 //	        — the progress heartbeat (ttl/3) stands in for it.
-//	TODO(phase-3): task age gate (PLAITA_TASK_MAX_AGE_SECONDS, §1.2) and the
-//	        tenant quota / dedup-key idempotency paths.
+//
+// Wave 3 (2026-10-20, issues #29/#30/#31):
+//
+//	age gate (#29)   — carriers past PLAITA_TASK_MAX_AGE_SECONDS are acked
+//	                   without executing (dual-source age: payload timestamp
+//	                   vs Stream ID ms, max wins), see agegate.go.
+//	start idempotency
+//	                 — a start carrier for an execution that already has a
+//	                   state row (running/suspended/terminal) is an idempotent
+//	                   ack; terminal rows are never overwritten and duplicate
+//	                   starts never reach the DLQ; an id owned by another flow
+//	                   is poison-acked (ExecutionIdConflict parity), see
+//	                   handleStart.
+//	tenant quota (#30)
+//	                 — per-tenant start semaphore (ZSET + TTL, Lua admit),
+//	                   over-quota starts deferred to the stream tail, slot
+//	                   released at the terminal-write choke point, see
+//	                   quota.go.
+//	metrics (#31)    — the Metrics interface (no-op default, host-injectable)
+//	                   instrumented at the key path points, see metrics.go.
 //	Landed since M6: the node-retry carrier conversion (§9.1 #91) — a
 //	        retryable failure re-enqueues a resume/continue carrier whenever a
 //	        state row exists (retry.go), after snapshotting a failure-boundary
@@ -111,6 +129,10 @@ type Worker struct {
 	registry *Registry
 	ledger   *DispatchLedger
 	retries  *RetryBudgets
+	quota    *TenantQuota
+	// metrics is the #31 observability face; always non-nil (no-op default,
+	// host-injectable via SetMetrics).
+	metrics Metrics
 
 	// M6 checkpoint v1.5: resumable snapshots + suspended-node wake-up
 	// subscriptions (§9.2 decision carriers).
@@ -144,6 +166,8 @@ func New(cfg *Config, rdb *redis.Client, logger Logger) *Worker {
 		registry: NewRegistry(rdb, cfg, logger),
 		ledger:   NewDispatchLedger(rdb, cfg, logger),
 		retries:  NewRetryBudgets(rdb, cfg, logger),
+		quota:    NewTenantQuota(rdb, cfg, logger),
+		metrics:  NoopMetrics{},
 		orphans:  map[string]*orphanEntry{},
 
 		checkpoints: NewRedisCheckpointStore(rdb, cfg),
@@ -151,8 +175,24 @@ func New(cfg *Config, rdb *redis.Client, logger Logger) *Worker {
 	}
 	w.drainState.activeRuns = map[*executionRun]context.CancelFunc{}
 	w.queue.SetDeadLetterGuard(w.deadLetterGuard)
+	// #30: the execution store's terminal-write choke point releases the
+	// tenant start slot (suspended keeps it; the entry TTL backstops a crash).
+	w.store.SetOnTerminalSave(func(ctx context.Context, tenantID, executionID string) {
+		w.quota.Release(ctx, tenantID, executionID)
+	})
 	w.registerEngineListeners()
 	return w
+}
+
+// SetMetrics injects the host's metrics collector (#31). A nil argument keeps
+// the no-op default. Call before Run; safe afterwards for collectors that are
+// themselves concurrency-safe.
+func (w *Worker) SetMetrics(m Metrics) {
+	if m == nil {
+		m = NoopMetrics{}
+	}
+	w.metrics = m
+	w.queue.SetMetrics(m)
 }
 
 func (w *Worker) registerEngineListeners() {
@@ -265,6 +305,11 @@ func (w *Worker) Run(ctx context.Context) error {
 			return nil
 		case <-time.After(backoff):
 		}
+		// #31: queue_depth gauge (XLEN is O(1); sampling errors never break
+		// the loop).
+		if n, err := w.queue.Depth(ctx); err == nil {
+			w.metrics.SetGauge(MetricQueueDepth, float64(n), nil)
+		}
 		handled, err := w.ProcessOne(ctx)
 		if err != nil {
 			// Transient family: warn + backoff, never blow up the loop (§2.4).
@@ -335,9 +380,32 @@ func (w *Worker) ProcessOne(ctx context.Context) (bool, error) {
 		return w.handleForeignTarget(ctx, delivery)
 	}
 
+	// #29 age gate: carriers past the horizon are acked without executing
+	// and the drop is observable (log + counter + live execution event).
+	// Placement mirrors Python's dispatch gate: after routing/handover (the
+	// receiving worker re-checks its own copy) and before the quota gate (an
+	// expired carrier must not consume a slot) and before any execution.
+	if w.carrierTooOld(task, delivery.Envelope.MessageID) {
+		w.metrics.IncCounter(MetricTaskExpiredTotal, metricLabels("tenant", task.TenantID, "type", task.Type))
+		w.logger.Warn("task past the age horizon, acked without executing",
+			"type", task.Type, "execution_id", task.ExecutionID,
+			"flow_id", task.FlowID, "message_id", task.MessageID,
+			"age_seconds", taskAgeOf(task, delivery.Envelope.MessageID))
+		w.publishExecutionEvent(ctx, task.ExecutionID, map[string]any{
+			"type": "task_expired", "at": nowISO(),
+			"age_seconds": taskAgeOf(task, delivery.Envelope.MessageID),
+		})
+		return true, w.queue.Ack(ctx, task.MessageID)
+	}
+
 	switch task.Type {
 	case "start":
 		if err := w.handleStart(ctx, task); err != nil {
+			// #30: an over-quota start is deferred to the stream tail (never
+			// executed, never dead-lettered); the enqueue→ack happens there.
+			if errors.Is(err, ErrTenantQuotaDeferred) {
+				return w.deferOverQuotaStart(ctx, delivery)
+			}
 			return w.dispositionHandlerError(ctx, delivery, err)
 		}
 	case "resume":
@@ -362,8 +430,9 @@ func (w *Worker) dispositionHandlerError(ctx context.Context, delivery *Delivery
 	return true, err
 }
 
-// handleStart executes a start task: cancel entry checkpoint → lease acquire
-// (BEFORE the running row, §3.4) → running row → engine execution → terminal
+// handleStart executes a start task: lease acquire (BEFORE the running row,
+// §3.4) → idempotency gate (#29) → cancel entry checkpoint (§4.2 #1) →
+// tenant quota admit (#30) → running row → engine execution → terminal
 // write-back (§5.2) → release.
 func (w *Worker) handleStart(ctx context.Context, task *Task) error {
 	tenant := task.TenantID
@@ -371,13 +440,6 @@ func (w *Worker) handleStart(ctx context.Context, task *Task) error {
 	if executionID == "" {
 		executionID = newExecutionID() // legacy messages: mint in place (§2.3)
 		task.ExecutionID = executionID
-	}
-
-	// Entry checkpoint (§4.2 #1): cancel intent before anything else.
-	if hit, _, err := w.store.IsCancelRequested(ctx, tenant, executionID); err != nil {
-		return fmt.Errorf("cancel probe: %w", err)
-	} else if hit {
-		return w.persistCancelAtEntry(ctx, tenant, executionID, task)
 	}
 
 	// Lease acquire strictly before the running row (§3.4).
@@ -389,27 +451,74 @@ func (w *Worker) handleStart(ctx context.Context, task *Task) error {
 		}
 		return fmt.Errorf("lease acquire: %w", err)
 	}
+	w.metrics.IncCounter(MetricLeaseAcquired, metricLabels("tenant", tenant))
+
+	// #29 start idempotency gate: a carrier for an execution that already has
+	// a state row is an idempotent ack — running rows are never re-run from a
+	// duplicate start (the lease only blocks *simultaneous* double runs, this
+	// gate blocks the *sequential* ones), terminal rows are never overwritten,
+	// suspended executions wait for their decision carrier, and duplicate
+	// starts never reach the DLQ (tombstone semantics alignment: "重复 start
+	// 不进 DLQ"). An id already owned by ANOTHER flow is the Python
+	// ExecutionIdConflictError parity: poison ack (redelivery cannot self-heal).
+	if prev, perr := w.store.LoadExecutionState(ctx, tenant, executionID); perr != nil {
+		_ = w.lease.Release(ctx, handle)
+		return fmt.Errorf("state probe: %w", perr)
+	} else if prev != nil {
+		if prev.FlowID != "" && task.FlowID != "" && prev.FlowID != task.FlowID {
+			_ = w.lease.Release(ctx, handle)
+			w.logger.Error("execution_id already belongs to another flow; duplicate start poison-acked",
+				"execution_id", executionID, "carrier_flow", task.FlowID, "stored_flow", prev.FlowID)
+			w.metrics.IncCounter(MetricTaskDedupHitTotal, metricLabels("tenant", tenant, "reason", "flow_conflict"))
+			return nil
+		}
+		_ = w.lease.Release(ctx, handle)
+		w.metrics.IncCounter(MetricTaskDedupHitTotal, metricLabels("tenant", tenant, "status", prev.Status))
+		if prev.Status == StatusSuspended {
+			w.logger.Info("start carrier for a suspended execution, idempotent ack (use a resume carrier to wake it)",
+				"execution_id", executionID)
+		} else {
+			w.logger.Info("duplicate start for an existing execution, idempotent ack (no overwrite)",
+				"execution_id", executionID, "status", prev.Status)
+		}
+		return nil
+	}
 
 	// A brand-new execution id must not inherit retry budgets from a previous
 	// life of the same id (§8.3. 删除执行时一并清). An existing row (retry
 	// re-enqueue / duplicate carrier) keeps its counters.
-	if prev, perr := w.store.LoadExecutionState(ctx, tenant, executionID); perr != nil {
-		_ = w.lease.Release(ctx, handle)
-		return fmt.Errorf("state probe: %w", perr)
-	} else if prev == nil {
-		_ = w.retries.ResetAll(ctx, tenant, executionID)
-		// A brand-new execution id must not inherit a stale checkpoint from a
-		// previous life of the same id.
-		w.deleteCheckpoint(ctx, tenant, executionID)
-	} else if prev.Status == StatusSuspended {
-		// M6: a start carrier for an already-suspended execution must not
-		// replay the flow from scratch — that would re-run the nodes before
-		// the suspend point and leak the old subscription. The only valid
-		// advance is a decision carrier (event/timeout/cancel).
-		_ = w.lease.Release(ctx, handle)
-		w.logger.Info("start carrier for a suspended execution, idempotent ack (use a resume carrier to wake it)",
-			"execution_id", executionID)
-		return nil
+	_ = w.retries.ResetAll(ctx, tenant, executionID)
+	// A brand-new execution id must not inherit a stale checkpoint from a
+	// previous life of the same id.
+	w.deleteCheckpoint(ctx, tenant, executionID)
+
+	// Entry checkpoint (§4.2 #1): cancel intent before the running row exists.
+	// (Reached only for brand-new executions — the #29 gate above consumed the
+	// existing-row cases, so a duplicate start can no longer overwrite a row
+	// via the cancel path; a live run sees the flag through its poller and a
+	// suspended one through its cancel resume carrier.)
+	if hit, _, err := w.store.IsCancelRequested(ctx, tenant, executionID); err != nil {
+		return fmt.Errorf("cancel probe: %w", err)
+	} else if hit {
+		return w.persistCancelAtEntry(ctx, tenant, executionID, task)
+	}
+
+	// #30 tenant quota admit: after the idempotency gate (a duplicate must not
+	// retake a slot the live execution already holds), before the running row
+	// (a denied start never executes). Unconfigured tenants never touch Redis
+	// here (default = unlimited). A quota_bypass carrier (defer budget
+	// exhausted) skips the gate entirely — liveness over the soft quota.
+	if !task.QuotaBypass {
+		if allowed, running := w.quota.AdmitStart(ctx, tenant, executionID); !allowed {
+			_ = w.lease.Release(ctx, handle)
+			w.metrics.IncCounter(MetricQuotaExceededTotal, metricLabels("tenant", tenant))
+			w.metrics.SetGauge(MetricQuotaRunning, float64(running), metricLabels("tenant", tenant))
+			w.logger.Info("tenant start quota full, deferring the carrier",
+				"tenant", tenant, "execution_id", executionID, "running", running)
+			return ErrTenantQuotaDeferred
+		} else if running > 0 {
+			w.metrics.SetGauge(MetricQuotaRunning, float64(running), metricLabels("tenant", tenant))
+		}
 	}
 
 	// Flow definition (§7). Missing = deterministic (poison ack after an
@@ -486,6 +595,14 @@ func (w *Worker) persistCancelAtEntry(ctx context.Context, tenant, executionID s
 func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error {
 	task, def, handle := plan.task, plan.def, plan.handle
 	tenant := task.TenantID
+	// #31: exec_duration / exec_result labels — low cardinality only (tenant,
+	// flow); execution_id is deliberately never a label.
+	execLabels := metricLabels("tenant", tenant, "flow", task.FlowID)
+	execStarted := time.Now()
+	emitResult := func(status string) {
+		w.metrics.IncCounter(MetricExecResult, metricLabels("tenant", tenant, "flow", task.FlowID, "status", status))
+		w.metrics.ObserveDuration(MetricExecDuration, time.Since(execStarted), execLabels)
+	}
 
 	run := &executionRun{
 		owner:       w,
@@ -503,6 +620,16 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 	}
 	if wait, ok := queueWaitMillis(task.Timestamp); ok {
 		run.queueWaitMS = &wait
+	}
+	if plan.resume != nil || plan.continuation {
+		// #31: wake latency — enqueue→execution of any carrier advancing an
+		// existing execution (event/timeout decision carrier or a converted
+		// continue), the observable half of "挂起/受挫 → 唤醒".
+		if wait, ok := queueWaitMillis(task.Timestamp); ok {
+			w.metrics.ObserveDuration(MetricEventWakeLatency,
+				time.Duration(wait)*time.Millisecond,
+				metricLabels("tenant", tenant, "resume_type", task.ResumeType))
+		}
 	}
 
 	runCtx, cancelRun := context.WithCancel(ctx)
@@ -652,10 +779,12 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 
 	switch {
 	case leaseLost.Load():
+		w.metrics.IncCounter(MetricLeaseLost, metricLabels("tenant", tenant))
 		_ = w.lease.Release(loopCtx, handle)
 		return ErrLeaseLost
 	case cancelHit:
 		w.logger.Info("execution cancelled", "execution_id", task.ExecutionID)
+		emitResult("cancelled")
 		err := run.finalize(func() error {
 			run.recordTimeline("run_end", map[string]any{"final": true})
 			plan.state.Context = w.buildCheckpoint(run, plan.state.Context)
@@ -699,6 +828,7 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 		// resume carrier can take it.
 		w.logger.Info("execution suspended", "execution_id", task.ExecutionID,
 			"node", string(susp.NodeID), "resume_type", "event")
+		emitResult("suspended")
 		err := run.finalize(func() error {
 			return w.persistSuspended(loopCtx, tenant, handle, plan.state, run, susp)
 		})
@@ -715,12 +845,15 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 		if !terminalized {
 			// Budget left: hand the retry carrier decision to the consumer
 			// loop, which performs the backoff + enqueue→ack choreography.
+			emitResult("failed")
 			run.markFinished()
 			_ = w.lease.Release(loopCtx, handle)
 			return retryErr
 		}
+		emitResult("failed")
 	default:
 		w.logger.Info("execution completed", "execution_id", task.ExecutionID)
+		emitResult("completed")
 		err := run.finalize(func() error {
 			run.recordTimeline("run_end", map[string]any{"final": true})
 			plan.state.Context = w.buildCheckpoint(run, plan.state.Context)
@@ -1305,6 +1438,7 @@ func (w *Worker) resumeUnderLease(ctx context.Context, task *Task) error {
 		}
 		return fmt.Errorf("resume lease acquire: %w", err)
 	}
+	w.metrics.IncCounter(MetricLeaseAcquired, metricLabels("tenant", tenant))
 	defer func() { _ = w.lease.Release(ctx, handle) }()
 
 	// In-lease re-check (plaita#241): the entry snapshot may already be stale.
@@ -1390,6 +1524,7 @@ func (w *Worker) resumeCancelUnderLease(ctx context.Context, task *Task) error {
 		}
 		return fmt.Errorf("resume cancel lease acquire: %w", err)
 	}
+	w.metrics.IncCounter(MetricLeaseAcquired, metricLabels("tenant", tenant))
 	defer func() { _ = w.lease.Release(ctx, handle) }()
 
 	state, err := w.store.LoadExecutionState(ctx, tenant, executionID)
@@ -1486,6 +1621,7 @@ func (w *Worker) compensateSuspendDispatch(ctx context.Context, task *Task, stat
 		}
 		return false, fmt.Errorf("suspend dispatch lease: %w", err)
 	}
+	w.metrics.IncCounter(MetricLeaseAcquired, metricLabels("tenant", task.TenantID))
 	defer func() { _ = w.lease.Release(ctx, handle) }()
 
 	fresh, err := w.store.LoadExecutionState(ctx, task.TenantID, task.ExecutionID)
@@ -1709,6 +1845,8 @@ func (w *Worker) requeueRetryableFailure(ctx context.Context, delivery *Delivery
 			"execution_id", task.ExecutionID, "error", err)
 		return true, nil
 	}
+	// #31: one retry carrier actually went out (requeue, not budget exhaust).
+	w.metrics.IncCounter(MetricRetryTotal, metricLabels("tenant", task.TenantID, "flow", task.FlowID, "node", nre.FailedNode))
 	w.logger.Warn("retry carrier re-enqueued and original acked",
 		"execution_id", task.ExecutionID, "node", nre.FailedNode,
 		"attempt", nre.Attempt, "budget", nre.Budget, "message_id", messageID)
@@ -1907,12 +2045,10 @@ func (w *Worker) buildCheckpoint(run *executionRun, seed map[string]any) map[str
 	return out
 }
 
-// queueWaitMillis parses the producer timestamp (naive local wall clock,
-// §2.3) into a queue wait in milliseconds. Unparsable → not reported.
-func queueWaitMillis(ts string) (float64, bool) {
-	if ts == "" {
-		return 0, false
-	}
+// parseProducerTimestamp parses the producer timestamp (naive local wall
+// clock without timezone, or RFC3339, §2.3). Shared by the queue-wait
+// computation and the #29 age gate.
+func parseProducerTimestamp(ts string) (time.Time, bool) {
 	layouts := []string{
 		"2006-01-02T15:04:05.999999",
 		"2006-01-02T15:04:05",
@@ -1921,10 +2057,23 @@ func queueWaitMillis(ts string) (float64, bool) {
 	}
 	for _, l := range layouts {
 		if t, err := time.ParseInLocation(l, ts, time.Local); err == nil {
-			return float64(time.Since(t).Milliseconds()), true
+			return t, true
 		}
 	}
-	return 0, false
+	return time.Time{}, false
+}
+
+// queueWaitMillis parses the producer timestamp (naive local wall clock,
+// §2.3) into a queue wait in milliseconds. Unparsable → not reported.
+func queueWaitMillis(ts string) (float64, bool) {
+	if ts == "" {
+		return 0, false
+	}
+	t, ok := parseProducerTimestamp(ts)
+	if !ok {
+		return 0, false
+	}
+	return float64(time.Since(t).Milliseconds()), true
 }
 
 // newExecutionID mints a uuid4 hex (§2.3: uuid4 hex form).

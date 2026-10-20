@@ -62,6 +62,17 @@ func nowISO() string { return time.Now().Format("2006-01-02T15:04:05.000000") }
 type ExecutionStore struct {
 	client *redis.Client
 	cfg    *Config
+	// onTerminal fires after a successful terminal-status save. It is the
+	// single release choke point for the per-tenant start quota (#30,
+	// Python _persist_state_or_raise 收口 release_tenant_start): completed /
+	// error / cancelled return the slot; suspended keeps it. Best-effort —
+	// a callback failure never fails the save.
+	onTerminal func(ctx context.Context, tenantID, executionID string)
+}
+
+// SetOnTerminalSave wires the terminal-save callback (worker → quota release).
+func (s *ExecutionStore) SetOnTerminalSave(fn func(ctx context.Context, tenantID, executionID string)) {
+	s.onTerminal = fn
 }
 
 func NewExecutionStore(client *redis.Client, cfg *Config) *ExecutionStore {
@@ -158,6 +169,7 @@ func (s *ExecutionStore) SaveExecutionState(ctx context.Context, tenantID string
 		if n == 0 {
 			return fmt.Errorf("%w: fence generation mismatch (gen=%d)", ErrLeaseLost, fenceGen)
 		}
+		s.notifyTerminal(ctx, tenantID, state)
 		return nil
 	}
 	pipe := s.client.Pipeline()
@@ -170,7 +182,18 @@ func (s *ExecutionStore) SaveExecutionState(ctx context.Context, tenantID string
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("%w: %v", ErrStatePersist, err)
 	}
+	s.notifyTerminal(ctx, tenantID, state)
 	return nil
+}
+
+// notifyTerminal fires the post-terminal-save callback (quota slot release,
+// #30). A failed save never reaches it — a CAS-mismatched write must not
+// release a slot still owned by the live holder.
+func (s *ExecutionStore) notifyTerminal(ctx context.Context, tenantID string, state *ExecutionState) {
+	if s.onTerminal == nil || !TerminalStatuses[state.Status] {
+		return
+	}
+	s.onTerminal(ctx, tenantID, state.ExecutionID)
 }
 
 // stateStartTimeScore parses the start_time ISO string into an epoch score
