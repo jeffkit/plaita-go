@@ -74,6 +74,14 @@ func validateDoc(doc map[string]any, sc scope) error {
 					edges[id] = append(edges[id], next)
 				}
 			}
+		case "if":
+			// if 的假分支边（translateIf 已把 camel 别名 elseNext 折叠）。
+			// Python ir_validate 把 else_next/elseNext 计入可达性边集
+			// （_iter_edge_targets 的超集口径）——漏掉它会把仅从假分支可达
+			// 的节点误判为不可达。
+			if e := firstString(n, "else_next", "elseNext"); e != "" {
+				edges[id] = append(edges[id], e)
+			}
 		case "end":
 			ends[id] = true
 		}

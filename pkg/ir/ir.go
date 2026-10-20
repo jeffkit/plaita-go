@@ -70,6 +70,7 @@ var supportedNodeTypes = map[string]bool{
 	"end":        true,
 	"assignment": true,
 	"switch":     true,
+	"if":         true,
 	"parallel":   true,
 	"loop":       true,
 	"child":      true,
