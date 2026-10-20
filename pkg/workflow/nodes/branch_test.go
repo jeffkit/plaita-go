@@ -934,9 +934,9 @@ func Test_eq(t *testing.T) {
 
 // TestConditionOperators_PlaitaMatrix：条件算子与 Python decide.py
 // Condition.match + condition_matcher 逐条对齐（issue #3 的 44 条矩阵关键行）。
-// 语义与 $F（pkg/expression/plaitaexpr 的 plaitaEqual/plaitaCompare/
-// plaitaContains）同源：bool 是数字、字符串不参与数值 cast、容器深比较、
-// 字符串按字典序、None 短路仅 eq/ne。
+// 语义与 $F（pkg/expression/plaitaexpr 的 Equal/Compare/Contains）同源：
+// bool 是数字、字符串不参与数值 cast、容器深比较、字符串按字典序、
+// None 短路仅 eq/ne。实现直调 plaitaexpr 导出版本，无双实现。
 func TestConditionOperators_PlaitaMatrix(t *testing.T) {
 	match := func(t *testing.T, input map[string]any, field string, op ComparisonOperator, value any) (bool, error) {
 		t.Helper()
@@ -1039,9 +1039,9 @@ func TestConditionOperators_PlaitaMatrix(t *testing.T) {
 }
 
 // TestConditionEq_MatchesDollarF：条件 eq 与表达式引擎的 $F.eq 必须同源
-// （issue #3）——同一对操作数经 $F.eq 求值与条件算子 eq 结果一致。plaitaexpr
-// 的 plaitaEqual 未导出，这里经公开门面 expression.Eval 走真实的 $F 求值路径
-// 做交叉验证；条件侧的 None 短路真值表与 plaitaEqual 对 nil 的处理一致。
+// （issue #3）——同一对操作数经 $F.eq 求值与条件算子 eq 结果一致。两侧实现
+// 都直调 plaitaexpr 的 Equal，这里经公开门面 expression.Eval 走真实的 $F
+// 求值路径做交叉验证；条件侧的 None 短路真值表与 Equal 对 nil 的处理一致。
 func TestConditionEq_MatchesDollarF(t *testing.T) {
 	cases := []struct {
 		l, r any

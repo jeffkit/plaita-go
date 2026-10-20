@@ -266,6 +266,11 @@ func snapshotRuntimeContext(rc *runtime.Context, opts *SuspendOptions, parentDep
 		}
 	}
 	out["$LAST_NODE"] = string(rc.LastNodeID)
+	// plaita CheckpointSchema.SYSTEM_KEY_NAMES keeps BRANCH as system state:
+	// the resumed run must see the branch taken before the suspend point.
+	if rc.LastBranch != nil {
+		out["$BRANCH"] = rc.LastBranch
+	}
 
 	if rc.ParentWorkflowContext != nil {
 		if parentDepth >= maxParentChainDepth {
@@ -304,6 +309,9 @@ func RestoreRuntimeContext(ctx context.Context, checkpointContext map[string]any
 	if lastNode, ok := checkpointContext["$LAST_NODE"].(string); ok {
 		rc.LastNodeID = NodeID(lastNode)
 	}
+	if branch, ok := checkpointContext["$BRANCH"]; ok {
+		rc.LastBranch = branch
+	}
 	if parent, ok := checkpointContext["$PARENT"].(map[string]any); ok {
 		parentRC := restoreRuntimeChain(parent)
 		rc.ParentWorkflowContext = runtime.WithWorkflowRuntimeContext(context.Background(), parentRC)
@@ -321,6 +329,9 @@ func restoreRuntimeChain(snap map[string]any) *runtime.Context {
 	rc.CurrentNodeContext = stringAnyMap(snap["$CURRENT"])
 	if lastNode, ok := snap["$LAST_NODE"].(string); ok {
 		rc.LastNodeID = NodeID(lastNode)
+	}
+	if branch, ok := snap["$BRANCH"]; ok {
+		rc.LastBranch = branch
 	}
 	if parent, ok := snap["$PARENT"].(map[string]any); ok {
 		rc.ParentWorkflowContext = runtime.WithWorkflowRuntimeContext(context.Background(), restoreRuntimeChain(parent))

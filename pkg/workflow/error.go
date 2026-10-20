@@ -18,6 +18,14 @@ var (
 	ErrStartNodeNotFound = errors.New("start node not found")
 	ErrEndNodeNotFound   = errors.New("end node not found")
 	ErrNodeNotFound      = errors.New("workflow node not found")
+	// ErrWorkflowReentry is returned when the same Workflow instance is
+	// executed again while a run is still in flight (Python
+	// executor._reentry_error). Create a new Workflow per concurrent run, or
+	// use child flows for sub-flows.
+	ErrWorkflowReentry = errors.New(
+		"workflow instance is already running; concurrent runs on one instance " +
+			"corrupt shared execution state ($INPUT/$NODE/last_node): create a new " +
+			"Workflow per concurrent run, or use child executions for sub-flows")
 )
 
 // DefaultHandlerErrorCode is the abort code used when a handler with a
@@ -194,20 +202,43 @@ func NonRetryable(err error) error {
 }
 
 // deterministicErrorTypeNames lists node-side deterministic error types by
-// name. Those types live in pkg/workflow/nodes, which pkg/workflow cannot
-// import (import cycle), so the engine bridges the classification over the
-// concrete type name — the wiring AGENTS.md lists as pending. If a node type
-// here is renamed, its errors degrade to "unknown" and keep the historical
-// retry behavior (fail-open, same as before this bridge).
+// name. Those types live in packages pkg/workflow cannot import (nodes by
+// import cycle; pkg/llm to keep the engine decoupled from any provider
+// client), so the engine bridges the classification over the concrete type
+// name. If a type here is renamed, its errors degrade to "unknown" and keep
+// the historical retry behavior (fail-open, same as before this bridge).
 var deterministicErrorTypeNames = map[string]bool{
 	"NotifyDeterministicError": true, // notify family: credential/config errors
+	"DeterministicError":       true, // llm side: plaita-nodes _retry.DeterministicError port
+	"HitlError":                true, // hitl-server explicit rejections (send success=false, poll status=error)
+}
+
+// retryClassifier is the structural contract an error type can expose to
+// carry its own transient/deterministic verdict without pkg/workflow
+// importing the package (e.g. *llm.APIError.Retryable: 5xx/408/425/429
+// transient, other 4xx deterministic per the plaita-nodes status table).
+type retryClassifier interface {
+	Retryable() bool
+}
+
+// retryVerdict walks the wrap chain for the outermost error that classifies
+// itself through retryClassifier and reports its verdict; ok is false when
+// no error in the chain carries one.
+func retryVerdict(err error) (verdict, ok bool) {
+	for err != nil {
+		if c, isClassifier := err.(retryClassifier); isClassifier {
+			return c.Retryable(), true
+		}
+		err = errors.Unwrap(err)
+	}
+	return false, false
 }
 
 // IsRetryableError reports whether err is worth retrying, aligned with
 // plaita runner.is_retryable_error:
 //
-//   - deterministic errors (NonRetryable and the node-side classified types)
-//     never retry;
+//   - deterministic errors (NonRetryable, the bridged node-side types and
+//     everything self-classifying as non-retryable) never retry;
 //   - node code 1001 (request generation = configuration/parameter error)
 //     never retries; 1002/1003 (send/processing = transient) retry;
 //   - every other unknown error keeps the historical behavior (retry).
@@ -221,6 +252,9 @@ func IsRetryableError(err error) bool {
 	}
 	if hasDeterministicErrorType(err) {
 		return false
+	}
+	if verdict, ok := retryVerdict(err); ok {
+		return verdict
 	}
 	switch errs.Internal(err).Code {
 	case nodeGenRequestErrorCode:

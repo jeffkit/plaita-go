@@ -46,6 +46,10 @@ const (
 	ValueSourceERROR  ValueSource = "ERROR"
 	ValueSourceENV    ValueSource = "ENV"
 	ValueSourceGlobal ValueSource = "GLOBAL"
+	// ValueSourceBranch is the branch target taken by the most recent
+	// branching node (plaita system key $BRANCH / context.last_branch). It
+	// is a scalar root: it has no sub-paths.
+	ValueSourceBranch ValueSource = "BRANCH"
 	ValueNULL         ValueSource = "NULL"
 	ValueEmptyString  ValueSource = "EMPTYSTRING"
 )
@@ -57,6 +61,7 @@ var builtinValueSources = []ValueSource{
 	ValueSourceERROR,
 	ValueSourceENV,
 	ValueSourceGlobal,
+	ValueSourceBranch,
 	ValueNULL,
 }
 

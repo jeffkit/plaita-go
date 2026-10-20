@@ -54,17 +54,21 @@ func execArgsFromRuntimeCtx(ctx context.Context) map[string]any {
 		return nil
 	}
 	runtimeCtx := runtime.WorkflowRuntimeContext(ctx)
+	// Map roots are read through snapshot accessors: the owning flow may keep
+	// writing node results/globals while a background parallel branch
+	// evaluates $PARENT.<...> against this context (issue #17 -race).
 	execArgs := map[string]any{
-		string(parser.ValueSourceInput):  runtimeCtx.WorkflowInput,
-		string(parser.ValueSourceNode):   runtimeCtx.ExecuteNodeResults,
+		string(parser.ValueSourceInput):  runtimeCtx.GetWorkflowInput(),
+		string(parser.ValueSourceNode):   runtimeCtx.GetExecuteNodeResults(),
 		string(parser.ValueSourceParent): execArgsFromRuntimeCtx(runtimeCtx.ParentWorkflowContext),
-		string(parser.ValueSourceENV):    runtimeCtx.EnvVariables,
-		string(parser.ValueSourceERROR):  runtimeCtx.ExecuteNodeErrors,
-		string(parser.ValueSourceGlobal): runtimeCtx.GlobalVariables,
+		string(parser.ValueSourceENV):    runtimeCtx.GetEnvVariables(),
+		string(parser.ValueSourceERROR):  runtimeCtx.GetExecuteNodeErrors(),
+		string(parser.ValueSourceGlobal): runtimeCtx.GetGlobalVariables(),
+		string(parser.ValueSourceBranch): runtimeCtx.GetLastBranch(),
 		string(parser.ValueNULL):         nil,
 		string(parser.ValueEmptyString):  "",
 	}
-	deepCopy(runtimeCtx.CurrentNodeContext, &execArgs)
+	deepCopy(runtimeCtx.GetCurrentNodeContexts(), &execArgs)
 	return execArgs
 }
 
@@ -329,29 +333,30 @@ func (e *Evaluator) evalVariable(
 	switch variable.Source {
 	case parser.ValueSourceInput:
 		if len(variable.WithoutSourceVariable) == 0 {
-			return model.NewValue(runtimeCtx.WorkflowInput), nil // TODO: deep copy input map
+			return model.NewValue(runtimeCtx.GetWorkflowInput()), nil // TODO: deep copy input map
 		}
 		// plaita missing-key semantics: a missing field on an existing input
 		// yields nil; only a nil/absent input container or an index miss is
 		// an error (see semantics.go).
-		val, err := lookupPathPlaita(runtimeCtx.WorkflowInput, variable.WithoutSourceVariable, false)
+		val, err := lookupPathPlaita(runtimeCtx.GetWorkflowInput(), variable.WithoutSourceVariable, false)
 		if err != nil {
 			return model.Value{}, fmt.Errorf("failed to lookup input variable %q: %w", variable.Variable, err)
 		}
 		return model.NewValue(val), nil
 	case parser.ValueSourceNode:
+		results := runtimeCtx.GetExecuteNodeResults()
 		if len(variable.WithoutSourceVariable) == 0 {
-			return model.NewValue(runtimeCtx.ExecuteNodeResults), nil
+			return model.NewValue(results), nil
 		}
 		// plaita#130: `$NODE.raw.<node>[.path...]` reads the stored node
 		// result verbatim (the modifier is stripped; strings are never
 		// re-evaluated at any depth). A node literally named `raw` keeps
 		// being resolved as that node.
 		path := variable.WithoutSourceVariable
-		if rawPath, ok := nodeRawAccessorPath(runtimeCtx.ExecuteNodeResults, path); ok {
+		if rawPath, ok := nodeRawAccessorPath(results, path); ok {
 			path = rawPath
 		}
-		val, err := lookupPathPlaita(runtimeCtx.ExecuteNodeResults, path, false)
+		val, err := lookupPathPlaita(results, path, false)
 		if err != nil {
 			return model.Value{}, fmt.Errorf("failed to lookup executed node result var %q: %w", variable.Variable, err)
 		}
@@ -366,33 +371,38 @@ func (e *Evaluator) evalVariable(
 		// $ERROR is a Go-runtime-specific root with no plaita counterpart;
 		// it keeps its legacy case-insensitive lookup and error-on-miss
 		// semantics unchanged.
-		val, err := lookup.LookupStringI(runtimeCtx.ExecuteNodeErrors, variable.WithoutSourceVariable)
+		val, err := lookup.LookupStringI(runtimeCtx.GetExecuteNodeErrors(), variable.WithoutSourceVariable)
 		if err != nil {
 			return model.Value{}, fmt.Errorf("failed to lookup executed error result var %q: %w", variable.Variable,
 				err)
 		}
 		return model.NewValue(val.Interface()), nil
 	case parser.ValueSourceENV:
-		val, err := lookupPathPlaita(runtimeCtx.EnvVariables, variable.WithoutSourceVariable, false)
+		val, err := lookupPathPlaita(runtimeCtx.GetEnvVariables(), variable.WithoutSourceVariable, false)
 		if err != nil {
 			return model.Value{}, fmt.Errorf("failed to lookup executed error result var %q: %w", variable.Variable,
 				err)
 		}
 		return model.NewValue(val), nil
 	case parser.ValueSourceGlobal:
-		val, err := lookupPathPlaita(runtimeCtx.GlobalVariables, variable.WithoutSourceVariable, false)
+		val, err := lookupPathPlaita(runtimeCtx.GetGlobalVariables(), variable.WithoutSourceVariable, false)
 		if err != nil {
 			return model.Value{}, fmt.Errorf("failed to lookup executed error result var %q: %w", variable.Variable,
 				err)
 		}
 		return model.NewValue(val), nil
+	case parser.ValueSourceBranch:
+		// $BRANCH is the branch target taken by the most recent branching
+		// node (plaita runner: context.last_branch); nil until one has run
+		// (plaita None). Scalar root — no sub-paths.
+		return model.NewValue(runtimeCtx.GetLastBranch()), nil
 	case parser.ValueNULL:
 		return model.NewValue(nil), nil
 	case parser.ValueEmptyString:
 		return model.NewValue(""), nil
 	default:
 		execArgs := make(map[string]any)
-		deepCopy(runtimeCtx.CurrentNodeContext, &execArgs)
+		deepCopy(runtimeCtx.GetCurrentNodeContexts(), &execArgs)
 		deepCopy(parameters, &execArgs)
 		// The first segment names a context root: a miss there is plaita's
 		// KeyError (error); misses deeper down follow the field-miss-yields-

@@ -57,7 +57,7 @@ func index(container any, item any) (int, error) {
 		return i, nil
 	case []any:
 		for i, v := range c {
-			if plaitaEqual(v, item) {
+			if Equal(v, item) {
 				return i, nil
 			}
 		}
@@ -147,7 +147,7 @@ func insert(s []any, i int64, item any) []any {
 // returns a NEW list; an absent item is a ValueError.
 func remove(s []any, item any) ([]any, error) {
 	for i, v := range s {
-		if plaitaEqual(v, item) {
+		if Equal(v, item) {
 			out := make([]any, 0, len(s)-1)
 			out = append(out, s[:i]...)
 			out = append(out, s[i+1:]...)

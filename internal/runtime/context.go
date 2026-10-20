@@ -19,6 +19,13 @@ const (
 )
 
 // Context represents the context of workflow execution.
+//
+// Concurrency: a Context is shared between a flow and its background
+// parallel branches (the branch clones its own per-execution state but
+// resolves $PARENT against the source execution), so every field is guarded
+// by mu. Readers that need to iterate a map must take a snapshot accessor
+// (GetExecuteNodeResults / GetGlobalVariables / …) — the getters copy under
+// the read lock, callers never iterate the live map.
 type Context struct {
 	mu                    sync.RWMutex
 	WorkflowInput         any             `json:"input"`
@@ -26,9 +33,13 @@ type Context struct {
 	ParentWorkflowContext context.Context `json:"parent"`
 	CurrentNodeContext    map[string]any  `json:"current"`
 	LastNodeID            types.NodeID    `json:"last_node_id"`
-	ExecuteNodeErrors     map[string]any  `json:"errors"`
-	EnvVariables          map[string]any  `json:"env_variables"`
-	GlobalVariables       map[string]any  `json:"global_variables"`
+	// LastBranch is the branch target taken by the most recent branching
+	// node (plaita runner: context.last_branch = result for node.branching
+	// nodes; nil until one has run). Read by expressions as $BRANCH.
+	LastBranch        any            `json:"last_branch,omitempty"`
+	ExecuteNodeErrors map[string]any `json:"errors"`
+	EnvVariables      map[string]any `json:"env_variables"`
+	GlobalVariables   map[string]any `json:"global_variables"`
 
 	// FlowDeadline is the deadline imposed by the current flow's own timeout
 	// budget. It stays zero for flows without an explicit timeout. It is used
@@ -65,11 +76,15 @@ func WithWorkflowInput(ctx context.Context, input any) context.Context {
 
 // WithWorkflowInput sets the workflow input in workflow runtime context.
 func (c *Context) WithWorkflowInput(input any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.WorkflowInput = input
 }
 
 // GetWorkflowInput returns the workflow input from workflow runtime context.
 func (c *Context) GetWorkflowInput() any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.WorkflowInput
 }
 
@@ -139,6 +154,8 @@ func (c *Context) GetParentWorkflowContext() context.Context {
 
 // WithExecuteNodeResult sets the execute node result in context.
 func (c *Context) WithExecuteNodeResult(nodeID types.NodeID, result any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.ExecuteNodeResults == nil {
 		c.ExecuteNodeResults = make(map[string]any)
 	}
@@ -146,8 +163,26 @@ func (c *Context) WithExecuteNodeResult(nodeID types.NodeID, result any) {
 	c.ExecuteNodeResults[string(nodeID)] = result
 }
 
+// GetExecuteNodeResults returns a snapshot of the executed node results
+// ($NODE). The copy is taken under the read lock: callers may iterate it
+// (expression evaluation) while the owning flow keeps writing.
+func (c *Context) GetExecuteNodeResults() map[string]any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.ExecuteNodeResults == nil {
+		return nil
+	}
+	out := make(map[string]any, len(c.ExecuteNodeResults))
+	for k, v := range c.ExecuteNodeResults {
+		out[k] = v
+	}
+	return out
+}
+
 // WithExecuteNodeError sets the execute node error in context.
 func (c *Context) WithExecuteNodeError(nodeID types.NodeID, err any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.ExecuteNodeErrors == nil {
 		c.ExecuteNodeErrors = make(map[string]any)
 	}
@@ -156,16 +191,37 @@ func (c *Context) WithExecuteNodeError(nodeID types.NodeID, err any) {
 
 // GetExecuteNodeError returns the execute node error from context.
 func (c *Context) GetExecuteNodeError(nodeID types.NodeID) any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.ExecuteNodeErrors[string(nodeID)]
+}
+
+// GetExecuteNodeErrors returns a snapshot of the executed node errors
+// ($ERROR).
+func (c *Context) GetExecuteNodeErrors() map[string]any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.ExecuteNodeErrors == nil {
+		return nil
+	}
+	out := make(map[string]any, len(c.ExecuteNodeErrors))
+	for k, v := range c.ExecuteNodeErrors {
+		out[k] = v
+	}
+	return out
 }
 
 // GetExecuteNodeResult returns the execute node result from context.
 func (c *Context) GetExecuteNodeResult(nodeID types.NodeID) any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.ExecuteNodeResults[string(nodeID)]
 }
 
 // WithCurrentNodeContext sets the current node context in context.
 func (c *Context) WithCurrentNodeContext(key string, nodeContext any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.CurrentNodeContext == nil {
 		c.CurrentNodeContext = make(map[string]any)
 	}
@@ -174,26 +230,67 @@ func (c *Context) WithCurrentNodeContext(key string, nodeContext any) {
 
 // ResetCurrentNodeContext resets the current node context in context.
 func (c *Context) ResetCurrentNodeContext() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.CurrentNodeContext = make(map[string]any)
 }
 
 // GetCurrentNodeContext returns the current node context from context.
 func (c *Context) GetCurrentNodeContext(key string) any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.CurrentNodeContext[key]
+}
+
+// GetCurrentNodeContexts returns a snapshot of the current node context
+// (per-node extra results such as a switch's matchInfos).
+func (c *Context) GetCurrentNodeContexts() map[string]any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.CurrentNodeContext == nil {
+		return nil
+	}
+	out := make(map[string]any, len(c.CurrentNodeContext))
+	for k, v := range c.CurrentNodeContext {
+		out[k] = v
+	}
+	return out
 }
 
 // WithLastNodeID sets the last node id in workflow runtime context.
 func (c *Context) WithLastNodeID(nodeID types.NodeID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.LastNodeID = nodeID
 }
 
 // GetLastNodeID returns the last node id from workflow runtime context.
 func (c *Context) GetLastNodeID() types.NodeID {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.LastNodeID
+}
+
+// WithLastBranch records the branch target taken by the most recent
+// branching node (plaita runner: context.last_branch).
+func (c *Context) WithLastBranch(branch any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.LastBranch = branch
+}
+
+// GetLastBranch returns the branch target taken by the most recent branching
+// node ($BRANCH); nil until a branching node has run (plaita None).
+func (c *Context) GetLastBranch() any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.LastBranch
 }
 
 // WithGlobalVariables sets the global variables in context.
 func (c *Context) WithGlobalVariables(variables map[string]any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.GlobalVariables == nil {
 		c.GlobalVariables = make(map[string]any)
 	}
@@ -205,6 +302,8 @@ func (c *Context) WithGlobalVariables(variables map[string]any) {
 
 // WithGlobalVariable sets the global variable in context.
 func (c *Context) WithGlobalVariable(key string, value any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.GlobalVariables == nil {
 		c.GlobalVariables = make(map[string]any)
 	}
@@ -213,12 +312,40 @@ func (c *Context) WithGlobalVariable(key string, value any) {
 
 // GetGlobalVariable returns the global variables from context.
 func (c *Context) GetGlobalVariable(key string) any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.GlobalVariables[key]
 }
 
-// GetGlobalVariables returns the global variables from context.
+// GetGlobalVariables returns a snapshot of the global variables from context
+// ($GLOBAL). The copy keeps callers safe while another execution path merges
+// globals; the historical live-map return had no mutating caller.
 func (c *Context) GetGlobalVariables() map[string]any {
-	return c.GlobalVariables
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.GlobalVariables == nil {
+		return nil
+	}
+	out := make(map[string]any, len(c.GlobalVariables))
+	for k, v := range c.GlobalVariables {
+		out[k] = v
+	}
+	return out
+}
+
+// GetEnvVariables returns a snapshot of the env variables from context
+// ($ENV).
+func (c *Context) GetEnvVariables() map[string]any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.EnvVariables == nil {
+		return nil
+	}
+	out := make(map[string]any, len(c.EnvVariables))
+	for k, v := range c.EnvVariables {
+		out[k] = v
+	}
+	return out
 }
 
 // LastNodeID returns the last node id from workflow runtime context.
@@ -296,17 +423,23 @@ func NewExecutionRuntimeContext(ctx context.Context) *Context {
 // branch is a child of the flow that contains the parallel node, so
 // $PARENT inside the branch must resolve against that flow, matching
 // plaita's child-execution parent chain.
+//
+// The source maps are deep-copied under the source's read lock: a background
+// branch clones while the parent flow keeps writing node results.
 func CloneContext(ctx context.Context) context.Context {
 	runtimeCtx := WorkflowRuntimeContext(ctx)
 	newRuntimeCtx := newContext()
+	runtimeCtx.mu.RLock()
 	copyOpts := copier.Option{DeepCopy: true}
 	_ = copier.CopyWithOption(&newRuntimeCtx.WorkflowInput, runtimeCtx.WorkflowInput, copyOpts)
 	_ = copier.CopyWithOption(&newRuntimeCtx.ExecuteNodeResults, runtimeCtx.ExecuteNodeResults, copyOpts)
 	_ = copier.CopyWithOption(&newRuntimeCtx.CurrentNodeContext, runtimeCtx.CurrentNodeContext, copyOpts)
 	_ = copier.CopyWithOption(&newRuntimeCtx.EnvVariables, runtimeCtx.EnvVariables, copyOpts)
 	_ = copier.CopyWithOption(&newRuntimeCtx.GlobalVariables, runtimeCtx.GlobalVariables, copyOpts)
-	newRuntimeCtx.ParentWorkflowContext = ctx
 	newRuntimeCtx.LastNodeID = runtimeCtx.LastNodeID
+	newRuntimeCtx.LastBranch = runtimeCtx.LastBranch
 	newRuntimeCtx.FlowDeadline = runtimeCtx.FlowDeadline
+	runtimeCtx.mu.RUnlock()
+	newRuntimeCtx.ParentWorkflowContext = ctx
 	return WithWorkflowRuntimeContext(ctx, newRuntimeCtx)
 }

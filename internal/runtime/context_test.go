@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -138,4 +140,79 @@ func TestContext_WithExecuteNodeError(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestContext_LastBranch(t *testing.T) {
+	c := NewContext()
+	// plaita: last_branch is None until a branching node has run.
+	require.Nil(t, c.GetLastBranch())
+	c.WithLastBranch("e1")
+	require.Equal(t, "e1", c.GetLastBranch())
+	c.WithLastBranch(nil)
+	require.Nil(t, c.GetLastBranch())
+	// clones carry the branch (parallel branch snapshot semantics).
+	c.WithLastBranch("yes")
+	clone := WorkflowRuntimeContext(CloneContext(
+		WithWorkflowRuntimeContext(context.Background(), c)))
+	require.Equal(t, "yes", clone.GetLastBranch())
+}
+
+// TestContext_ConcurrentReadWrite is the -race harness for issue #17: a
+// parent flow keeps writing node results/globals/current-node state while
+// background parallel branches snapshot and clone the same context (the
+// pre-lock failure was a parent write racing a branch's $PARENT evaluation).
+func TestContext_ConcurrentReadWrite(t *testing.T) {
+	ctx := NewContext()
+	ctx.WithGlobalVariable("seed", 0)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				ctx.WithExecuteNodeResult(types.NodeID(fmt.Sprintf("n%d-%d", i, j)), j)
+				ctx.WithExecuteNodeError(types.NodeID(fmt.Sprintf("e%d-%d", i, j)), "x")
+				ctx.WithCurrentNodeContext(fmt.Sprintf("c%d-%d", i, j), map[string]any{"v": j})
+				ctx.WithGlobalVariable(fmt.Sprintf("g%d-%d", i, j), j)
+				ctx.WithLastNodeID(types.NodeID(fmt.Sprintf("n%d-%d", i, j)))
+				ctx.WithLastBranch(fmt.Sprintf("b%d-%d", i, j))
+				ctx.ResetCurrentNodeContext()
+			}
+		}(i)
+	}
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				_ = ctx.GetExecuteNodeResult("n0-1")
+				_ = ctx.GetExecuteNodeError("e0-1")
+				_ = ctx.GetCurrentNodeContext("c0-1")
+				_ = ctx.GetGlobalVariable("g0-1")
+				_ = ctx.GetLastNodeID()
+				_ = ctx.GetLastBranch()
+				_ = ctx.GetExecuteNodeResults()
+				_ = ctx.GetExecuteNodeErrors()
+				_ = ctx.GetCurrentNodeContexts()
+				_ = ctx.GetGlobalVariables()
+				_ = ctx.GetEnvVariables()
+				_ = ctx.GetWorkflowInput()
+			}
+		}()
+	}
+	// background branch clones race the writers too (CloneContext holds the
+	// source read lock across its deep copy).
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			parent := WithWorkflowRuntimeContext(context.Background(), ctx)
+			for j := 0; j < 100; j++ {
+				clone := WorkflowRuntimeContext(CloneContext(parent))
+				_ = clone.GetExecuteNodeResults()
+			}
+		}()
+	}
+	wg.Wait()
 }

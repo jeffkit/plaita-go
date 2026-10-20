@@ -305,16 +305,25 @@ func TestSwitch_Execute_ConcurrentSortSafety(t *testing.T) {
 
 	// 两个 end 各自输出本路径标记：并发下 priority 排序必须稳定命中 high
 	// 分支；$NODE.sw 同时验证 switch 的节点结果语义（#6）。
-	flow := &workflow.Workflow{
-		ID:      "switch-race-flow",
-		Runtime: workflow.RuntimeGo,
-		Version: "v1.0",
-		Nodes: workflow.Nodes{
-			&Start{BaseNode{ID: "start", Next: "sw"}},
-			sw,
-			&End{BaseNode: BaseNode{ID: "end-high", Output: "$NODE.sw"}},
-			&End{BaseNode: BaseNode{ID: "end-low", Output: "$NODE.sw"}},
-		},
+	//
+	// 语义更新（engine-wiring，#17 重入保护接线后）：Workflow 实例不再可重入
+	// （同实例并发 Execute 返回 ErrWorkflowReentry），但节点定义仍然是共享的
+	// ——每个 goroutine 建各自的 Workflow 实例、指向同一组节点指针，保住本测
+	// 试的真不变量：同一 *Switch 定义被并发执行时排序走副本、Branches 顺序
+	// 不被改写。
+	nodes := workflow.Nodes{
+		&Start{BaseNode{ID: "start", Next: "sw"}},
+		sw,
+		&End{BaseNode: BaseNode{ID: "end-high", Output: "$NODE.sw"}},
+		&End{BaseNode: BaseNode{ID: "end-low", Output: "$NODE.sw"}},
+	}
+	newFlow := func() *workflow.Workflow {
+		return &workflow.Workflow{
+			ID:      "switch-race-flow",
+			Runtime: workflow.RuntimeGo,
+			Version: "v1.0",
+			Nodes:   nodes,
+		}
 	}
 
 	var wg sync.WaitGroup
@@ -322,7 +331,7 @@ func TestSwitch_Execute_ConcurrentSortSafety(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			got, err := flow.Execute(context.Background(), map[string]any{"a": 10})
+			got, err := newFlow().Execute(context.Background(), map[string]any{"a": 10})
 			require.NoError(t, err)
 			require.Equal(t, "end-high", got, "concurrent execution must pick the same (priority-sorted) branch")
 		}()

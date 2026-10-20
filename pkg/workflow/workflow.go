@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/fatih/structs"
@@ -88,6 +89,9 @@ type Workflow struct {
 	TimeoutHandlePolicy TimeoutHandlePolicy          `json:"timeoutHandler,omitempty"` // 超时处理策略
 	Metadata            map[string]any               `json:"metadata,omitempty"`       // workflow元数据
 	Context             Context                      `json:"context,omitempty"`        // workflow上下文配置
+	// running is the reentry guard: one Workflow instance runs at most one
+	// Execute at a time (Python _reentry_error semantics). Zero value ready.
+	running atomic.Bool
 	// ExposeEnv is the $ENV allowlist (plaita 0.5.0 allowlist model,
 	// fail-closed): only the listed environment variables are visible to flow
 	// expressions. An empty/absent list exposes nothing. A child flow without
@@ -153,7 +157,19 @@ func toMap(v any) (map[string]any, error) {
 
 // Execute executes the flow with the given input.
 // Variable `args` can be pass by struct or map[string]any.
+//
+// A Workflow instance is not reentrant (Python executor._begin_run /
+// _reentry_error): one Workflow object carries no per-execution state, but a
+// second concurrent run would still interleave on shared node definitions
+// and event callbacks. Concurrent/reentrant Execute on the same instance is
+// rejected with ErrWorkflowReentry; create a new Workflow (or a child flow)
+// per concurrent run. The flag is released when the execution returns.
 func (f *Workflow) Execute(ctx context.Context, args ExecuteArgs) (any, error) {
+	if !f.running.CompareAndSwap(false, true) {
+		return nil, fmt.Errorf("workflow %q: %w", f.ID, ErrWorkflowReentry)
+	}
+	defer f.running.Store(false)
+
 	if err := f.Validate(); err != nil {
 		return nil, err
 	}
@@ -197,6 +213,12 @@ func (f *Workflow) Execute(ctx context.Context, args ExecuteArgs) (any, error) {
 			return err
 		}
 
+		// plaita node-F2 at flow level: a deterministic node error (wired
+		// through IsRetryableError) must not buy full-flow re-executions
+		// either — retryTimes only multiplies attempts for transient faults.
+		if !IsRetryableError(err) {
+			return err
+		}
 		return RetryableError(err)
 	}
 
@@ -238,7 +260,7 @@ func (f *Workflow) prepareExecutionRuntimeContext(ctx context.Context, args Exec
 	case f.ExposeEnv != nil:
 		fresh.WithEnvVariables(nil)
 	case hadParent && fresh.ParentWorkflowContext != nil:
-		fresh.WithEnvVariables(runtime.WorkflowRuntimeContext(fresh.ParentWorkflowContext).EnvVariables)
+		fresh.WithEnvVariables(runtime.WorkflowRuntimeContext(fresh.ParentWorkflowContext).GetEnvVariables())
 	default:
 		fresh.WithEnvVariables(nil)
 	}
@@ -475,6 +497,17 @@ func (f *Workflow) executeNode(ctx context.Context, node Node) (result *ExecuteR
 		defaultResult, finalErr := errorHandlePolicy.HandleFinalError(err)
 		result = &ExecuteResult{Result: defaultResult, NextNode: node.NextNode()}
 		return result, finalErr
+	}
+	// plaita runner: the branch taken by the most recent branching node is
+	// recorded as context.last_branch ($BRANCH) — only on a successful
+	// attempt (Python run_node writes it after run, errors keep the previous
+	// branch). The switch's result IS the resolved branch target, so the
+	// value mirrors Python resolve_branch_target (next, falling back to the
+	// branch name).
+	if node.GetType() == types.NodeTypeSwitch && result != nil {
+		if branch, ok := result.Result.(string); ok {
+			runtime.WorkflowRuntimeContext(ctx).WithLastBranch(branch)
+		}
 	}
 	return result, nil
 }

@@ -74,12 +74,16 @@ func isTruthy(v any) bool {
 	}
 }
 
-// plaitaEqual implements Python `==` for the expression value domain:
+// Equal implements Python `==` for the expression value domain:
 // nil == nil, cross-type numeric equality (1 == 1.0, True == 1), exact string
 // equality, and deep structural equality for slices/maps (Python containers
 // compare element-wise, so [1] == [1.0] is True). Unrelated types are simply
 // not equal (Python == never raises for these).
-func plaitaEqual(l, r any) bool {
+//
+// Equal is the single source of plaita `==` semantics: the $F.eq/ne
+// functions and the switch condition operators (pkg/workflow/nodes/branch.go)
+// both call it directly — no mirrored implementation may drift.
+func Equal(l, r any) bool {
 	if l == nil || r == nil {
 		return l == nil && r == nil
 	}
@@ -102,7 +106,7 @@ func plaitaEqual(l, r any) bool {
 				return false
 			}
 			for i := 0; i < lv.Len(); i++ {
-				if !plaitaEqual(lv.Index(i).Interface(), rv.Index(i).Interface()) {
+				if !Equal(lv.Index(i).Interface(), rv.Index(i).Interface()) {
 					return false
 				}
 			}
@@ -118,7 +122,7 @@ func plaitaEqual(l, r any) bool {
 				if !other.IsValid() {
 					return false
 				}
-				if !plaitaEqual(lv.MapIndex(key).Interface(), other.Interface()) {
+				if !Equal(lv.MapIndex(key).Interface(), other.Interface()) {
 					return false
 				}
 			}
@@ -128,12 +132,13 @@ func plaitaEqual(l, r any) bool {
 	return false
 }
 
-// plaitaCompare implements Python's ordering operators (a OP b) for gt/gte/
+// Compare implements Python's ordering operators (a OP b) for gt/gte/
 // lt/lte. plaita's type domain: numbers (int/float/bool cross-type) and
 // strings (lexicographic, strings only against strings). Anything else —
 // including mixed number/string — raises TypeError in Python, propagated
 // here as an error (plaita re-raises native operator errors verbatim).
-func plaitaCompare(op string, l, r any) (int, error) {
+// Shared by $F.gt/gte/lt/lte and the switch condition operators.
+func Compare(op string, l, r any) (int, error) {
 	if lf, ok := numericOf(l); ok {
 		if rf, ok := numericOf(r); ok {
 			switch {
@@ -151,40 +156,40 @@ func plaitaCompare(op string, l, r any) (int, error) {
 			return strings.Compare(ls, rs), nil
 		}
 	}
-	return 0, fmt.Errorf("$F.%s: unsupported operand types: %T and %T", op, l, r)
+	return 0, fmt.Errorf("%s: unsupported operand types: %T and %T", op, l, r)
 }
 
 // eq is plaita $F.eq(a, b) — Python `a == b` (expression.py _fn_eq).
 func eq(l, r any) bool {
-	return plaitaEqual(l, r)
+	return Equal(l, r)
 }
 
 // ne is plaita $F.ne(a, b) — Python `a != b` (expression.py _fn_ne).
 func ne(l, r any) bool {
-	return !plaitaEqual(l, r)
+	return !Equal(l, r)
 }
 
 // gt is plaita $F.gt(a, b) — Python `a > b` (expression.py _fn_gt).
 func gt(l, r any) (bool, error) {
-	c, err := plaitaCompare("gt", l, r)
+	c, err := Compare("$F.gt", l, r)
 	return c > 0, err
 }
 
 // gte is plaita $F.gte(a, b) — Python `a >= b` (expression.py _fn_gte).
 func gte(l, r any) (bool, error) {
-	c, err := plaitaCompare("gte", l, r)
+	c, err := Compare("$F.gte", l, r)
 	return c >= 0, err
 }
 
 // lt is plaita $F.lt(a, b) — Python `a < b` (expression.py _fn_lt).
 func lt(l, r any) (bool, error) {
-	c, err := plaitaCompare("lt", l, r)
+	c, err := Compare("$F.lt", l, r)
 	return c < 0, err
 }
 
 // lte is plaita $F.lte(a, b) — Python `a <= b` (expression.py _fn_lte).
 func lte(l, r any) (bool, error) {
-	c, err := plaitaCompare("lte", l, r)
+	c, err := Compare("$F.lte", l, r)
 	return c <= 0, err
 }
 
@@ -208,24 +213,27 @@ func ifelse(cond any, trueVal, falseVal any) any {
 //   - a is dict: b is tested against the keys
 //   - anything else: Python raises TypeError, propagated as an error
 func notContains(container, needle any) (bool, error) {
-	contained, err := plaitaContains(container, needle)
+	contained, err := Contains("$F.notContains", container, needle)
 	if err != nil {
 		return false, err
 	}
 	return !contained, nil
 }
 
-// plaitaContains implements Python `b in a` for the container kinds listed
-// on notContains.
-func plaitaContains(container, needle any) (bool, error) {
+// Contains implements Python `b in a` for the container kinds listed on
+// notContains. op is rendered verbatim in error messages so both call sites
+// ($F.notContains and the switch condition operators) keep their historical
+// error text. Shared by $F.notContains and pkg/workflow/nodes/branch.go —
+// no mirrored implementation may drift.
+func Contains(op string, container, needle any) (bool, error) {
 	switch c := container.(type) {
 	case nil:
-		return false, fmt.Errorf("$F.notContains: argument of type 'NoneType' is not a container")
+		return false, fmt.Errorf("%s: argument of type 'NoneType' is not a container", op)
 	case string:
 		s, ok := needle.(string)
 		if !ok {
 			return false, fmt.Errorf(
-				"$F.notContains: 'in <string>' requires string as left operand, got %T", needle)
+				"%s: 'in <string>' requires string as left operand, got %T", op, needle)
 		}
 		return strings.Contains(c, s), nil
 	}
@@ -233,7 +241,7 @@ func plaitaContains(container, needle any) (bool, error) {
 	switch rv.Kind() {
 	case reflect.Slice, reflect.Array:
 		for i := 0; i < rv.Len(); i++ {
-			if plaitaEqual(rv.Index(i).Interface(), needle) {
+			if Equal(rv.Index(i).Interface(), needle) {
 				return true, nil
 			}
 		}
@@ -251,7 +259,7 @@ func plaitaContains(container, needle any) (bool, error) {
 		return rv.MapIndex(key).IsValid(), nil
 	default:
 		return false, fmt.Errorf(
-			"$F.notContains: unsupported container type %T (string, list or dict expected)", container)
+			"%s: unsupported container type %T (string, list or dict expected)", op, container)
 	}
 }
 

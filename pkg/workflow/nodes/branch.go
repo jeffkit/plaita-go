@@ -15,6 +15,7 @@ import (
 
 	"github.com/jeffkit/plaita-go/internal/types"
 	"github.com/jeffkit/plaita-go/pkg/expression"
+	"github.com/jeffkit/plaita-go/pkg/expression/plaitaexpr"
 )
 
 var jsonAPI = jsoniter.Config{
@@ -176,41 +177,11 @@ func (l LogicCondition) MatchContext(ctx context.Context) (bool, *MatchInfo, err
 // 条件算子实现（issue #3）。
 //
 // Python 权威：plaita/plaita/node/decide.py 的 Condition.match +
-// condition_matcher。语义与 pkg/expression/plaitaexpr 的 plaitaEqual /
-// plaitaCompare / plaitaContains 同源（$F.eq/gt/in 与条件算子同一套语义，
-// 不得再分裂）。plaitaexpr 侧这三个函数目前未导出，这里按其语义镜像实现；
-// 两侧必须保持一致，$F 侧导出后应删除本组镜像、改为直接调用。
+// condition_matcher。比较语义与 pkg/expression/plaitaexpr 的 Equal /
+// Compare / Contains 同源（$F.eq/gt/in 与条件算子同一套语义）——plaitaexpr
+// 导出后这里的镜像实现已删除，以下一律直调导出版本；薄包装只负责 compareFunc
+// 签名适配与错误消息里的算子名。
 // ---------------------------------------------------------------------------
-
-// conditionNumericOf mirrors plaitaexpr.numericOf: bool IS numeric (Python
-// int subclass, True == 1), int/float compare cross-type, json.Number is
-// numeric; strings are deliberately NOT numeric ("1" == 1 is False in
-// Python) and nil is not numeric.
-func conditionNumericOf(v any) (float64, bool) {
-	switch t := v.(type) {
-	case bool:
-		if t {
-			return 1, true
-		}
-		return 0, true
-	case json.Number:
-		f, err := t.Float64()
-		return f, err == nil
-	case string, nil:
-		return 0, false
-	}
-	rv := reflect.ValueOf(v)
-	switch rv.Kind() {
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return float64(rv.Int()), true
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return float64(rv.Uint()), true
-	case reflect.Float32, reflect.Float64:
-		return rv.Float(), true
-	default:
-		return 0, false
-	}
-}
 
 // isNone reports whether v is plaita's None. Python has a single None; Go's
 // typed nils (nil slice/map/pointer inside an interface) must count as None
@@ -228,154 +199,34 @@ func isNone(v any) bool {
 	}
 }
 
-// plaitaEqual mirrors plaitaexpr.plaitaEqual (Python `==` for the expression
-// value domain): nil == nil, cross-type numeric equality (1 == 1.0,
-// True == 1), exact string equality, deep structural equality for
-// slices/maps. Unrelated types are not equal; nothing panics on
-// map/slice operands.
-func plaitaEqual(l, r any) bool {
-	if l == nil || r == nil {
-		return l == nil && r == nil
-	}
-	if lf, ok := conditionNumericOf(l); ok {
-		if rf, ok := conditionNumericOf(r); ok {
-			return lf == rf
-		}
-		return false
-	}
-	if ls, ok := l.(string); ok {
-		rs, ok := r.(string)
-		return ok && ls == rs
-	}
-	lv, rv := reflect.ValueOf(l), reflect.ValueOf(r)
-	switch lv.Kind() {
-	case reflect.Slice, reflect.Array:
-		switch rv.Kind() {
-		case reflect.Slice, reflect.Array:
-			if lv.Len() != rv.Len() {
-				return false
-			}
-			for i := 0; i < lv.Len(); i++ {
-				if !plaitaEqual(lv.Index(i).Interface(), rv.Index(i).Interface()) {
-					return false
-				}
-			}
-			return true
-		}
-	case reflect.Map:
-		if rv.Kind() == reflect.Map {
-			if lv.Len() != rv.Len() {
-				return false
-			}
-			for _, key := range lv.MapKeys() {
-				other := rv.MapIndex(key)
-				if !other.IsValid() {
-					return false
-				}
-				if !plaitaEqual(lv.MapIndex(key).Interface(), other.Interface()) {
-					return false
-				}
-			}
-			return true
-		}
-	}
-	return false
-}
-
-// plaitaCompare mirrors plaitaexpr.plaitaCompare (Python ordering operators):
-// numbers (int/float/bool cross-type) compare numerically, strings compare
-// lexicographically (string only against string); anything else — including
-// mixed number/string — is Python TypeError, propagated as an error instead
-// of a silent cast.
-func plaitaCompare(op string, l, r any) (int, error) {
-	if lf, ok := conditionNumericOf(l); ok {
-		if rf, ok := conditionNumericOf(r); ok {
-			switch {
-			case lf < rf:
-				return -1, nil
-			case lf > rf:
-				return 1, nil
-			default:
-				return 0, nil
-			}
-		}
-	}
-	if ls, ok := l.(string); ok {
-		if rs, ok := r.(string); ok {
-			return strings.Compare(ls, rs), nil
-		}
-	}
-	return 0, fmt.Errorf("%s: unsupported operand types: %T and %T", op, l, r)
-}
-
-// plaitaContains mirrors plaitaexpr.plaitaContains (Python `needle in
-// container`): string container does substring test (needle must be a
-// string), slice container does membership via ==, map container tests keys.
-// Anything else is Python TypeError, propagated as an error.
-func plaitaContains(op string, container, needle any) (bool, error) {
-	if isNone(container) {
-		return false, fmt.Errorf("%s: argument of type 'NoneType' is not a container", op)
-	}
-	if s, ok := container.(string); ok {
-		ns, ok := needle.(string)
-		if !ok {
-			return false, fmt.Errorf("%s: 'in <string>' requires string as left operand, got %T", op, needle)
-		}
-		return strings.Contains(s, ns), nil
-	}
-	rv := reflect.ValueOf(container)
-	switch rv.Kind() {
-	case reflect.Slice, reflect.Array:
-		for i := 0; i < rv.Len(); i++ {
-			if plaitaEqual(rv.Index(i).Interface(), needle) {
-				return true, nil
-			}
-		}
-		return false, nil
-	case reflect.Map:
-		// Python dict: `b in a` tests keys via hash+==. A needle whose type
-		// can never equal the key type is simply not contained.
-		if isNone(needle) {
-			return false, nil
-		}
-		key := reflect.ValueOf(needle)
-		if !key.IsValid() || key.Type() != rv.Type().Key() {
-			return false, nil
-		}
-		return rv.MapIndex(key).IsValid(), nil
-	default:
-		return false, fmt.Errorf("%s: unsupported container type %T (string, list or dict expected)", op, container)
-	}
-}
-
 func gte(l, r any) (bool, error) {
-	c, err := plaitaCompare("gte", l, r)
+	c, err := plaitaexpr.Compare("gte", l, r)
 	return c >= 0, err
 }
 
 func gt(l, r any) (bool, error) {
-	c, err := plaitaCompare("gt", l, r)
+	c, err := plaitaexpr.Compare("gt", l, r)
 	return c > 0, err
 }
 
 func lt(l, r any) (bool, error) {
-	c, err := plaitaCompare("lt", l, r)
+	c, err := plaitaexpr.Compare("lt", l, r)
 	return c < 0, err
 }
 
 func lte(l, r any) (bool, error) {
-	c, err := plaitaCompare("lte", l, r)
+	c, err := plaitaexpr.Compare("lte", l, r)
 	return c <= 0, err
 }
 
 // eq is Python `left == right` (decide.py CONDITION_OP_EQ). Never panics on
 // map/slice operands (deep structural compare); never silently casts.
 func eq(l, r any) (bool, error) {
-	return plaitaEqual(l, r), nil
+	return plaitaexpr.Equal(l, r), nil
 }
 
 func ne(l, r any) (bool, error) {
-	return !plaitaEqual(l, r), nil
+	return !plaitaexpr.Equal(l, r), nil
 }
 
 // between/notBetween are plaita-go extensions (plaita's default condition
@@ -419,11 +270,11 @@ func notBetween(l, r any) (bool, error) {
 // in is Python `left in right` (decide.py CONDITION_OP_IN): right may be a
 // string (substring test), a list (membership via ==) or a dict (key test).
 func in(l, r any) (bool, error) {
-	return plaitaContains("in", r, l)
+	return plaitaexpr.Contains("in", r, l)
 }
 
 func notIn(l, r any) (bool, error) {
-	contained, err := plaitaContains("notIn", r, l)
+	contained, err := plaitaexpr.Contains("notIn", r, l)
 	if err != nil {
 		return false, err
 	}
@@ -449,11 +300,11 @@ func like(l, r any) (bool, error) {
 // right side is contained in the left (string substring, slice element, or
 // map key).
 func contains(l, r any) (bool, error) {
-	return plaitaContains("contains", l, r)
+	return plaitaexpr.Contains("contains", l, r)
 }
 
 func notContains(l, r any) (bool, error) {
-	contained, err := plaitaContains("notContains", l, r)
+	contained, err := plaitaexpr.Contains("notContains", l, r)
 	if err != nil {
 		return false, err
 	}
