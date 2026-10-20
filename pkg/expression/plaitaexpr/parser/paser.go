@@ -50,8 +50,19 @@ const (
 	// branching node (plaita system key $BRANCH / context.last_branch). It
 	// is a scalar root: it has no sub-paths.
 	ValueSourceBranch ValueSource = "BRANCH"
-	ValueNULL         ValueSource = "NULL"
-	ValueEmptyString  ValueSource = "EMPTYSTRING"
+	// ValueSourceFlowID is the id of the flow the current execution runs
+	// (plaita system key $FLOW_ID, setup_flow). Scalar root. ValueSourceFlow
+	// is its documented alias ($FLOW).
+	ValueSourceFlowID ValueSource = "FLOW_ID"
+	ValueSourceFlow   ValueSource = "FLOW"
+	// ValueSourceLastNode is the id of the last completed node (plaita
+	// system key $LAST_NODE / context.last_node). Scalar root.
+	ValueSourceLastNode ValueSource = "LAST_NODE"
+	// ValueSourceExecutionID is the distributed execution id (plaita system
+	// key $EXECUTION_ID, setup_flow). Scalar root.
+	ValueSourceExecutionID ValueSource = "EXECUTION_ID"
+	ValueNULL              ValueSource = "NULL"
+	ValueEmptyString       ValueSource = "EMPTYSTRING"
 )
 
 var builtinValueSources = []ValueSource{
@@ -62,7 +73,12 @@ var builtinValueSources = []ValueSource{
 	ValueSourceENV,
 	ValueSourceGlobal,
 	ValueSourceBranch,
+	ValueSourceFlowID,
+	ValueSourceFlow,
+	ValueSourceLastNode,
+	ValueSourceExecutionID,
 	ValueNULL,
+	ValueEmptyString,
 }
 
 // VariableExpr variable expression

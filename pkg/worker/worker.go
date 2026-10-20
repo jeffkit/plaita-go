@@ -66,18 +66,16 @@ import (
 //
 // Still out of scope (phase 3):
 //
-//	TODO(phase-3): per-step state persistence (PERSIST_EVERY_N_STEPS=1, §5.2)
-//	        — the progress heartbeat (ttl/3) stands in for it.
 //	TODO(phase-3): task age gate (PLAITA_TASK_MAX_AGE_SECONDS, §1.2) and the
 //	        tenant quota / dedup-key idempotency paths.
 //	Landed since M6: the node-retry carrier conversion (§9.1 #91) — a
 //	        retryable failure re-enqueues a resume/continue carrier whenever a
 //	        state row exists (retry.go), after snapshotting a failure-boundary
 //	        checkpoint; the continue arrival path advances the live execution
-//	        (continueRunning). The engine has no mid-flow entry yet, so the
-//	        continuation re-enters at the flow start (completed predecessors
-//	        re-run); everything around the engine call — lease, fingerprint
-//	        gate, history carry, checkpoint lifecycle — is the resume path's.
+//	        (continueRunning) through the engine's mid-flow entry
+//	        (Workflow.ResumeFrom) whenever a usable checkpoint exists,
+//	        falling back to a flow-start re-entry (with a timeline event)
+//	        only when it does not (§9.1 fresh-run parity).
 
 // runContextKey carries the executionRun through the engine execution
 // context so the global engine event listeners can correlate events to the
@@ -113,7 +111,8 @@ type Worker struct {
 	retries  *RetryBudgets
 
 	// M6 checkpoint v1.5: resumable snapshots + suspended-node wake-up
-	// subscriptions (§9.2 decision carriers).
+	// subscriptions (§9.2 decision carriers); #32 per-step checkpoints ride
+	// the same store (kind=per-step) as the mid-flow resume position.
 	checkpoints *RedisCheckpointStore
 	eventSubs   *EventSubscriptions
 
@@ -452,10 +451,15 @@ type executePlan struct {
 	// resume, when non-nil, turns the engine call into Workflow.Resume
 	// (suspended → event/timeout/cancel carrier) instead of Workflow.Execute.
 	resume *resumeInput
+	// midflow, when non-nil, turns the engine call into Workflow.ResumeFrom
+	// (#32): a continue/retry carrier advancing a live execution enters at
+	// the checkpoint's recorded position instead of replaying from the flow
+	// start. Only set for a usable mid-flow checkpoint (kind=per-step or a
+	// legacy continue-typed snapshot).
+	midflow *workflow.Checkpoint
 	// continuation marks a continue/retry carrier advancing a live (running)
-	// execution (§9.1 conversion target): the engine call stays
-	// Workflow.Execute, but the row's node_timings/timeline are carried
-	// forward so the terminal row reads as one execution (§5.1).
+	// execution (§9.1 conversion target); the row's node_timings/timeline are
+	// carried forward so the terminal row reads as one execution (§5.1).
 	continuation bool
 }
 
@@ -514,19 +518,22 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 	ctx = withRun(runCtx, run)
 	// M6: the engine writes the checkpoint and registers the wake-up
 	// subscription at a suspend boundary; the worker owns both stores.
+	// #32: StepCheckpoint=1 (§5.2 PERSIST_EVERY_N_STEPS=1) also records the
+	// live execution's position after every completed root node, so a
+	// continue/retry carrier enters mid-flow instead of replaying.
 	ctx = workflow.WithSuspendOptions(ctx, &workflow.SuspendOptions{
-		ExecutionID:   task.ExecutionID,
-		TenantID:      tenant,
-		FlowID:        task.FlowID,
-		Store:         w.checkpoints,
-		Subscriptions: w.eventSubs,
+		ExecutionID:    task.ExecutionID,
+		TenantID:       tenant,
+		FlowID:         task.FlowID,
+		Store:          w.checkpoints,
+		Subscriptions:  w.eventSubs,
+		StepCheckpoint: 1,
 	})
-	// Sandbox execution scope (pkg/sandbox resolution order: ctx value >
-	// PLAITA_EXECUTION_ID env > $GLOBAL): threading the real execution id
-	// makes the workspace identity {execution_id}:{ws_key} stable, so a
-	// retried/resumed carrier re-attaches to the same sandbox instead of
-	// falling back to the (node, input) hash scope.
+	// The real execution id for the engine context ($EXECUTION_ID): the
+	// sandbox scope reads it via sandbox.ExecutionIDFromContext, the engine
+	// runtime seeds $EXECUTION_ID from the same value.
 	ctx = sandbox.WithExecutionID(ctx, task.ExecutionID)
+	ctx = runtime.WithExecutionID(ctx, task.ExecutionID)
 	w.registerRun(run, cancelRun)
 	defer w.unregisterRun(run)
 	defer w.dropOrphan(task.ExecutionID, "run ended")
@@ -623,11 +630,39 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 		}
 	}()
 
+	// §9.1 fresh-run parity made observable (#32): a continue/retry carrier
+	// whose execution has no usable mid-flow checkpoint degrades to a
+	// flow-start re-entry — record that in the timeline so operators can see
+	// the fallback (and its replayed predecessors) instead of reading the
+	// silence as a mid-flow continuation.
+	if plan.continuation && plan.midflow == nil {
+		ev := run.recordTimeline("continue_fallback_start", map[string]any{
+			"reason": "no mid-flow checkpoint; re-entering at flow start",
+		})
+		w.publishExecutionEvent(ctx, run.executionID, ev)
+	}
+
 	var result any
 	var execErr error
-	if plan.resume != nil {
+	switch {
+	case plan.resume != nil:
 		result, execErr = def.Workflow.Resume(ctx, plan.resume.checkpoint, plan.resume.resumeType, plan.resume.data)
-	} else {
+	case plan.midflow != nil:
+		// #32 mid-flow entry: continue the live execution at the checkpoint's
+		// recorded position; completed predecessors are not replayed. A
+		// REFUSED entry (stale checkpoint, guard rejection, unrestorable
+		// snapshot) happens strictly before any node executes, so the issue's
+		// fallback applies: re-enter at the flow start with the fallback on
+		// the record (§9.1 fresh-run parity).
+		result, execErr = def.Workflow.ResumeFrom(ctx, plan.midflow, "")
+		if midFlowEntryRefused(execErr) {
+			ev := run.recordTimeline("continue_fallback_start", map[string]any{
+				"reason": fmt.Sprintf("mid-flow entry refused: %v", execErr),
+			})
+			w.publishExecutionEvent(ctx, run.executionID, ev)
+			result, execErr = def.Workflow.Execute(ctx, task.Params)
+		}
+	default:
 		result, execErr = def.Workflow.Execute(ctx, task.Params)
 	}
 	susp := workflow.AsSuspend(execErr)
@@ -873,13 +908,15 @@ func (w *Worker) resumeSuspended(ctx context.Context, task *Task, state *Executi
 // continue/retry carrier — the arrival half of the §9.1 retry-carrier
 // conversion (Python resume_flow: running + continue/retry share one stepping
 // path, "必须真实重派"). Python resumes from its per-step checkpoint; this
-// build re-enters the engine at the flow start (no mid-flow entry yet —
-// documented engine-scope deviation), but the surrounding dispositions are
-// the resume path's: flow-id gate, §7 fingerprint hard gate, history carry
-// (executeAndFinalize seeding), checkpoint lifecycle and the §5.2 terminal
-// write. A failure-boundary checkpoint written by the requeue path is the
-// resume-position evidence; its absence is NOT fatal (Python: continue
-// without a saved context degrades to a fresh run of the same execution).
+// build enters the engine mid-flow through Workflow.ResumeFrom (#32) whenever
+// a usable checkpoint exists (kind=per-step, or a legacy continue-typed
+// snapshot): the execution continues at the checkpoint's next node and
+// completed predecessors are NOT replayed. Without one the carrier degrades
+// to the fresh-run parity of a flow-start re-entry (§9.1) and the fallback is
+// recorded in the timeline (executeAndFinalize). The surrounding dispositions
+// are the resume path's either way: flow-id gate, §7 fingerprint hard gate,
+// history carry (executeAndFinalize seeding), checkpoint lifecycle and the
+// §5.2 terminal write.
 func (w *Worker) continueRunning(ctx context.Context, task *Task, state *ExecutionState, handle *LeaseHandle) error {
 	tenant := task.TenantID
 	flowID := task.FlowID
@@ -890,24 +927,64 @@ func (w *Worker) continueRunning(ctx context.Context, task *Task, state *Executi
 	if err != nil || def == nil {
 		return err
 	}
-	if cp, cerr := w.checkpoints.LoadCheckpoint(ctx, tenant, task.ExecutionID); cerr != nil {
-		// A real read failure stays pending; a missing checkpoint proceeds.
-		return fmt.Errorf("continue checkpoint probe: %w", cerr)
-	} else if cp != nil {
-		w.logger.Info("continue carrier resuming a live execution (checkpoint position recorded)",
-			"execution_id", task.ExecutionID, "resume_type", task.ResumeType,
-			"checkpoint_node", string(cp.SuspendedNode))
-	} else {
-		w.logger.Warn("continue carrier resuming a live execution without a checkpoint (fresh-run parity)",
-			"execution_id", task.ExecutionID, "resume_type", task.ResumeType)
-	}
-	return w.executeAndFinalize(ctx, executePlan{
+	plan := executePlan{
 		task:         task,
 		def:          def,
 		handle:       handle,
 		state:        state,
 		continuation: true,
-	})
+	}
+	if cp, cerr := w.checkpoints.LoadCheckpoint(ctx, tenant, task.ExecutionID); cerr != nil {
+		// A real read failure stays pending; a missing checkpoint proceeds.
+		return fmt.Errorf("continue checkpoint probe: %w", cerr)
+	} else if midFlowEntryUsable(cp) {
+		plan.midflow = cp
+		w.logger.Info("continue carrier entering the execution mid-flow",
+			"execution_id", task.ExecutionID, "resume_type", task.ResumeType,
+			"checkpoint_node", string(cp.SuspendedNode), "entry_node", string(cp.NextNode))
+	} else {
+		w.logger.Warn("continue carrier resuming a live execution without a mid-flow checkpoint (fresh-run parity)",
+			"execution_id", task.ExecutionID, "resume_type", task.ResumeType)
+	}
+	return w.executeAndFinalize(ctx, plan)
+}
+
+// midFlowEntryRefused reports whether a Workflow.ResumeFrom error means the
+// mid-flow entry itself was refused BEFORE any node executed (guard rejection
+// on a stale/inapplicable checkpoint, or an unrestorable snapshot) — the #32
+// fallback then re-enters at the flow start. Node/flow failures after the
+// entry are NOT refusals: they take the ordinary §9.1 retry classification.
+func midFlowEntryRefused(err error) bool {
+	if err == nil {
+		return false
+	}
+	var guard *workflow.ResumeGuardError
+	if errors.As(err, &guard) {
+		return true
+	}
+	var snap *workflow.StateSnapshotError
+	return errors.As(err, &snap)
+}
+
+// midFlowEntryUsable reports whether cp records a position Workflow.ResumeFrom
+// may enter at: an engine per-step checkpoint (kind=per-step) or a legacy
+// continue-typed snapshot (kind empty, resume_type=continue — written by
+// workers before the kind field existed), and only when it carries an entry
+// node. A suspend checkpoint is NOT usable: its position is a parked
+// suspending node, and stepping past it would skip the pending state — that
+// path belongs to Workflow.Resume.
+func midFlowEntryUsable(cp *workflow.Checkpoint) bool {
+	if cp == nil || cp.NextNode == "" {
+		return false
+	}
+	switch cp.Kind {
+	case workflow.CheckpointKindPerStep:
+		return true
+	case "":
+		return cp.ResumeType == workflow.ResumeContinue
+	default:
+		return false
+	}
 }
 
 // loadContinuationDefinition resolves the flow for a resume-path advance and
@@ -1084,10 +1161,12 @@ func (w *Worker) classifyNodeFailure(ctx context.Context, tenant string, handle 
 // saveFailureCheckpoint snapshots the runtime context captured at flow end
 // (rootRuntime holds the live context even for a failed attempt) into the
 // execution's checkpoint key. The snapshot carries the completed-node results
-// ($NODE), $LAST_NODE and the failure's $ERROR — the position a continue
-// carrier would resume from. Snapshot/persist failures only warn: losing the
-// evidence degrades the next carrier to fresh-run parity, never blocks the
-// retry.
+// ($NODE), $LAST_NODE and the failure's $ERROR; kind=per-step with
+// next_node=failed node marks it as a mid-flow entry (#32): the converted
+// continue/retry carrier re-executes the failed node and steps on, instead of
+// replaying the flow from its start. Snapshot/persist failures only warn:
+// losing the evidence degrades the next carrier to fresh-run parity, never
+// blocks the retry.
 func (w *Worker) saveFailureCheckpoint(ctx context.Context, tenant string, state *ExecutionState, run *executionRun) {
 	if run == nil {
 		return
@@ -1113,6 +1192,7 @@ func (w *Worker) saveFailureCheckpoint(ctx context.Context, tenant string, state
 	}
 	cp := &workflow.Checkpoint{
 		SchemaVersion: workflow.CheckpointSchemaVersion,
+		Kind:          workflow.CheckpointKindPerStep,
 		ExecutionID:   state.ExecutionID,
 		TenantID:      tenant,
 		FlowID:        state.FlowID,
@@ -1120,6 +1200,14 @@ func (w *Worker) saveFailureCheckpoint(ctx context.Context, tenant string, state
 		ResumeType:    workflow.ResumeContinue,
 		Context:       snap,
 		CreatedAt:     nowISO(),
+	}
+	// Retry semantics: the failed node never completed, so the mid-flow entry
+	// re-executes IT (not its successor). Without a known failed node there is
+	// no entry position — the checkpoint stays without next_node and the next
+	// carrier degrades to fresh-run parity (midFlowEntryUsable).
+	if nodeID := run.failedNode; nodeID != "" {
+		cp.SuspendedNode = workflow.NodeID(nodeID)
+		cp.NextNode = workflow.NodeID(nodeID)
 	}
 	if err := w.checkpoints.SaveCheckpoint(ctx, cp); err != nil {
 		w.logger.Warn("failure checkpoint persist failed; retry carrier continues without one",
@@ -1129,9 +1217,8 @@ func (w *Worker) saveFailureCheckpoint(ctx context.Context, tenant string, state
 
 // resetRetryProgress clears the retry counters for every node that advanced
 // (§9.1). The total/deterministic counters are cleared only when the run
-// completed: this build replays the whole flow on retry (no checkpoint
-// resume), so the always-successful start node must not reset the
-// consecutive-failure ceilings.
+// completed: a mid-flow continuation leaves the consecutive-failure ceilings
+// alone until the whole execution reaches its terminal row.
 func (w *Worker) resetRetryProgress(ctx context.Context, tenant, executionID string, run *executionRun) {
 	if run == nil {
 		return

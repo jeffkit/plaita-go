@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"crypto/rand"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -36,7 +38,18 @@ type Context struct {
 	// LastBranch is the branch target taken by the most recent branching
 	// node (plaita runner: context.last_branch = result for node.branching
 	// nodes; nil until one has run). Read by expressions as $BRANCH.
-	LastBranch        any            `json:"last_branch,omitempty"`
+	LastBranch any `json:"last_branch,omitempty"`
+	// FlowID is the id of the flow this execution context belongs to
+	// (plaita setup_flow: $FLOW_ID). A child flow without its own id keeps
+	// the parent's value (plaita child fallback). Read by expressions as
+	// $FLOW_ID / $FLOW.
+	FlowID string `json:"flow_id,omitempty"`
+	// ExecutionID is the distributed execution id (plaita setup_flow:
+	// $EXECUTION_ID). The root execution gets it from the worker's ctx
+	// injection (runtime.WithExecutionID) or mints a uuid; child/loop/
+	// parallel sub-executions inherit the root's value, so every level of
+	// one execution correlates under the same id.
+	ExecutionID       string         `json:"execution_id,omitempty"`
 	ExecuteNodeErrors map[string]any `json:"errors"`
 	EnvVariables      map[string]any `json:"env_variables"`
 	GlobalVariables   map[string]any `json:"global_variables"`
@@ -287,6 +300,36 @@ func (c *Context) GetLastBranch() any {
 	return c.LastBranch
 }
 
+// WithFlowID records the flow id of the execution this context belongs to
+// (plaita setup_flow: $FLOW_ID).
+func (c *Context) WithFlowID(flowID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.FlowID = flowID
+}
+
+// GetFlowID returns the flow id ($FLOW_ID / $FLOW); empty before the flow
+// set it (plaita: the root always has one, a child falls back to its parent).
+func (c *Context) GetFlowID() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.FlowID
+}
+
+// WithExecutionID records the distributed execution id ($EXECUTION_ID).
+func (c *Context) WithExecutionID(executionID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ExecutionID = executionID
+}
+
+// GetExecutionID returns the distributed execution id ($EXECUTION_ID).
+func (c *Context) GetExecutionID() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.ExecutionID
+}
+
 // WithGlobalVariables sets the global variables in context.
 func (c *Context) WithGlobalVariables(variables map[string]any) {
 	c.mu.Lock()
@@ -353,6 +396,32 @@ func LastNodeID(ctx context.Context) types.NodeID {
 	return WorkflowRuntimeContext(ctx).GetLastNodeID()
 }
 
+// executionIDContextKey carries the host's execution id for the current
+// engine execution (the worker injects it via WithExecutionID before
+// Execute/Resume so $EXECUTION_ID reflects the real distributed id instead
+// of a bare-engine uuid).
+type executionIDContextKey struct{}
+
+// WithExecutionID attaches the host's execution id to ctx. Workflow.Execute
+// reads it when seeding the root execution context ($EXECUTION_ID); child /
+// loop / parallel sub-executions inherit the value from the root context.
+func WithExecutionID(ctx context.Context, executionID string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, executionIDContextKey{}, executionID)
+}
+
+// ExecutionIDFromContext returns the execution id attached by
+// WithExecutionID, or "".
+func ExecutionIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	id, _ := ctx.Value(executionIDContextKey{}).(string)
+	return id
+}
+
 // WithWorkflowRuntimeContext returns a new context with workflow runtime context.
 func WithWorkflowRuntimeContext(ctx context.Context, workflowRuntimeContext *Context) context.Context {
 	if workflowRuntimeContext == nil {
@@ -403,6 +472,10 @@ func ResetWorkflowRuntimeContext(ctx context.Context) context.Context {
 //     spawned this execution; a root flow has no parent and $PARENT stays nil.
 //   - The parent's global variables are copied in ($GLOBAL falls back to the
 //     parent in plaita; the copy is the Go encoding of that fallback).
+//   - The parent's flow id and execution id are inherited ($FLOW_ID /
+//     $EXECUTION_ID child fallback, plaita setup_flow): a sub-flow with its
+//     own id overrides the flow id afterwards, the execution id stays shared
+//     so every level of one distributed execution correlates.
 func NewExecutionRuntimeContext(ctx context.Context) *Context {
 	fresh := newContext()
 	parent, ok := LookupWorkflowRuntimeContext(ctx)
@@ -412,10 +485,37 @@ func NewExecutionRuntimeContext(ctx context.Context) *Context {
 	if parent.ParentWorkflowContext != nil {
 		fresh.ParentWorkflowContext = parent.ParentWorkflowContext
 	}
+	// The parent chain has up to two levels (child/loop nodes wrap the parent
+	// execution in a raw seed context): the immediate rc and, through the
+	// seed's $PARENT link, the real parent execution. Both carry inheritable
+	// identity; the immediate one wins.
+	if parent.FlowID != "" {
+		fresh.FlowID = parent.FlowID
+	}
+	if parent.ExecutionID != "" {
+		fresh.ExecutionID = parent.ExecutionID
+	}
 	if parentRuntime := WorkflowRuntimeContext(parent.ParentWorkflowContext); parentRuntime != nil {
 		fresh.WithGlobalVariables(parentRuntime.GetGlobalVariables())
+		if fresh.FlowID == "" {
+			fresh.FlowID = parentRuntime.FlowID
+		}
+		if fresh.ExecutionID == "" {
+			fresh.ExecutionID = parentRuntime.ExecutionID
+		}
 	}
 	return fresh
+}
+
+// NewExecutionUUID mints a uuid4 in the canonical dashed form (plaita
+// execution_id = str(uuid.uuid4())). The bare-engine fallback for a root
+// execution whose host did not inject one via WithExecutionID.
+func NewExecutionUUID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 // CloneContext deep clone the workflow runtime context from context. The
@@ -439,6 +539,8 @@ func CloneContext(ctx context.Context) context.Context {
 	newRuntimeCtx.LastNodeID = runtimeCtx.LastNodeID
 	newRuntimeCtx.LastBranch = runtimeCtx.LastBranch
 	newRuntimeCtx.FlowDeadline = runtimeCtx.FlowDeadline
+	newRuntimeCtx.FlowID = runtimeCtx.FlowID
+	newRuntimeCtx.ExecutionID = runtimeCtx.ExecutionID
 	runtimeCtx.mu.RUnlock()
 	newRuntimeCtx.ParentWorkflowContext = ctx
 	return WithWorkflowRuntimeContext(ctx, newRuntimeCtx)

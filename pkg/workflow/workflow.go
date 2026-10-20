@@ -241,13 +241,42 @@ func (f *Workflow) Execute(ctx context.Context, args ExecuteArgs) (any, error) {
 //     allowlist — an undeclared allowlist (nil) inherits the parent
 //     execution's filtered env, a declared one re-filters os.Environ, and
 //     with neither $ENV stays empty (fail-closed);
-//   - the flow's own globals override the inherited ones.
+//   - the flow's own globals override the inherited ones;
+//   - $FLOW_ID (alias $FLOW) is the flow's own id; a sub-flow without one
+//     keeps the parent's (plaita child fallback) — and the effective flow id
+//     is also written into $GLOBAL.flow_id (plaita setup_flow);
+//   - $EXECUTION_ID is the host-injected execution id (runtime.
+//     WithExecutionID, wired by the worker), inherited from the parent
+//     execution when the host did not inject one at this level, or a fresh
+//     uuid for a bare-engine root run.
 func (f *Workflow) prepareExecutionRuntimeContext(ctx context.Context, args ExecuteArgs) context.Context {
 	fresh := runtime.NewExecutionRuntimeContext(ctx)
 	_, hadParent := runtime.LookupWorkflowRuntimeContext(ctx)
 	ctx = runtime.WithWorkflowRuntimeContext(ctx, fresh)
 	ctx = runtime.WithWorkflowInput(ctx, args)
 	fresh.WithGlobalVariables(f.Context.ParseGlobal())
+
+	// $FLOW_ID / $GLOBAL.flow_id (plaita setup_flow): the flow's own id wins;
+	// NewExecutionRuntimeContext already inherited the parent's, so a
+	// sub-flow without its own id keeps it. The effective id lands in
+	// $GLOBAL.flow_id too (an explicit global of the same name is the flow
+	// config's, which setup_flow overwrites).
+	if flowID := string(f.ID); flowID != "" {
+		fresh.WithFlowID(flowID)
+	}
+	if flowID := fresh.GetFlowID(); flowID != "" {
+		fresh.WithGlobalVariable("flow_id", flowID)
+	}
+
+	// $EXECUTION_ID: the host's injected id wins (worker wiring); otherwise
+	// the value inherited from the parent execution stands (child/loop/
+	// parallel sub-executions correlate under the root's id); a root run
+	// without either mints a uuid.
+	if execID := runtime.ExecutionIDFromContext(ctx); execID != "" {
+		fresh.WithExecutionID(execID)
+	} else if fresh.GetExecutionID() == "" {
+		fresh.WithExecutionID(runtime.NewExecutionUUID())
+	}
 
 	// $ENV assembly (plaita 0.5.0 allowlist model, fail-closed):
 	//   - declared allowlist (non-empty) → filter os.Environ through it;
@@ -287,10 +316,12 @@ func (f *Workflow) execute(ctx context.Context, _ ExecuteArgs) (result any, err 
 }
 
 // runNodes advances the flow from node. It is shared by the start path
-// (execute) and the resume path (Resume continues from the resumed node's
-// next pointer), so both use exactly the same step bookkeeping and suspend
-// detection.
+// (execute), the resume path (Resume continues from the resumed node's next
+// pointer) and the mid-flow entry (ResumeFrom continues at the checkpoint's
+// next node), so all three use exactly the same step bookkeeping, per-step
+// checkpointing and suspend detection.
 func (f *Workflow) runNodes(ctx context.Context, node Node) (any, error) {
+	completed := 0
 	for node != nil {
 		result, err := f.executeNode(ctx, node)
 		if err != nil {
@@ -312,6 +343,15 @@ func (f *Workflow) runNodes(ctx context.Context, node Node) (any, error) {
 		runtimeCtx := runtime.WorkflowRuntimeContext(ctx)
 		runtimeCtx.WithExecuteNodeResult(node.GetID(), result.Result)
 		runtimeCtx.WithLastNodeID(node.GetID())
+
+		// #32 per-step checkpoint: record the live execution's position
+		// (completed node + upcoming node) per the host's policy, before
+		// advancing. A failure fails the step: a silently stale checkpoint
+		// would misroute a later continue carrier.
+		completed++
+		if err := f.stepCheckpoint(ctx, node, result.NextNode, completed); err != nil {
+			return nil, err
+		}
 
 		node, err = f.findNodeByID(result.NextNode)
 		if err != nil {

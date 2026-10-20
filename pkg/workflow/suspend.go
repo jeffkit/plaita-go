@@ -101,6 +101,15 @@ type SuspendOptions struct {
 	FlowID        string
 	Store         CheckpointStore
 	Subscriptions SubscriptionRegistry
+	// StepCheckpoint > 0 enables per-step checkpoints (#32): after every
+	// N-th completed ROOT-flow node the engine snapshots the execution
+	// context and saves a kind=per-step checkpoint (N=1: every step). The
+	// per-step checkpoint shares the execution's checkpoint key — it is the
+	// resume position a continue/retry carrier enters at (Workflow.
+	// ResumeFrom); a suspend boundary overwrites it while parked. 0 (the
+	// zero value) keeps the M6 behavior: checkpoints at suspend boundaries
+	// only.
+	StepCheckpoint int
 }
 
 type suspendOptionsKey struct{}
@@ -431,6 +440,7 @@ func (f *Workflow) buildCheckpoint(ctx context.Context, nodeID, next NodeID, sta
 	}
 	cp := &Checkpoint{
 		SchemaVersion: CheckpointSchemaVersion,
+		Kind:          CheckpointKindSuspend,
 		SuspendedNode: nodeID,
 		NextNode:      next,
 		ResumeType:    ResumeEvent,
@@ -451,4 +461,133 @@ func (f *Workflow) buildCheckpoint(ctx context.Context, nodeID, next NodeID, sta
 		}
 	}
 	return cp, nil
+}
+
+// --- per-step checkpoints + mid-flow entry (#32) ---------------------------
+//
+// M6 checkpoints only suspend boundaries; a continue/retry carrier advancing
+// a RUNNING execution had no engine entry point and re-entered at the flow
+// start, replaying every completed node (non-idempotent nodes repeated their
+// side effects). Two additions close that gap:
+//
+//   - stepCheckpoint: after each completed root-flow node (per the
+//     SuspendOptions.StepCheckpoint interval) the engine snapshots the
+//     execution context into a kind=per-step checkpoint whose next_node is
+//     the upcoming node — the resumable position of a live execution;
+//   - ResumeFrom: restore such a checkpoint and continue at its next node —
+//     only the remaining nodes execute.
+
+// stepCheckpoint is the per-step checkpoint hook runNodes calls after each
+// successfully completed node. step is the 1-based ordinal of completed nodes
+// within the current stepping session (a resumed session restarts the count —
+// the interval is a write-amplification knob, not a correctness knob).
+// Root-flow positions only: ResumeFrom re-enters the root flow, so a nested
+// (child/loop/parallel) position cannot be expressed and is not checkpointed
+// (same scope rule as suspend v1.5).
+func (f *Workflow) stepCheckpoint(ctx context.Context, completed Node, next NodeID, step int) error {
+	opts := SuspendOptionsFromContext(ctx)
+	if opts == nil || opts.Store == nil || opts.StepCheckpoint <= 0 {
+		return nil
+	}
+	if step%opts.StepCheckpoint != 0 {
+		return nil
+	}
+	rc := runtime.WorkflowRuntimeContext(ctx)
+	if rc.ParentWorkflowContext != nil {
+		return nil
+	}
+	snap, err := SnapshotRuntimeContext(ctx, opts)
+	if err != nil {
+		return err
+	}
+	flowID := opts.FlowID
+	if flowID == "" {
+		flowID = string(f.ID)
+	}
+	cp := &Checkpoint{
+		SchemaVersion: CheckpointSchemaVersion,
+		Kind:          CheckpointKindPerStep,
+		ExecutionID:   opts.ExecutionID,
+		TenantID:      opts.TenantID,
+		FlowID:        flowID,
+		SuspendedNode: completed.GetID(),
+		NextNode:      next,
+		ResumeType:    ResumeContinue,
+		Context:       snap,
+		CreatedAt:     isoNow(),
+	}
+	if err := opts.Store.SaveCheckpoint(ctx, cp); err != nil {
+		return fmt.Errorf("per-step checkpoint after node %s: %w", completed.GetID(), err)
+	}
+	return nil
+}
+
+// ResumeFrom is the mid-flow entry (#32): it restores cp (a kind=per-step
+// checkpoint written by stepCheckpoint, or an equivalent failure-boundary
+// snapshot) and continues the flow at nextNodeID — falling back to the
+// checkpoint's own next_node when nextNodeID is empty. Only the remaining
+// nodes execute: the completed predecessors carried by the snapshot's $NODE
+// are never replayed, so a non-idempotent node's side effect happens exactly
+// once.
+//
+// The sibling entries: Workflow.Execute starts a flow, Workflow.Resume wakes
+// a suspending node with a decision carrier (event/timeout/cancel), and
+// ResumeFrom continues a live execution from a recorded position. A
+// kind=suspend checkpoint is rejected (use Resume); a missing next node is a
+// ResumeGuardError, not a silent restart.
+//
+// Like Execute, ResumeFrom holds the instance's reentry guard: a concurrent
+// run on the same Workflow object is rejected with ErrWorkflowReentry.
+func (f *Workflow) ResumeFrom(ctx context.Context, cp *Checkpoint, nextNodeID NodeID) (result any, err error) {
+	if !f.running.CompareAndSwap(false, true) {
+		return nil, fmt.Errorf("workflow %q: %w", f.ID, ErrWorkflowReentry)
+	}
+	defer f.running.Store(false)
+
+	if cp == nil {
+		return nil, &ResumeGuardError{Message: "mid-flow resume requires a checkpoint, none was provided"}
+	}
+	if cp.Kind == CheckpointKindSuspend {
+		return nil, &ResumeGuardError{Message: fmt.Sprintf(
+			"checkpoint is parked at suspending node %s; use Workflow.Resume with a decision carrier",
+			cp.SuspendedNode)}
+	}
+	if cp.SchemaVersion <= 0 || cp.SchemaVersion > CheckpointSchemaVersion {
+		return nil, &ResumeGuardError{Message: fmt.Sprintf(
+			"checkpoint schema version %d is not supported by this engine (supported: 1..%d)",
+			cp.SchemaVersion, CheckpointSchemaVersion)}
+	}
+	if err := f.Validate(); err != nil {
+		return nil, err
+	}
+
+	ctx, err = RestoreRuntimeContext(ctx, cp.Context)
+	if err != nil {
+		return nil, err
+	}
+	// Same end-of-step contract as Resume: the host's OnFlowEnd listener is
+	// the capture point for the post-continuation runtime context; a fresh
+	// suspension inside the remaining nodes is reported without an error.
+	defer func() {
+		if susp := AsSuspend(err); susp != nil {
+			triggerFlowEnd(ctx, f, nil, nil)
+			return
+		}
+		triggerFlowEnd(ctx, f, result, err)
+	}()
+
+	nodeID := nextNodeID
+	if nodeID == "" {
+		nodeID = cp.NextNode
+	}
+	if nodeID == "" {
+		return nil, &ResumeGuardError{
+			Message: "mid-flow resume has no entry node: pass nextNodeID or a checkpoint with next_node"}
+	}
+	node, err := f.findNodeByID(nodeID)
+	if err != nil {
+		return nil, &ResumeGuardError{Message: fmt.Sprintf(
+			"mid-flow entry node %q is not part of flow %q", nodeID, f.ID)}
+	}
+	return f.runNodes(ctx, node)
 }

@@ -58,18 +58,31 @@ func execArgsFromRuntimeCtx(ctx context.Context) map[string]any {
 	// writing node results/globals while a background parallel branch
 	// evaluates $PARENT.<...> against this context (issue #17 -race).
 	execArgs := map[string]any{
-		string(parser.ValueSourceInput):  runtimeCtx.GetWorkflowInput(),
-		string(parser.ValueSourceNode):   runtimeCtx.GetExecuteNodeResults(),
-		string(parser.ValueSourceParent): execArgsFromRuntimeCtx(runtimeCtx.ParentWorkflowContext),
-		string(parser.ValueSourceENV):    runtimeCtx.GetEnvVariables(),
-		string(parser.ValueSourceERROR):  runtimeCtx.GetExecuteNodeErrors(),
-		string(parser.ValueSourceGlobal): runtimeCtx.GetGlobalVariables(),
-		string(parser.ValueSourceBranch): runtimeCtx.GetLastBranch(),
-		string(parser.ValueNULL):         nil,
-		string(parser.ValueEmptyString):  "",
+		string(parser.ValueSourceInput):       runtimeCtx.GetWorkflowInput(),
+		string(parser.ValueSourceNode):        runtimeCtx.GetExecuteNodeResults(),
+		string(parser.ValueSourceParent):      execArgsFromRuntimeCtx(runtimeCtx.ParentWorkflowContext),
+		string(parser.ValueSourceENV):         runtimeCtx.GetEnvVariables(),
+		string(parser.ValueSourceERROR):       runtimeCtx.GetExecuteNodeErrors(),
+		string(parser.ValueSourceGlobal):      runtimeCtx.GetGlobalVariables(),
+		string(parser.ValueSourceBranch):      runtimeCtx.GetLastBranch(),
+		string(parser.ValueSourceFlowID):      runtimeCtx.GetFlowID(),
+		string(parser.ValueSourceFlow):        runtimeCtx.GetFlowID(),
+		string(parser.ValueSourceLastNode):    lastNodeRootValue(runtimeCtx),
+		string(parser.ValueSourceExecutionID): runtimeCtx.GetExecutionID(),
+		string(parser.ValueNULL):              nil,
+		string(parser.ValueEmptyString):       "",
 	}
 	deepCopy(runtimeCtx.GetCurrentNodeContexts(), &execArgs)
 	return execArgs
+}
+
+// lastNodeRootValue renders $LAST_NODE: the last completed node's id, or nil
+// before any node has completed (plaita context.last_node is None then).
+func lastNodeRootValue(runtimeCtx *runtime.Context) any {
+	if id := runtimeCtx.GetLastNodeID(); id != "" {
+		return string(id)
+	}
+	return nil
 }
 
 func (e *Evaluator) evalFunc(
@@ -396,6 +409,21 @@ func (e *Evaluator) evalVariable(
 		// node (plaita runner: context.last_branch); nil until one has run
 		// (plaita None). Scalar root — no sub-paths.
 		return model.NewValue(runtimeCtx.GetLastBranch()), nil
+	case parser.ValueSourceFlowID, parser.ValueSourceFlow:
+		// $FLOW_ID (alias $FLOW) is the id of the flow this execution runs
+		// (plaita setup_flow); a child flow without its own id keeps the
+		// parent's value. Scalar root — no sub-paths.
+		return model.NewValue(runtimeCtx.GetFlowID()), nil
+	case parser.ValueSourceLastNode:
+		// $LAST_NODE is the id of the last completed node (plaita runner:
+		// context.last_node); nil before any node has run (plaita None).
+		// Scalar root — no sub-paths.
+		return model.NewValue(lastNodeRootValue(runtimeCtx)), nil
+	case parser.ValueSourceExecutionID:
+		// $EXECUTION_ID is the distributed execution id (plaita setup_flow);
+		// every level of one execution (root/child/branch) shares it.
+		// Scalar root — no sub-paths.
+		return model.NewValue(runtimeCtx.GetExecutionID()), nil
 	case parser.ValueNULL:
 		return model.NewValue(nil), nil
 	case parser.ValueEmptyString:

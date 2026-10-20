@@ -59,9 +59,22 @@ func snapshotErrorf(format string, args ...any) error {
 	return &StateSnapshotError{Message: fmt.Sprintf(format, args...)}
 }
 
+// Checkpoint kinds (#32): suspend boundaries (M6) and per-step positions
+// share the checkpoint store; the kind tells the resume entries apart. A
+// checkpoint written before the kind field existed has an empty kind —
+// readers treat that as a suspend boundary unless its resume_type says
+// otherwise (worker legacy fallback).
+const (
+	CheckpointKindSuspend = "suspend"
+	CheckpointKindPerStep = "per-step"
+)
+
 // Checkpoint is one resumable suspend boundary.
 type Checkpoint struct {
-	SchemaVersion int            `json:"schema_version"`
+	SchemaVersion int `json:"schema_version"`
+	// Kind discriminates suspend boundaries from per-step positions
+	// (CheckpointKind*); empty means a legacy suspend snapshot.
+	Kind          string         `json:"kind,omitempty"`
 	ExecutionID   string         `json:"execution_id,omitempty"`
 	TenantID      string         `json:"tenant_id,omitempty"`
 	FlowID        string         `json:"flow_id,omitempty"`
@@ -271,6 +284,21 @@ func snapshotRuntimeContext(rc *runtime.Context, opts *SuspendOptions, parentDep
 	if rc.LastBranch != nil {
 		out["$BRANCH"] = rc.LastBranch
 	}
+	// #11 system roots travel with every snapshot: the resumed run must see
+	// the same $FLOW_ID/$EXECUTION_ID the original run had. opts (the host's
+	// suspend wiring) keeps precedence for hosts that set them without
+	// seeding the runtime context.
+	flowID, executionID := rc.FlowID, rc.ExecutionID
+	if opts != nil {
+		if opts.FlowID != "" {
+			flowID = opts.FlowID
+		}
+		if opts.ExecutionID != "" {
+			executionID = opts.ExecutionID
+		}
+	}
+	out["$FLOW_ID"] = flowID
+	out["$EXECUTION_ID"] = executionID
 
 	if rc.ParentWorkflowContext != nil {
 		if parentDepth >= maxParentChainDepth {
@@ -283,11 +311,6 @@ func snapshotRuntimeContext(rc *runtime.Context, opts *SuspendOptions, parentDep
 			}
 			out["$PARENT"] = parentSnap
 		}
-	}
-
-	if opts != nil {
-		out["$FLOW_ID"] = opts.FlowID
-		out["$EXECUTION_ID"] = opts.ExecutionID
 	}
 	return out, nil
 }
@@ -312,6 +335,12 @@ func RestoreRuntimeContext(ctx context.Context, checkpointContext map[string]any
 	if branch, ok := checkpointContext["$BRANCH"]; ok {
 		rc.LastBranch = branch
 	}
+	if flowID, ok := checkpointContext["$FLOW_ID"].(string); ok {
+		rc.FlowID = flowID
+	}
+	if executionID, ok := checkpointContext["$EXECUTION_ID"].(string); ok {
+		rc.ExecutionID = executionID
+	}
 	if parent, ok := checkpointContext["$PARENT"].(map[string]any); ok {
 		parentRC := restoreRuntimeChain(parent)
 		rc.ParentWorkflowContext = runtime.WithWorkflowRuntimeContext(context.Background(), parentRC)
@@ -332,6 +361,12 @@ func restoreRuntimeChain(snap map[string]any) *runtime.Context {
 	}
 	if branch, ok := snap["$BRANCH"]; ok {
 		rc.LastBranch = branch
+	}
+	if flowID, ok := snap["$FLOW_ID"].(string); ok {
+		rc.FlowID = flowID
+	}
+	if executionID, ok := snap["$EXECUTION_ID"].(string); ok {
+		rc.ExecutionID = executionID
 	}
 	if parent, ok := snap["$PARENT"].(map[string]any); ok {
 		rc.ParentWorkflowContext = runtime.WithWorkflowRuntimeContext(context.Background(), restoreRuntimeChain(parent))
