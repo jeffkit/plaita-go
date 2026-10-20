@@ -3,14 +3,17 @@ package nodes
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/jeffkit/plaita-go/internal/runtime"
 	"github.com/jeffkit/plaita-go/pkg/agentproc"
+	"github.com/jeffkit/plaita-go/pkg/workflow"
 )
 
 func agentRegistryForTest(t *testing.T) *agentproc.Registry {
@@ -303,5 +306,66 @@ func TestAgentRunRecursiveDirectDetails(t *testing.T) {
 	}
 	if obs[0]["type"] != "generation" || obs[0]["output"] != "thinking out loud" || obs[0]["model"] != "rm" {
 		t.Errorf("observation = %v", obs[0])
+	}
+}
+
+// TestAgentRunHostRunTenantGate pins A62-02: a non-default tenant may not
+// spawn an agent CLI on the worker host. The gate must fire before spawn so
+// the agent has zero execution chance.
+func TestAgentRunHostRunTenantGate(t *testing.T) {
+	node := &AgentRun{
+		BaseNode: BaseNode{ID: "ag"},
+		Agent:    "echo",
+		Prompt:   "p",
+		Repo:     t.TempDir(), // existing dir: without the gate the spawn would succeed
+		Registry: agentRegistryForTest(t),
+	}
+	ctx := runtime.WithTenantID(agentRunContext(t, map[string]any{}), "acme")
+	res, err := node.Execute(ctx)
+	if err == nil {
+		t.Fatalf("non-default tenant must be refused, got result %v", res)
+	}
+	if !errors.Is(err, ErrHostRunTenantDenied) {
+		t.Fatalf("error = %v, want ErrHostRunTenantDenied", err)
+	}
+	if !strings.Contains(err.Error(), "workspace") {
+		t.Errorf("error should point at the sandbox path: %v", err)
+	}
+	if workflow.IsRetryableError(err) {
+		t.Error("a tenant policy refusal must be deterministic (no retry storm)")
+	}
+}
+
+// TestAgentRunDefaultTenantHostRunAllowed is the positive control for the
+// tenant gate: the default tenant keeps the historical host-run semantics.
+func TestAgentRunDefaultTenantHostRunAllowed(t *testing.T) {
+	node := &AgentRun{
+		BaseNode: BaseNode{ID: "ag"},
+		Agent:    "echo",
+		Prompt:   "p",
+		Registry: agentRegistryForTest(t),
+	}
+	ctx := runtime.WithTenantID(agentRunContext(t, map[string]any{}), runtime.DefaultTenantID)
+	res, err := node.Execute(ctx)
+	if err != nil {
+		t.Fatalf("default tenant host run must be allowed: %v", err)
+	}
+	if out := res.Result.(map[string]any); out["text"] != "reply-from-agent" {
+		t.Errorf("text = %v", out["text"])
+	}
+}
+
+// TestAgentRunBareEngineHostRunAllowed pins the no-tenant-layer deployment:
+// without a worker there is no tenant context (plaita's single-tenant
+// ImportError fallback), so the gate stays out of the way.
+func TestAgentRunBareEngineHostRunAllowed(t *testing.T) {
+	node := &AgentRun{
+		BaseNode: BaseNode{ID: "ag"},
+		Agent:    "echo",
+		Prompt:   "p",
+		Registry: agentRegistryForTest(t),
+	}
+	if _, err := node.Execute(agentRunContext(t, map[string]any{})); err != nil {
+		t.Fatalf("bare engine host run must be allowed: %v", err)
 	}
 }

@@ -2,6 +2,7 @@ package nodes
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 
@@ -17,120 +18,6 @@ func TestCode_Execute(t *testing.T) {
 		want       *workflow.ExecuteResult
 		wantErr    bool
 	}{
-		{
-			name: "test simple golang code node",
-			runtimeCtx: &runtime.Context{
-				WorkflowInput: map[string]any{
-					"name": "foo",
-				},
-			},
-			codeNode: &Code{
-				BaseNode: BaseNode{
-					ID:         "code-node",
-					Next:       "end",
-					OutputType: workflow.Property{DataType: workflow.String},
-				},
-				Language: Go,
-				Code: `
-				import "context"
-
-				func run(_ context.Context, input any) (any, error) {
-					return "hello " + input.(string), nil
-				}
-				`,
-				Input: "$INPUT.name",
-			},
-			want:    &workflow.ExecuteResult{Result: "hello foo", NextNode: "end"},
-			wantErr: false,
-		},
-		{
-			name: "test go code node with input args and global vars",
-			runtimeCtx: &runtime.Context{
-				WorkflowInput: map[string]any{
-					"name": "foo",
-				},
-			},
-			codeNode: &Code{
-				BaseNode: BaseNode{
-					ID:         "code-node",
-					Next:       "end",
-					OutputType: workflow.Property{DataType: workflow.String},
-				},
-				Language: Go,
-				Code: `
-				import (
-					"context"
-					"errors"
-					"fmt"
-				)
-
-				const prefix = "foo"
-
-				func parseInput(input any) (string, error) {
-					if v, ok := input.(string); ok {
-						return v, nil
-					}
-					return "", errors.New("invalid input")
-				}
-
-				func run(_ context.Context, input any) (any, error) {
-					name, err := parseInput(input)
-					if err != nil {
-						return nil, err
-					}
-					return fmt.Sprintf("%s: hello, %s", prefix, name), nil
-				}
-				`,
-				Input: "$INPUT.name",
-			},
-			want:    &workflow.ExecuteResult{Result: "foo: hello, foo", NextNode: "end"},
-			wantErr: false,
-		},
-		{
-			name: "test go code node with object type input args and global vars",
-			runtimeCtx: &runtime.Context{
-				WorkflowInput: map[string]any{
-					"name": "kong",
-					"age":  18,
-				},
-			},
-			codeNode: &Code{
-				BaseNode: BaseNode{
-					ID:         "code-node",
-					Next:       "end",
-					OutputType: workflow.Property{DataType: workflow.String},
-				},
-				Language: Go,
-				Code: `
-				import (
-					"context"
-					"errors"
-					"fmt"
-				)
-
-				const prefix = "foo"
-
-				func parseInput(input any) (map[string]any, error) {
-					if v, ok := input.(map[string]any); ok {
-						return v, nil
-					}
-					return nil, errors.New("invalid input")
-				}
-
-				func run(_ context.Context, input any) (any, error) {
-					fmt.Println(input)
-					info, err := parseInput(input)
-					if err != nil {
-						return nil, err
-					}
-					return fmt.Sprintf("%s: hello, %s", prefix, info["name"]), nil
-				}
-				`,
-				Input: "$INPUT",
-			},
-			want:    &workflow.ExecuteResult{Result: "foo: hello, kong", NextNode: "end"},
-			wantErr: false,
-		},
 		{
 			name: "test simple js code node",
 			runtimeCtx: &runtime.Context{
@@ -156,7 +43,7 @@ func TestCode_Execute(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "test go code node with input args and global vars",
+			name: "test js code node with input args and global vars",
 			runtimeCtx: &runtime.Context{
 				WorkflowInput: map[string]any{
 					"name": "foo",
@@ -193,7 +80,7 @@ func TestCode_Execute(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "test go code node with object type input args and global vars",
+			name: "test js code node with object type input args and global vars",
 			runtimeCtx: &runtime.Context{
 				WorkflowInput: map[string]any{
 					"name": "kong",
@@ -243,5 +130,43 @@ func TestCode_Execute(t *testing.T) {
 				t.Errorf("Execute() got = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestCodeGoBackendRefused pins A62-04: the legacy yaegi backend is gone. A
+// flow-authored Go source must be refused at construction (Validate) and, as
+// defense in depth, at execution for callers that construct the node directly
+// — it must never reach an in-process interpreter with stdlib access.
+func TestCodeGoBackendRefused(t *testing.T) {
+	node := &Code{
+		BaseNode: BaseNode{ID: "code-node", Next: "end"},
+		Language: Go,
+		Code: `import "os"
+func run() (any, error) { return os.ReadFile("/etc/passwd") }`,
+		Input: "$INPUT",
+	}
+	if err := node.Validate(); !errors.Is(err, ErrInProcessGoUnsupported) {
+		t.Fatalf("Validate() error = %v, want ErrInProcessGoUnsupported", err)
+	}
+	ctx := runtime.WithWorkflowRuntimeContext(context.Background(), &runtime.Context{
+		WorkflowInput: map[string]any{},
+	})
+	if _, err := node.Execute(ctx); !errors.Is(err, ErrInProcessGoUnsupported) {
+		t.Fatalf("Execute() error = %v, want ErrInProcessGoUnsupported", err)
+	} else if workflow.IsRetryableError(err) {
+		t.Error("a backend refusal must be deterministic (no retry storm)")
+	}
+}
+
+// TestCodeValidateAdmitsSupportedBackends is the positive control: the two
+// implemented backends still pass construction validation.
+func TestCodeValidateAdmitsSupportedBackends(t *testing.T) {
+	for _, node := range []*Code{
+		{BaseNode: BaseNode{ID: "js"}, Language: JS, Code: "function run(i){return i}", Input: "$INPUT"},
+		{BaseNode: BaseNode{ID: "py"}, Language: LanguagePython, Code: "def run(input):\n    return input", Input: "$INPUT"},
+	} {
+		if err := node.Validate(); err != nil {
+			t.Errorf("Validate(%s) = %v", node.Language, err)
+		}
 	}
 }

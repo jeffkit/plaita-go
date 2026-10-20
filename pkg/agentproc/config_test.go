@@ -3,6 +3,7 @@ package agentproc
 import (
 	"os"
 	"path/filepath"
+	stdruntime "runtime"
 	"strings"
 	"testing"
 )
@@ -143,4 +144,65 @@ func TestResolveUnknownAgent(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("err = %v", err)
 	}
+}
+
+// TestConfigFilesRequirePrivatePermissions pins A62-05: agents.json and
+// providers.json carry plaintext credentials, so any group/other bit is a
+// fail-loud load error (no warn-and-continue).
+func TestConfigFilesRequirePrivatePermissions(t *testing.T) {
+	if stdruntime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not enforced on Windows")
+	}
+	for _, name := range []string{"agents.json", "providers.json"} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), name)
+			if err := os.WriteFile(path, []byte(`{}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := readJSONFile(path)
+			if err == nil {
+				t.Fatalf("%s with mode 0644 must be refused", name)
+			}
+			if !strings.Contains(err.Error(), "chmod 600") {
+				t.Errorf("error should name the fix, got: %v", err)
+			}
+			if err := os.Chmod(path, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readJSONFile(path); err != nil {
+				t.Fatalf("%s with mode 0600 must load: %v", name, err)
+			}
+		})
+	}
+}
+
+// TestResolveAgentRefusesLooseConfigModes proves the check is wired into the
+// real resolution paths (agents.json and providers.json), not just the helper.
+func TestResolveAgentRefusesLooseConfigModes(t *testing.T) {
+	if stdruntime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not enforced on Windows")
+	}
+
+	t.Run("agents.json", func(t *testing.T) {
+		r := writeConfig(t, `{"agents": {"a": {"executor": "cursor", "command": "x"}}}`, "")
+		if err := os.Chmod(filepath.Join(r.Dir, "agents.json"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.ResolveAgent("a"); err == nil || !strings.Contains(err.Error(), "chmod 600") {
+			t.Fatalf("err = %v, want a permission refusal", err)
+		}
+	})
+
+	t.Run("providers.json", func(t *testing.T) {
+		r := writeConfig(t, `{"agents": {"a": {"executor": "claude", "provider": "glm", "command": "x"}}}`, testProviders)
+		if err := os.Chmod(filepath.Join(r.Dir, "providers.json"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.ResolveAgent("a"); err == nil || !strings.Contains(err.Error(), "chmod 600") {
+			t.Fatalf("err = %v, want a permission refusal (plaintext provider key)", err)
+		}
+	})
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"regexp"
 
 	validation "github.com/go-ozzo/ozzo-validation"
 	"github.com/samber/lo"
@@ -27,7 +26,11 @@ type LanguageType string
 
 // supported language types.
 const (
-	Go    LanguageType = "go"
+	// Go is the legacy in-process (yaegi) backend. The constant stays so old
+	// IR documents are recognized and rejected by name; the interpreter itself
+	// was removed (A62-04 — see ErrInProcessGoUnsupported).
+	Go LanguageType = "go"
+	// Shell and PHP are recognized historical values, not admitted backends.
 	Shell LanguageType = "shell"
 	PHP   LanguageType = "php"
 	JS    LanguageType = "javascript"
@@ -39,21 +42,24 @@ const (
 )
 
 const (
-	GO_PACKAGE_NAME = "plaita_go_inline"
-	GO_FUNC_NAME    = "run"
-	JS_FUNC_NAME    = "run"
+	// JS_FUNC_NAME is the entrypoint the javascript source must define.
+	JS_FUNC_NAME = "run"
 	// PY_FUNC_NAME mirrors plaita PYTHON_FUNC_NAME: the user script must
 	// define a function named "run" taking the decoded JSON input.
 	PY_FUNC_NAME = "run"
 )
 
-var builtinLanguageTypes = []LanguageType{Go, JS, LanguagePython}
+// builtinLanguageTypes is the admitted backend set. Go/yaegi is deliberately
+// absent (A62-04): executing flow-authored Go source in the worker process
+// gives it stdlib-level filesystem and network access with no isolation and no
+// interruption boundary.
+var builtinLanguageTypes = []LanguageType{JS, LanguagePython}
 
-// GoArgs represents the arguments for go interpreter.
-type GoArgs struct {
-	PackageName string `json:"packageName"`
-	FuncName    string `json:"funcName"`
-}
+// ErrInProcessGoUnsupported is the construction-time refusal of the yaegi
+// backend (A62-04). Go code has no sandboxed execution path in this engine;
+// the plaita runtime's sandboxed code backends are the supported home for it.
+var ErrInProcessGoUnsupported = errors.New(
+	"code node: in-process go (yaegi) execution is not supported by this engine")
 
 // JsArgs represents the arguments for js interpreter.
 type JsArgs struct {
@@ -64,13 +70,6 @@ type JsArgs struct {
 // Validate validates the js args.
 func (g *JsArgs) Validate() error {
 	return validation.ValidateStruct(g,
-		validation.Field(&g.FuncName, validation.Required.Error("function name is required")))
-}
-
-// Validate validates the go args.
-func (g *GoArgs) Validate() error {
-	return validation.ValidateStruct(g,
-		validation.Field(&g.PackageName, validation.Required.Error("package name is required")),
 		validation.Field(&g.FuncName, validation.Required.Error("function name is required")))
 }
 
@@ -95,6 +94,13 @@ const pyBackendSubprocess = "subprocess"
 
 // Validate validates the code node.
 func (c *Code) Validate() error {
+	// Fail closed on the legacy in-process Go backend before the generic
+	// language check, so the error names the real reason (A62-04).
+	if c.Language == Go {
+		return fmt.Errorf("%w: language %q is refused at construction time; javascript (goja) and "+
+			"python (subprocess sidecar) are the supported backends, or run the flow on the "+
+			"plaita runtime", ErrInProcessGoUnsupported, c.Language)
+	}
 	if err := validation.ValidateStruct(c,
 		validation.Field(&c.BaseNode, validation.Required),
 		validation.Field(
@@ -138,7 +144,11 @@ func (c *Code) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
 	var result any
 	switch c.Language {
 	case Go:
-		result, err = c.interpretGoCode(ctx, arguments)
+		// Defense in depth: callers that construct the node directly (without
+		// Validate) must hit the same refusal, never the removed yaegi path.
+		// Deterministic: a retry cannot make an unsupported backend runnable.
+		return nil, workflow.NonRetryable(fmt.Errorf("%w: refusing language %q",
+			ErrInProcessGoUnsupported, c.Language))
 	case PHP:
 		result, err = c.interpretPHPCode(ctx, arguments)
 	case JS:
@@ -158,25 +168,6 @@ func (c *Code) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
 	}
 
 	return &workflow.ExecuteResult{Result: result, NextNode: c.NextNode()}, nil
-}
-
-func (c *Code) interpretGoCode(ctx context.Context, arguments any) (any, error) {
-	evalArgs := &interpreter.GoEvalArgs{
-		PackageName: GO_PACKAGE_NAME,
-		FuncName:    GO_FUNC_NAME,
-		Parameters:  arguments,
-	}
-
-	codeStr := c.Code
-	r := regexp.MustCompile(`package (\w+)`)
-	if r.MatchString(codeStr) {
-		codeStr = r.ReplaceAllString(codeStr, "package "+GO_PACKAGE_NAME)
-	} else {
-		codeStr = "package " + GO_PACKAGE_NAME + "\n" + codeStr
-	}
-
-	// TODO(scottzhlin): optimize me, don't new interpreter per eval, use a global interpreter pool.
-	return interpreter.NewGoInterpreter().Eval(ctx, codeStr, interpreter.WithGoEvalArgs(evalArgs))
 }
 
 func (c *Code) interpretPHPCode(ctx context.Context, arguments any) (any, error) {

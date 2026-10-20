@@ -664,6 +664,10 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 	// runtime seeds $EXECUTION_ID from the same value.
 	ctx = sandbox.WithExecutionID(ctx, task.ExecutionID)
 	ctx = runtime.WithExecutionID(ctx, task.ExecutionID)
+	// The tenant is what the host-executing node gates read (agentrun host
+	// run, plaita refuse_non_default_tenant): without it every execution
+	// would look like the implicit default tenant.
+	ctx = runtime.WithTenantID(ctx, tenant)
 	w.registerRun(run, cancelRun)
 	defer w.unregisterRun(run)
 	defer w.dropOrphan(task.ExecutionID, "run ended")

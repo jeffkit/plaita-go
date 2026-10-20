@@ -6,7 +6,6 @@ type Option interface {
 }
 
 type options struct {
-	goEvalArgs *GoEvalArgs
 	jsEvalArgs *JsEvalArgs
 }
 
@@ -24,14 +23,7 @@ func (fo *funcOption) apply(o *options) {
 	fo.f(o)
 }
 
-// WithGoEvalArgs sets the go eval args.
-func WithGoEvalArgs(args *GoEvalArgs) Option {
-	return newFuncOption(func(o *options) {
-		o.goEvalArgs = args
-	})
-}
-
-// WithJsEvalArgs sets the go eval args.
+// WithJsEvalArgs sets the js eval args.
 func WithJsEvalArgs(args *JsEvalArgs) Option {
 	return newFuncOption(func(o *options) {
 		o.jsEvalArgs = args

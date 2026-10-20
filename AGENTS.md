@@ -18,7 +18,7 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
                       checkpoint.go（环安全/深度上限快照 + CheckpointStore）/suspend.go（Suspender/Resumer/Resume 入口）
   pkg/workflow/nodes/ 内置节点（assignment/branch/http/loop/parallel/redis/code/child/end/event/hitl/hitl_await…）
   pkg/expression/     plaitaexpr（$ 变量 + $F 函数，goval 求值）
-  internal/interpreter/ goja（JS）/ yeagi（Go 源码）解释器，code 节点用
+  internal/interpreter/ goja（JS）解释器，code 节点用（yaegi/Go 后端已删，A62-04）
   pkg/model, pkg/parser, pkg/providers/  流程模型、解析、flow 来源（fs/memory）
   pkg/delegate, pkg/discovery/           http 节点的委托与寻址（polaris 已删，仅 domain/noop）
   pkg/worker/       runtime worker（2026-10-19 MVP + 二期 + M6）：Streams 取单/租约 Lua/状态写回/事件/取消/心跳 +
@@ -78,6 +78,14 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
 - **修正**：终态 context 的 `$NODE` 改为节点结果表（原误写 `CurrentNodeContext`）；`$CURRENT` 单独保留。
 - **限制**：仅根流程可挂起（child/loop/parallel 内挂起显式报错）；事件 Pub/Sub 无回扫器（订阅超时与执行状态双写仍保证至少一次唤醒）。**M6 之后（本轮 worker-tail）**：retry 载体的 start→resume/continue 转换已做（§9.1，见二期「节点级重试预算」条目）——失败边界 checkpoint 由 worker 侧快照，continue 载体对 running 执行真推进（引擎面残余：从 flow 起点重入，见该条）。
 
+## Face 2 安全对齐闸（2026-10-20，分支 fix/security-gates）
+
+A1 r62/r63 情报（A62-02/04/05、issue #34）三门的落地件。Python 权威语义：`plaita-nodes/_tenant_guard.py`、`agent_run._host_run_denied`、`plaita/subprocess_env.py`。
+
+- **agentrun 宿主直跑（A62-02）**：①`pkg/agentproc/runner.go` 的 `composeEnv` 不再继承全量 `os.Environ()`，改为白名单重建（`HostEnvAllowlist` = PATH/HOME/TMPDIR/LANG/LC_ALL/LC_CTYPE/PYTHONIOENCODING，同 plaita `build_subprocess_env`）+ 部署钩子 `HostEnvExtra`（同 `SUBPROCESS_ENV_EXTRA`；spec env 覆盖）——agent 进程只看到显式声明的 env，worker 的 `PLAITA_CREDENTIALS_KEY`/provider key 不随子进程走。**代理等部署变量必须经 `HostEnvExtra` 显式加**。②worker 把租户注入 `runtime.WithTenantID`（ctx 值，child/loop/parallel 经 context 链继承），`agentrun` 宿主路径在 spawn 前对非 default 租户 fail-closed（`ErrHostRunTenantDenied`，零执行机会）；`workspace` 沙箱分支不受影响（容器边界 + 0600 envfile）。bare engine / 单租户部署（无租户上下文）保持放行，同 plaita 无租户层语义。**未做**：gate/capture/code-python 的同族租户闸仍属 #34（本轮只落 agentrun 门）；`PLAITA_ALLOW_HOST_AGENT_RUN` 式 opt-out 未移植（默认拒绝，单机信任部署需另立单）。
+- **code 的 Go/yaegi 后端（A62-04）**：`internal/interpreter/yeagi.go` + `GoArgs`/`GO_*` 常量删除，yaegi 依赖移出 go.mod；`code` 节点构造期（`Validate`）与执行期（`Execute`，防直接构造绕过）均以 `ErrInProcessGoUnsupported` 拒绝 `language:"go"`。支持面 = javascript（goja，进程内，保留原语义）+ python（subprocess sidecar）。IR `translateCode` 原本就拒 Go，worker 路径不变。
+- **providers.json 明文（A62-05）**：`agentproc.readJSONFile` 对 agents.json / providers.json 做 fail-loud 权限检查——mode 0600 或更严，组/其他任何权限位 → 具名错误（含 `chmod 600 <path>`），无告警继续路径；Windows 跳过 POSIX 位检查（按 NTFS ACL）。明文 key 注入子进程的通道仍在（协议需要 provider env），加密/租户凭据路由另单；check-then-read 的 TOCTOU 不构成安全边界（本地运营者配置，威胁模型是误配泄露而非同机竞态）。
+
 ## 常用命令
 
 ```bash
@@ -99,8 +107,8 @@ make test   # 已封装代理
 | http | http | ✅ ir 收录；SSRF 护栏字段拒载；golden 待补（执行面已有 nodes 测试） |
 | redis | redis | ✅ ir 收录，字段同形 |
 | start/end | start/end | ✅ ir 对齐；end nop 拒载 |
-| code（python） | code（javascript + **python sidecar**） | ✅ 2026-10-20：python 经 subprocess sidecar（镜像 plaita `_RUNNER_TEMPLATE` 字节级契约，run(input)/stdin JSON/stdout 信封）；sandbox_backend 缺省/subprocess 接受，restricted/docker/unsafe fail-closed（生产 588 节点 100% subprocess 覆盖） |
-| agentrun（plaita-nodes） | agentrun（pkg/workflow/nodes/agentrun.go + pkg/agentproc） | ✅ spawn 路径落地（2026-10-19）；workspace 沙箱分支拒载 |
+| code（python） | code（javascript + **python sidecar**） | ✅ 2026-10-20：python 经 subprocess sidecar（镜像 plaita `_RUNNER_TEMPLATE` 字节级契约，run(input)/stdin JSON/stdout 信封）；sandbox_backend 缺省/subprocess 接受，restricted/docker/unsafe fail-closed（生产 588 节点 100% subprocess 覆盖）。javascript 走 goja；**Go/yaegi 后端已删**，`language:"go"` 构造期+执行期均以 `ErrInProcessGoUnsupported` 拒载（A62-04） |
+| agentrun（plaita-nodes） | agentrun（pkg/workflow/nodes/agentrun.go + pkg/agentproc） | ✅ spawn 路径落地（2026-10-19）；workspace 沙箱分支落地（Docker driver/envfile/lease）；**宿主直跑非 default 租户 fail-closed + 子进程 env 白名单**（2026-10-20，A62-02） |
 | event（挂起） | event（pkg/workflow/nodes/event.go） | ✅ M6 落地（2026-10-19）：订阅/过滤/超时/event·timeout·cancel 恢复；仅根流程挂起 |
 | hitl_await（挂起） | hitl_await（pkg/workflow/nodes/hitl_await.go） | ✅ M6 落地（2026-10-19）：发消息拿 session_id 即 pending，hitl_reply 事件/超时唤醒 |
 | if（Bool） | if（pkg/workflow/nodes/if.go） | ✅ 2026-10-20 落地：condition Python 真值/两分支/缺 else 显式报错；ir 边集补 if 假分支 |
@@ -149,6 +157,7 @@ agentrun `workspace=` 分支从「拒载」改为「计划支持」。**对齐�
 ## 已知问题
 
 - ~~error_node 上游遗留红~~ **已修平（2026-10-19 audit wave，#12/#13 http 契约修复顺带解决；撤代理后 1002=期望）**。
+- `TestWorkflow_Execute/test_execute_workflow_with_error_node`：`6929c35` 上本地稳定红（end 输出 `[]` 对 string 校验失败）；`origin/main` 干净 worktree 复跑同样红，**非 Face 2 三门引入**，待单独定位。
 - `test_execute_workflow_with_http_request_info`：live-network 测试（断言真实出网失败），结果取决于出口网络状态——CI 以 -skip 排除。
 - `Test_today_eval`/`Test_now_eval`：gomonkey time.Now 补丁抖动（测的是补丁不是代码），CI -skip。
 - `go vet`：pkg/providers/memory、filesystem 有 lock 值拷贝告警（上游质量噪音）。

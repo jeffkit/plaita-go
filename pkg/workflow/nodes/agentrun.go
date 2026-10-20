@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -63,6 +64,14 @@ func init() {
 
 // defaultTimeoutSecs mirrors plaita-nodes AgentRunNode.timeout_secs.
 const defaultTimeoutSecs = 1800
+
+// ErrHostRunTenantDenied is the fail-closed tenant gate on the host-run path
+// (A62-02, plaita-nodes agent_run._host_run_denied): a non-default tenant may
+// not spawn an agent CLI on the worker host, where it runs as the worker user
+// with read access to every tenant's credentials. The workspace (sandbox)
+// branch is the supported path — the container is the boundary and
+// credentials travel only through the 0600 envfile.
+var ErrHostRunTenantDenied = errors.New("agentrun: host run refused for a non-default tenant")
 
 // GetType returns the node type.
 func (a *AgentRun) GetType() workflow.NodeType { return types.NodeTypeAgentRun }
@@ -152,7 +161,10 @@ func (a *AgentRun) Execute(ctx context.Context) (*workflow.ExecuteResult, error)
 	}
 	spec, err := registry.ResolveAgent(agentName)
 	if err != nil {
-		return nil, fmt.Errorf("agentrun %q: %w", a.ID, err)
+		// Registry failures are configuration errors (missing entry/command,
+		// loose config-file permissions): deterministic, never retried —
+		// plaita's AgentRunConfigError class.
+		return nil, workflow.NonRetryable(fmt.Errorf("agentrun %q: %w", a.ID, err))
 	}
 
 	if presentLiteral(a.Workspace) {
@@ -160,6 +172,18 @@ func (a *AgentRun) Execute(ctx context.Context) (*workflow.ExecuteResult, error)
 			return nil, fmt.Errorf("agentrun %q: workspace and repo are mutually exclusive", a.ID)
 		}
 		return a.executeSandboxed(ctx, agentName, prompt, sessionID, spec, timeout)
+	}
+
+	// Tenant gate (fail-closed) before any host-side side effect. The worker
+	// injects the task's tenant into ctx; a bare engine run carries none and is
+	// the single-tenant deployment plaita also allows. Non-default tenants must
+	// declare workspace (sandbox) — there is no host-run opt-out in this engine.
+	if tenant := runtime.TenantIDFromContext(ctx); runtime.IsNonDefaultTenant(tenant) {
+		// A policy refusal is deterministic: retrying cannot change the tenant.
+		return nil, workflow.NonRetryable(fmt.Errorf("%w: node %q would run agent %q as the worker user for tenant %q "+
+			"(it could read the host's credentials and other tenants' data); declare workspace to run "+
+			"it in a sandbox, or run the flow on the plaita runtime",
+			ErrHostRunTenantDenied, a.ID, agentName, tenant))
 	}
 
 	// Python-node parity: the recursive bridge takes its workspace from
