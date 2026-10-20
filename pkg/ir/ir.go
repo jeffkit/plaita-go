@@ -115,7 +115,6 @@ var knownUnsupported = map[string]string{
 	"find":      "collection variant, not ported yet (base loop is supported)",
 	"reduce":    "collection variant, not ported yet (base loop is supported)",
 	"while":     "condition loop variant, not ported yet (base loop is supported)",
-	"if":        "bool branch node, use switch",
 	"case":      "legacy switch dialect, use switch",
 	"calculate": "calculate node is not ported yet",
 	"mock":      "mock node is not ported yet",
