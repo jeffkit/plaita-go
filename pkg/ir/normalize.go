@@ -209,6 +209,8 @@ func normalizeNode(n map[string]any) error {
 	switch t {
 	case "switch":
 		return translateSwitch(n)
+	case "if":
+		return translateIf(n)
 	case "parallel":
 		return translateParallel(n)
 	case "loop":
@@ -426,6 +428,58 @@ func translateSwitch(n map[string]any) error {
 			if err := normalizeCondition(c); err != nil {
 				return fmt.Errorf("branches[%d] condition: %v", i, err)
 			}
+		}
+	}
+	return nil
+}
+
+// translateIf 转正 plaita 的 if 节点（decide.py Bool，node_type "if"）。
+// 部署 IR 的权威形状（codeflow 编译产物 + ir_validate 边集）：
+//
+//	{"type":"if","id":…,"condition":{…},"next":"<真分支目标>","else_next":"<假分支目标>"}
+//
+// 校验照 switch 模式（形状/别名在此，目标存在性与可达性在 validateDoc 边集）：
+//
+//   - camel 别名折叠：elseNext → else_next（ir_validate 认可的双拼写；
+//     codeflow/builder/sexpr 三个前端都产出 snake，elseNext 只是部署残留）。
+//   - next / else_next 必须非空（ir_validate :690-699 的 if 结构规则：缺真/
+//     假分支目标是加载错误，不做 Python 模型层的 "true"/"false" 占位默认）。
+//   - condition 形状 fail-closed：Python 对解析不出 shape 的 condition
+//     （_parse_condition_content 返回 None）告警后永不命中、恒走假分支——
+//     部署面等价于静默假成功（decide.py:168-175 自认的缺陷形态），这里改为
+//     加载期拒绝；空 conditions 组同样拒绝（Go 组求值按 relation 走
+//     and→true / or→false，与 Python 的恒真语义分歧，编译器不产出该形状）。
+//     condition 缺省 / null 合法：照 Python condition=None 恒走假分支。
+func translateIf(n map[string]any) error {
+	foldKey(n, "elseNext", "else_next")
+
+	if nextIsEmpty(n) {
+		return fmt.Errorf("if node requires a true-branch target (next)")
+	}
+	if s := firstString(n, "else_next"); s == "" {
+		return fmt.Errorf("if node requires a false-branch target (else_next/elseNext)")
+	}
+
+	if v, ok := n["condition"]; ok && v != nil {
+		c, isMap := v.(map[string]any)
+		if !isMap {
+			return fmt.Errorf("if condition must be an object ({field,operator,value} or {relation,conditions}), got %T", v)
+		}
+		_, hasField := c["field"]
+		_, hasOperator := c["operator"]
+		_, hasValue := c["value"]
+		conditions, _ := c["conditions"].([]any)
+		_, hasRelation := c["relation"]
+		switch {
+		case hasField && hasOperator && hasValue:
+			// 单条件（value 允许 null：eq/null 比较是合法形状）。
+		case hasRelation && len(conditions) > 0:
+			if err := normalizeCondition(c); err != nil {
+				return fmt.Errorf("if condition: %v", err)
+			}
+		default:
+			return fmt.Errorf("if condition is malformed: needs {field,operator,value} or " +
+				"{relation,conditions[>0]}; a partial condition would always take the else branch")
 		}
 	}
 	return nil
