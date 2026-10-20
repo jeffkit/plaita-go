@@ -559,16 +559,56 @@ func translateHTTP(n map[string]any) error {
 	return nil
 }
 
+// translateCode admits the code node's two engine-executable languages.
+//
+// python (plaita CodeNode default): run through the python3 subprocess
+// sidecar (nodes/code_python.go), which mirrors plaita's subprocess backend —
+// operator-trusted code, wall-clock timeout, process-group kill; NOT an
+// in-process or container isolation boundary. sandbox_backend is therefore
+// adjudicated as: absent/""/"subprocess" accepted; "restricted"/"docker"/
+// "unsafe" rejected fail-closed (the Go engine cannot honour those isolation
+// tiers and must not silently downgrade them). An absent language defaults to
+// python exactly like plaita's model_validator.
+//
+// javascript: unchanged — the engine JS interpreter is in-process and has no
+// backend tiers, so any explicitly declared backend stays rejected.
 func translateCode(n map[string]any) error {
 	lang, _ := n["language"].(string)
-	if lang != "javascript" {
-		return fmt.Errorf("code node language %q is not supported (this engine runs javascript only)", lang)
+	if n["language"] == nil || lang == "" {
+		// plaita: language None → LANGUAGE_PYTHON
+		n["language"] = "python"
+		lang = "python"
 	}
-	for _, k := range []string{"sandboxBackend", "sandbox_backend"} {
-		if v, ok := n[k]; ok && v != nil && v != "" {
-			return fmt.Errorf("code node sandboxBackend %v is not supported in this engine", v)
+	switch lang {
+	case "python":
+		foldKey(n, "sandboxBackend", "sandbox_backend")
+		switch backend, _ := n["sandbox_backend"].(string); backend {
+		case "", "subprocess":
+			// accepted: the Go sidecar is the subprocess-form backend; keep
+			// the folded field so the engine node carries the declaration
+			n["sandboxBackend"] = backend
+			delete(n, "sandbox_backend")
+		case "restricted", "docker", "unsafe":
+			return fmt.Errorf(
+				"code node sandboxBackend %q has no Go implementation: the Go engine "+
+					"runs python code only in the subprocess form (fresh python3 process, "+
+					"wall-clock timeout, process-group kill — not an in-process or container "+
+					"isolation boundary). Set sandbox_backend to \"subprocess\" or drop it; "+
+					"flows that need in-process (restricted) or container (docker) isolation "+
+					"must run on the plaita runtime",
+				backend)
+		default:
+			return fmt.Errorf("code node sandboxBackend %v is invalid for language python (expected absent or \"subprocess\")", n["sandbox_backend"])
 		}
-		delete(n, k)
+	case "javascript":
+		for _, k := range []string{"sandboxBackend", "sandbox_backend"} {
+			if v, ok := n[k]; ok && v != nil && v != "" {
+				return fmt.Errorf("code node sandboxBackend %v is not supported in this engine (the javascript interpreter is in-process and has no sandbox backend tiers)", v)
+			}
+			delete(n, k)
+		}
+	default:
+		return fmt.Errorf("code node language %q is not supported (this engine runs javascript or python)", lang)
 	}
 	return nil
 }

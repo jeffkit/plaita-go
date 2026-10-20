@@ -168,9 +168,12 @@ func TestLoadRejects(t *testing.T) {
 			want: "not reachable",
 		},
 		{
-			name: "python code node",
-			doc:  `{"nodes":[{"type":"start","id":"s","next":"c"},{"type":"code","id":"c","language":"python","code":"1"}]}`,
-			want: "python",
+			// python code nodes are admitted (2026-10: python sidecar); what
+			// stays fail-closed is an isolation tier the Go engine cannot
+			// honour — translateCode must reject it, never silently downgrade.
+			name: "python code node with restricted backend",
+			doc:  `{"nodes":[{"type":"start","id":"s","next":"c"},{"type":"code","id":"c","language":"python","sandbox_backend":"restricted","code":"def run(input):\n    return input"}]}`,
+			want: "restricted",
 		},
 		{
 			name: "nop end",

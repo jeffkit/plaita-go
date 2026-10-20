@@ -31,15 +31,23 @@ const (
 	Shell LanguageType = "shell"
 	PHP   LanguageType = "php"
 	JS    LanguageType = "javascript"
+	// LanguagePython routes to the python3 subprocess sidecar, mirroring the
+	// plaita CodeNode "subprocess" backend (plaita/node/code.py): user code
+	// embedded in a runner script, JSON via stdin/stdout, wall-clock timeout
+	// and process-group kill. See code_python.go for the contract.
+	LanguagePython LanguageType = "python"
 )
 
 const (
 	GO_PACKAGE_NAME = "plaita_go_inline"
 	GO_FUNC_NAME    = "run"
 	JS_FUNC_NAME    = "run"
+	// PY_FUNC_NAME mirrors plaita PYTHON_FUNC_NAME: the user script must
+	// define a function named "run" taking the decoded JSON input.
+	PY_FUNC_NAME = "run"
 )
 
-var builtinLanguageTypes = []LanguageType{Go, JS}
+var builtinLanguageTypes = []LanguageType{Go, JS, LanguagePython}
 
 // GoArgs represents the arguments for go interpreter.
 type GoArgs struct {
@@ -73,11 +81,21 @@ type Code struct {
 	Language LanguageType `json:"language"`
 	Code     string       `json:"code"`
 	Input    any          `json:"input,omitempty"`
+	// SandboxBackend carries the plaita sandbox_backend declaration
+	// (snake_case folded to camelCase by the ir loader). The Go engine
+	// implements only the "subprocess" form for python — see code_python.go;
+	// anything else is rejected in Validate (fail-closed, same split as the
+	// ir loader's translateCode).
+	SandboxBackend string `json:"sandboxBackend,omitempty"`
 }
+
+// pyBackendSubprocess is the only sandbox_backend value the Go engine
+// implements for python (plaita CodeNode backend tier of the same name).
+const pyBackendSubprocess = "subprocess"
 
 // Validate validates the code node.
 func (c *Code) Validate() error {
-	return validation.ValidateStruct(c,
+	if err := validation.ValidateStruct(c,
 		validation.Field(&c.BaseNode, validation.Required),
 		validation.Field(
 			&c.Language,
@@ -85,7 +103,24 @@ func (c *Code) Validate() error {
 			validation.In(lo.ToAnySlice(builtinLanguageTypes)...).
 				Error(fmt.Sprintf("language must be one of %v", builtinLanguageTypes)),
 		),
-		validation.Field(&c.Code, validation.Required.Error("source code is required")))
+		validation.Field(&c.Code, validation.Required.Error("source code is required"))); err != nil {
+		return err
+	}
+	switch c.SandboxBackend {
+	case "", pyBackendSubprocess:
+	default:
+		return fmt.Errorf(
+			"code node: sandboxBackend %q is not supported in this engine: the Go "+
+				"sidecar runs python code only in the subprocess form (fresh python3 "+
+				"process, wall-clock timeout, process-group kill) and provides no "+
+				"in-process or container isolation; drop the field, set %q, or run "+
+				"such flows on the plaita runtime",
+			c.SandboxBackend, pyBackendSubprocess)
+	}
+	if c.Language == LanguagePython && !pyDefinesRunFunction(c.Code) {
+		return fmt.Errorf("code node: python code validation failed: No %s function found", PY_FUNC_NAME)
+	}
+	return nil
 }
 
 // GetType returns the type of the code node.
@@ -108,6 +143,8 @@ func (c *Code) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
 		result, err = c.interpretPHPCode(ctx, arguments)
 	case JS:
 		result, err = c.interpretJsCode(ctx, arguments)
+	case LanguagePython:
+		result, err = c.interpretPythonCode(ctx, arguments)
 	default:
 		return nil, fmt.Errorf("code node: unsupported language type: %s", c.Language)
 	}
@@ -155,4 +192,10 @@ func (c *Code) interpretJsCode(ctx context.Context, arguments any) (any, error) 
 
 	codeStr := c.Code
 	return interpreter.NewJsInterpreter().Eval(ctx, codeStr, interpreter.WithJsEvalArgs(evalArgs))
+}
+
+// interpretPythonCode runs the python sidecar (code_python.go): the wrapper
+// contract mirrors the plaita CodeNode subprocess backend verbatim.
+func (c *Code) interpretPythonCode(ctx context.Context, arguments any) (any, error) {
+	return runPythonSubprocess(ctx, c.Code, arguments)
 }
