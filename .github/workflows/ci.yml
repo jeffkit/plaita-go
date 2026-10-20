@@ -1,5 +1,10 @@
-# Deliberately thin: build + vet + fmt + unit tests. No matrix, no layers —
+# Deliberately thin: fmt + vet + build + unit tests. No matrix, no layers —
 # the suite is all-local (fake bridges, temp dirs) and finishes in ~1min.
+#
+# Gate parity: every step below has a `make` counterpart (`make ci`), and the
+# skipped-test list has exactly one source of truth (scripts/ci-skip.txt) shared
+# with the Makefile. The workflow shape itself is machine-checked first by
+# scripts/ci-workflow-audit.sh: a floating `uses:`/`go-version:` turns the job red.
 name: ci
 
 on:
@@ -10,24 +15,34 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # PR runs supersede each other. Main runs must not: a cancelled run is red for
+  # the landing gate, so cancelling main turns every queued merge into a false red.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
+      # Pinned to 40-char commit SHAs so a moved upstream tag/branch cannot change
+      # what runs here. Bump the SHA and the trailing version comment together.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          go-version: 'stable'
+          persist-credentials: false
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          # Tracks the module's `go` directive. `go-version: 'stable'` let the
+          # toolchain move under the repo without a commit.
+          go-version-file: go.mod
+
+      - name: workflow audit
+        run: bash scripts/ci-workflow-audit.sh
 
       - name: gofmt
-        run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            echo "unformatted files:"
-            echo "$unformatted"
-            exit 1
-          fi
+        run: make fmt-check
 
       - name: vet
         run: go vet ./...
@@ -36,8 +51,6 @@ jobs:
         run: go build ./...
 
       - name: test
-        # Skips (see AGENTS.md "已知问题"):
-        # - Test_today_eval / Test_now_eval: gomonkey time.Now patch flaky.
-        # - test_execute_workflow_with_http_request_info: live-network test
-        #   (asserts a real outbound request fails; depends on egress state).
-        run: go test ./... -skip 'Test_today_eval|Test_now_eval|Test_now_today_eval|TestWorkflow_Execute/test_execute_workflow_with_http_request_info'
+        # Skip list: scripts/ci-skip.txt (see AGENTS.md "已知问题"). The Makefile
+        # reads the same file, so `make test` and CI cannot drift apart.
+        run: go test ./... -count=1 -skip "$(cat scripts/ci-skip.txt)"

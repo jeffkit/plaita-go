@@ -1,0 +1,22 @@
+# Keeps the two things this repo pins by hand current: the modules in go.mod and
+# the commit SHAs in .github/workflows (dependabot rewrites both the SHA and the
+# trailing `# vX.Y.Z` comment, which scripts/ci-workflow-audit.sh requires).
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      go-deps:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
