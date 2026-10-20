@@ -65,12 +65,16 @@ var gateEnvAllowlist = []string{
 // [, "dry_run"]}. stdout/stderr are head+tail clipped past the caps with an
 // explicit omission marker.
 //
-// Divergences from the Python node, both forced by the runtime:
-//   - tenant isolation has no Go equivalent (single-tenant deployment —
-//     Python's refuse_non_default_tenant is a no-op without a tenant layer);
+// Divergences from the Python node, forced by the runtime:
 //   - cancellation rides the Go context instead of cancel_event, and a
 //     cancelled gate is an error while an own timeout keeps the historical
 //     exit_code=124 / passed=false semantics.
+//
+// Tenant boundary (pn#18 / A42-06): the command runs on the worker host, as
+// the worker user, with the tenant-wide credentials key — so a non-default
+// tenant is refused before any spawn (ErrTenantIsolationUnavailable). Dry runs
+// stay allowed (nothing executes); the default tenant keeps historical
+// semantics.
 type Gate struct {
 	BaseNode
 	Command     any               `json:"command,omitempty"`
@@ -137,6 +141,14 @@ func (g *Gate) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
 			"retries":   0,
 			"dry_run":   true,
 		}, NextNode: g.NextNode()}, nil
+	}
+
+	// Tenant gate (pn#18 / A42-06), after the dry-run short-circuit and before
+	// any spawn: a non-default tenant's command would run as the worker user
+	// and could read the default tenant's credentials. gate.py refuses at the
+	// same point (dry runs never execute, so they stay allowed).
+	if err := refuseNonDefaultTenant(ctx, "gate"); err != nil {
+		return nil, err
 	}
 
 	env := gateBuildSubprocessEnv(g.EnvExtra)

@@ -48,11 +48,15 @@ const captureDefaultTimeoutSecs = 120.0
 //   - dry_run (or globalContext.dry_run) returns a fake success without
 //     spawning anything.
 //
-// Divergences from the Python node, both forced by the runtime:
-//   - tenant isolation has no Go equivalent (single-tenant deployment —
-//     Python's refuse_non_default_tenant is a no-op without a tenant layer);
+// Divergences from the Python node, forced by the runtime:
 //   - cancellation rides the Go context instead of cancel_event: a cancelled
 //     capture is an error after the process group is killed.
+//
+// Tenant boundary (pn#18 / A42-06): the command runs on the worker host, as
+// the worker user, with the tenant-wide credentials key — so a non-default
+// tenant is refused before any spawn (ErrTenantIsolationUnavailable). Dry runs
+// stay allowed (nothing executes); the default tenant keeps historical
+// semantics.
 type Capture struct {
 	BaseNode
 	Command     any  `json:"command,omitempty"`      // string (shlex split / list-valued expression) or list
@@ -125,6 +129,14 @@ func (c *Capture) Execute(ctx context.Context) (*workflow.ExecuteResult, error) 
 			"stderr":    "",
 			"dry_run":   true,
 		}, NextNode: c.NextNode()}, nil
+	}
+
+	// Tenant gate (pn#18 / A42-06), after the dry-run short-circuit and before
+	// the child env is assembled or any spawn happens: the command would run as
+	// the worker user with host file-system access and could read the default
+	// tenant's credentials. capture.py refuses at the same point.
+	if err := refuseNonDefaultTenant(ctx, "capture"); err != nil {
+		return nil, err
 	}
 
 	// Whitelist-rebuilt env: host credentials stay out of the child; the

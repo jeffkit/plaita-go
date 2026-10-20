@@ -16,6 +16,14 @@
 // docker backend; this engine fail-closes on sandbox_backend values it does
 // not implement (restricted/docker/unsafe) instead of silently downgrading.
 //
+// Tenant boundary (plaita#256 / A42-06): the sidecar shares the worker's OS
+// user and file system, and every tenant's credentials share one key, so a
+// non-default tenant's user code could read the default tenant's credentials
+// no matter which env the parent passes. runPythonSubprocessBudget therefore
+// refuses non-default tenants **before spawning** (zero execution chance,
+// ErrTenantIsolationUnavailable); tenant-scoped code belongs in a container
+// that mounts no host credentials.
+//
 // Bounds (mirroring plaita):
 //   - wall-clock timeout from PLAITA_SANDBOX_TIMEOUT (seconds, default 10;
 //     must be a positive integer — 0/negative/non-integers are rejected
@@ -167,9 +175,9 @@ func pySandboxMemoryMB() (int64, error) {
 // already holds a decoded-expression value, marshalled here).
 //
 // Divergences from plaita, both forced by the runtime:
-//   - tenant refusal (A42-06) has no Go equivalent: this engine has no tenant
-//     layer, every execution is the implicit default tenant;
 //   - cancellation rides the Go context instead of cancel_event.
+//
+// The tenant refusal (A42-06) is enforced below, before any spawn.
 func runPythonSubprocess(ctx context.Context, code string, input any) (any, error) {
 	timeoutSecs, err := pySandboxTimeout()
 	if err != nil {
@@ -186,9 +194,18 @@ func runPythonSubprocess(ctx context.Context, code string, input any) (any, erro
 
 // runPythonSubprocessBudget is runPythonSubprocess with the bounds and the
 // child environment made explicit — the seam the tests use to pin HOME/TMPDIR
-// and shorten the timeout without touching host state.
+// and shorten the timeout without touching host state. The tenant gate lives
+// here, at the single point every spawn goes through (plaita refuses at
+// run_python_subprocess entry for the same reason).
 func runPythonSubprocessBudget(ctx context.Context, code string, input any,
 	timeout time.Duration, memBytes int64, childEnv []string) (any, error) {
+	// Tenant gate (plaita#256 / A42-06): refuse before building the runner or
+	// spawning — user code must have zero execution chance for a non-default
+	// tenant.
+	if err := refuseNonDefaultTenant(ctx, "code python"); err != nil {
+		return nil, err
+	}
+
 	inputJSON, err := json.Marshal(input)
 	if err != nil {
 		return nil, fmt.Errorf("python sidecar: input is not JSON-serialisable: %w", err)
