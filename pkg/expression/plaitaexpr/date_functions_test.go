@@ -60,8 +60,9 @@ func Test_now_today_eval(t *testing.T) {
 }
 
 func Test_strftime_directives(t *testing.T) {
-	// Direct-unit coverage of the strftime layer: `2026`/`18` acceptance rows
-	// (issue #22) are pinned end-to-end in Test_today_eval / Test_now_eval.
+	// Direct-unit coverage of the strftime layer: the `2026`/`18` acceptance
+	// rows (issue #22) are pinned end-to-end in Test_now_today_eval, which the
+	// CI skip list excludes (gomonkey time.Now patch flakes on darwin/arm64).
 	ts := time.Date(2026, 10, 19, 18, 30, 45, 123456000, time.UTC)
 	cases := []struct {
 		layout string

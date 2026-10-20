@@ -7,9 +7,14 @@ programmatically via ``ast`` (no hand transcription), verifies each extracted
 case against the live reference implementation, and writes one JSON case file
 for github.com/jeffkit/plaita-go/pkg/expression.
 
-Usage (run from the plaita Python repo root so ``import plaita`` resolves):
-    cd /Users/kong/projects/infra4agent/plaita
-    python3 /Users/kong/projects/plaita-go/scripts/export_golden.py
+Usage (run from the plaita Python repo root so ``import plaita`` resolves)::
+
+    cd ~/projects/infra4agent/plaita
+    python3 ~/projects/infra4agent/plaita-go/scripts/export_golden.py
+
+The output path defaults to this repository's
+``pkg/expression/testdata/expression_golden.json``, resolved from the script's
+own location — never from the caller's CWD.  A second argument overrides it.
 
 Extraction rules:
     assertEqual(evaluate(expr, ctx), expected)   -> expected value
@@ -38,9 +43,15 @@ import os
 import sys
 from datetime import date, datetime
 from decimal import Decimal
+from pathlib import Path
 
 DEFAULT_TEST_FILE = "tests/unit/test_expression_golden.py"
-DEFAULT_OUT = "/Users/kong/projects/plaita-go/pkg/expression/testdata/expression_golden.json"
+# Resolved from this file, not from CWD or a hardcoded absolute path: the
+# previous value pointed at a directory that does not exist, so a documented
+# refresh printed success while the golden file the Go tests read stayed stale.
+DEFAULT_OUT = str(
+    Path(__file__).resolve().parents[1] / "pkg" / "expression" / "testdata" / "expression_golden.json"
+)
 
 PARSE_FUNCTION_NOTE = (
     "API: parse_function (the $F.* call-parse entry; returns the input "

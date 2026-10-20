@@ -1,3 +1,7 @@
+# Not wired into CI yet: `make lint` is gofmt + go vet, and ci.yml runs the same
+# two plus build/test. Keep this file in step with the module so that wiring it in
+# is a one-line step (it needs a debt baseline first — funlen/lll/revive on the
+# existing tree is a separate decision). Schema is golangci-lint v1.
 linters-settings:
   funlen:
     lines: 80
@@ -8,7 +12,7 @@ linters-settings:
   gocyclo:
     min-complexity: 20
   goimports:
-    local-prefixes: git.woa.com/thor-family/loki/go-loki/pkg,git.woa.com/thor-family/loki/go-loki/internal,git.woa.com/thor-family/loki/go-loki/e2e
+    local-prefixes: github.com/jeffkit/plaita-go/pkg,github.com/jeffkit/plaita-go/internal,github.com/jeffkit/plaita-go/cmd
   golint:
     #min-confidence: 0
   govet:
@@ -48,7 +52,7 @@ linters:
     - gocheckcompilerdirectives
 
 run:
-  go: "1.19"
+  go: "1.24"
   concurrency: 16
   timeout: 10m
   issue-exit-code: 1
@@ -82,7 +86,3 @@ output:
   sort-results: true
   print-issued-lines: true
   print-linter-name: true
-
-
-service:
-  golangci-lint-version: 1.51.2

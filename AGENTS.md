@@ -93,8 +93,20 @@ A1 r62/r63 情报（A62-02/04/05、issue #34）的落地件。Python 权威语�
 # 本机 GOPROXY 可能指向内网 goproxy.woa.com（外网不可达），本仓统一走公共代理
 GOPROXY=https://goproxy.cn,direct go build ./...
 GOPROXY=https://goproxy.cn,direct go test ./...
-make test   # 已封装代理
+make ci     # = ci.yml 同形：gofmt 检查 + vet + build + test（含 skip）+ workflow 审计
+make test   # 只跑测试；skip 清单与 CI 共用 scripts/ci-skip.txt
+make test-all   # 不带 skip（无出口网络时 http_request_info 会红，见「已知问题」）
+make lint   # gofmt 检查 + vet（golangci-lint 配置存在但未接线）
 ```
+
+## CI/门禁（2026-10-21，对齐 plaita B59/A60 同型）
+
+- **单一真源**：跳过清单只在 `scripts/ci-skip.txt`（Makefile 与 ci.yml 都读它，改一处两边同时变）。此前 `make test` 不带 skip，出厂即红在 CI 恰好跳过的那条子测试上——本地红/CI 绿无法区分「自己弄坏了」还是「基线红」。
+- **workflow 形状自审**：`scripts/ci-workflow-audit.sh` 由 ci.yml 第一步与 `make audit` 调用，机器校验 ①每个 `uses:` 是 40 位 SHA 且带 `# vX.Y.Z` 注释（dependabot 靠该注释跟进）②无浮动工具链（`go-version-file: go.mod`，不用 `stable`）③workflow 级 `permissions:` ④job `timeout-minutes:` ⑤checkout `persist-credentials: false`。回归时精确红。
+- **concurrency 只对 PR 取消**：`cancel-in-progress` 绑 `github.event_name == 'pull_request'`。main 上并发取消会产生 `cancelled` 结论，而 landing gate 把 `cancelled` 判红——历史上已多次「main cancelled → 压分支」的假红。
+- **本地 Makefile 不再吞 rc**：原 `lint: vet` + `gofmt -l .` 只打印未格式化文件而 exit 0（同一棵树 CI 红、本地绿）；现 `make fmt-check` 列表非空即 rc=1。Makefile 同时去掉了 `GOFLAGS=-mod=mod`——它让 `make build` 静默重写 go.mod/go.sum 并成功，而 CI（默认只读）同树失败。
+- **`.code.yml` 已删**：内网 DevCloud 描述符的残留（artifact `go-loki` + `git.woa.com/thor-family/loki/go-loki`），与本仓 remote/module 无任何对应；`.golangci.yml` 的 `local-prefixes` 同步改回本模块。`pre-commit` 改为 local hooks（原配置走 `git://`——明文未认证、GitHub 已停用，`pre-commit install` 直接失败）。
+- **dependabot**：`.github/dependabot.yml` 月度分组更新 gomod + github-actions（后者同时改写 SHA 与版本注释）。
 
 ## 节点对齐矩阵（现状）
 
@@ -158,10 +170,9 @@ agentrun `workspace=` 分支从「拒载」改为「计划支持」。**对齐�
 ## 已知问题
 
 - ~~error_node 上游遗留红~~ **已修平（2026-10-19 audit wave，#12/#13 http 契约修复顺带解决；撤代理后 1002=期望）**。
-- `TestWorkflow_Execute/test_execute_workflow_with_error_node`：`6929c35` 上本地稳定红（end 输出 `[]` 对 string 校验失败）；`origin/main` 干净 worktree 复跑同样红，**非 Face 2 三门引入**，待单独定位。
-- `test_execute_workflow_with_http_request_info`：live-network 测试（断言真实出网失败），结果取决于出口网络状态——CI 以 -skip 排除。
-- `Test_today_eval`/`Test_now_eval`：gomonkey time.Now 补丁抖动（测的是补丁不是代码），CI -skip。
-- `go vet`：pkg/providers/memory、filesystem 有 lock 值拷贝告警（上游质量噪音）。
+- `TestWorkflow_Execute/test_execute_workflow_with_http_request_info`（当前唯一红）：`$ERROR.http.Info.Request.Method` 取到 `[]`，end 按 string 校验报错。用例打真实出网（`http://tencent.com`），出口不可达时确定性红。**CI 与 `make test` 经 `scripts/ci-skip.txt` 跳过，`make test-all` 复现**。2026-10-21 复核：同表的 `test_execute_workflow_with_error_node` 已绿（旧条目把它记成了这条红）。
+- `Test_now_today_eval`：gomonkey `time.Now` 补丁在同一测试二进制内多次重放不稳（darwin/arm64 实测 `-count=3` 第 3 次起红），CI skip。`$F.now/$F.today` 的 CI 覆盖因此只剩 `Test_strftime_directives`（直接测 strftime 层）。`Test_today_eval`/`Test_now_eval` 已不存在，skip 清单与测试注释同步剔除。
+- `go vet ./...`：2026-10-21 复核 rc=0 无输出（旧条目里的 providers lock 值拷贝告警已不在）。
 
 ## 约定
 
