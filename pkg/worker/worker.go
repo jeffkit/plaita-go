@@ -16,6 +16,7 @@ import (
 
 	"github.com/jeffkit/plaita-go/internal/runtime"
 	"github.com/jeffkit/plaita-go/internal/version"
+	"github.com/jeffkit/plaita-go/pkg/sandbox"
 	"github.com/jeffkit/plaita-go/pkg/workflow"
 )
 
@@ -69,10 +70,14 @@ import (
 //	        — the progress heartbeat (ttl/3) stands in for it.
 //	TODO(phase-3): task age gate (PLAITA_TASK_MAX_AGE_SECONDS, §1.2) and the
 //	        tenant quota / dedup-key idempotency paths.
-//	TODO(phase-3): node-retry carrier conversion — a retryable node failure
-//	        still re-enqueues a start carrier (whole-flow replay) because an
-//	        error execution has no checkpoint; the start→resume/continue
-//	        conversion waits for per-step checkpoints.
+//	Landed since M6: the node-retry carrier conversion (§9.1 #91) — a
+//	        retryable failure re-enqueues a resume/continue carrier whenever a
+//	        state row exists (retry.go), after snapshotting a failure-boundary
+//	        checkpoint; the continue arrival path advances the live execution
+//	        (continueRunning). The engine has no mid-flow entry yet, so the
+//	        continuation re-enters at the flow start (completed predecessors
+//	        re-run); everything around the engine call — lease, fingerprint
+//	        gate, history carry, checkpoint lifecycle — is the resume path's.
 
 // runContextKey carries the executionRun through the engine execution
 // context so the global engine event listeners can correlate events to the
@@ -447,6 +452,11 @@ type executePlan struct {
 	// resume, when non-nil, turns the engine call into Workflow.Resume
 	// (suspended → event/timeout/cancel carrier) instead of Workflow.Execute.
 	resume *resumeInput
+	// continuation marks a continue/retry carrier advancing a live (running)
+	// execution (§9.1 conversion target): the engine call stays
+	// Workflow.Execute, but the row's node_timings/timeline are carried
+	// forward so the terminal row reads as one execution (§5.1).
+	continuation bool
 }
 
 // resumeInput carries the checkpoint + carrier for a resume execution.
@@ -485,10 +495,10 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 		nodeTimings: map[string]map[string]any{},
 		enqueuedAt:  task.Timestamp,
 	}
-	if plan.resume != nil {
-		// A resume is a continuation of the same execution: carry the
-		// suspended row's node timings + timeline forward so the terminal
-		// write does not erase the pre-suspend history (§5.1).
+	if plan.resume != nil || plan.continuation {
+		// A resume/continuation is a continuation of the same execution:
+		// carry the previous row's node timings + timeline forward so the
+		// terminal write does not erase the earlier history (§5.1).
 		seedRunFromState(run, plan.state)
 	}
 	if wait, ok := queueWaitMillis(task.Timestamp); ok {
@@ -511,6 +521,12 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 		Store:         w.checkpoints,
 		Subscriptions: w.eventSubs,
 	})
+	// Sandbox execution scope (pkg/sandbox resolution order: ctx value >
+	// PLAITA_EXECUTION_ID env > $GLOBAL): threading the real execution id
+	// makes the workspace identity {execution_id}:{ws_key} stable, so a
+	// retried/resumed carrier re-attaches to the same sandbox instead of
+	// falling back to the (node, input) hash scope.
+	ctx = sandbox.WithExecutionID(ctx, task.ExecutionID)
 	w.registerRun(run, cancelRun)
 	defer w.unregisterRun(run)
 	defer w.dropOrphan(task.ExecutionID, "run ended")
@@ -809,39 +825,11 @@ func (w *Worker) resumeSuspended(ctx context.Context, task *Task, state *Executi
 	if flowID == "" {
 		flowID = state.FlowID
 	}
-	// §7: resume uses the version recorded on the state row, not "latest".
-	def, err := w.flows.GetFlowDefinition(ctx, tenant, flowID, state.FlowVersion)
-	if err != nil {
-		if errors.Is(err, ErrFlowNotFound) {
-			w.logger.Error("resume: flow definition not loadable, error terminal",
-				"flow_id", flowID, "version", state.FlowVersion, "error", err)
-			ne := WorkerError("flow_not_found", flowErrorCode, err.Error())
-			w.deleteCheckpoint(ctx, tenant, task.ExecutionID)
-			return w.persistErrorTerminal(ctx, tenant, handle.FenceToken, state, nil, ne)
-		}
-		return fmt.Errorf("resume flow load: %w", err)
-	}
-
-	// §7 flow-fingerprint hard gate: resuming a checkpoint against a changed
-	// flow silently corrupts the run. The explicit opt-out is the carrier's
-	// allow_flow_hash_change (Python data.allow_flow_hash_change).
-	allowHashChange, _ := task.Data["allow_flow_hash_change"].(bool)
-	if !allowHashChange && state.FlowHash != "" && def.Hash != "" && state.FlowHash != def.Hash {
-		w.logger.Error("resume: flow definition changed since the checkpoint was written",
-			"execution_id", task.ExecutionID,
-			"stored_flow_hash", state.FlowHash, "current_flow_hash", def.Hash)
-		ne := WorkerError("flow_hash_mismatch", flowErrorCode, fmt.Sprintf(
-			"flow definition changed since execution %s started (stored=%s current=%s); "+
-				"resume refused (set allow_flow_hash_change=true on the carrier to override)",
-			task.ExecutionID, state.FlowHash, def.Hash))
-		ne.Details = map[string]any{
-			"stored_flow_hash":       state.FlowHash,
-			"current_flow_hash":      def.Hash,
-			"stored_flow_hash_algo":  state.FlowHashAlgo,
-			"current_flow_hash_algo": def.HashAlgo,
-			"upgrade_suspected":      state.FlowHashAlgo != "" && def.HashAlgo != "" && state.FlowHashAlgo != def.HashAlgo,
-		}
-		return w.persistErrorTerminal(ctx, tenant, handle.FenceToken, state, nil, ne)
+	def, err := w.loadContinuationDefinition(ctx, task, state, flowID, handle.FenceToken)
+	if err != nil || def == nil {
+		// Deterministic terminal already written (nil def), or a transient
+		// load failure that leaves the message pending (non-nil err).
+		return err
 	}
 
 	checkpoint, err := w.checkpoints.LoadCheckpoint(ctx, tenant, task.ExecutionID)
@@ -879,6 +867,103 @@ func (w *Worker) resumeSuspended(ctx context.Context, task *Task, state *Executi
 			data:       task.Data,
 		},
 	})
+}
+
+// continueRunning advances a live (running) execution carrying a
+// continue/retry carrier — the arrival half of the §9.1 retry-carrier
+// conversion (Python resume_flow: running + continue/retry share one stepping
+// path, "必须真实重派"). Python resumes from its per-step checkpoint; this
+// build re-enters the engine at the flow start (no mid-flow entry yet —
+// documented engine-scope deviation), but the surrounding dispositions are
+// the resume path's: flow-id gate, §7 fingerprint hard gate, history carry
+// (executeAndFinalize seeding), checkpoint lifecycle and the §5.2 terminal
+// write. A failure-boundary checkpoint written by the requeue path is the
+// resume-position evidence; its absence is NOT fatal (Python: continue
+// without a saved context degrades to a fresh run of the same execution).
+func (w *Worker) continueRunning(ctx context.Context, task *Task, state *ExecutionState, handle *LeaseHandle) error {
+	tenant := task.TenantID
+	flowID := task.FlowID
+	if flowID == "" {
+		flowID = state.FlowID
+	}
+	def, err := w.loadContinuationDefinition(ctx, task, state, flowID, handle.FenceToken)
+	if err != nil || def == nil {
+		return err
+	}
+	if cp, cerr := w.checkpoints.LoadCheckpoint(ctx, tenant, task.ExecutionID); cerr != nil {
+		// A real read failure stays pending; a missing checkpoint proceeds.
+		return fmt.Errorf("continue checkpoint probe: %w", cerr)
+	} else if cp != nil {
+		w.logger.Info("continue carrier resuming a live execution (checkpoint position recorded)",
+			"execution_id", task.ExecutionID, "resume_type", task.ResumeType,
+			"checkpoint_node", string(cp.SuspendedNode))
+	} else {
+		w.logger.Warn("continue carrier resuming a live execution without a checkpoint (fresh-run parity)",
+			"execution_id", task.ExecutionID, "resume_type", task.ResumeType)
+	}
+	return w.executeAndFinalize(ctx, executePlan{
+		task:         task,
+		def:          def,
+		handle:       handle,
+		state:        state,
+		continuation: true,
+	})
+}
+
+// loadContinuationDefinition resolves the flow for a resume-path advance and
+// enforces the §7 admission gates shared by both resume paths:
+//
+//   - flow-id mismatch (carrier vs stored row) → poison ack, row untouched
+//     (Python _load_and_guard_resume_state: ValueError);
+//   - flow definition missing → deterministic flow_not_found error terminal;
+//   - definition changed since the start (fingerprint mismatch) →
+//     flow_hash_mismatch error terminal, unless the carrier carries
+//     allow_flow_hash_change (Python data.allow_flow_hash_change).
+//
+// A nil def with a nil error means a deterministic terminal was already
+// written; a non-nil error leaves the message pending (transient).
+func (w *Worker) loadContinuationDefinition(ctx context.Context, task *Task,
+	state *ExecutionState, flowID string, fenceGen int64) (*FlowDefinition, error) {
+	tenant := task.TenantID
+	if state.FlowID != "" && flowID != "" && state.FlowID != flowID {
+		w.logger.Warn("resume carrier flow_id does not match the stored row, poison ack",
+			"execution_id", task.ExecutionID, "carrier_flow", flowID, "stored_flow", state.FlowID)
+		return nil, nil
+	}
+	def, err := w.flows.GetFlowDefinition(ctx, tenant, flowID, state.FlowVersion)
+	if err != nil {
+		if errors.Is(err, ErrFlowNotFound) {
+			w.logger.Error("resume: flow definition not loadable, error terminal",
+				"flow_id", flowID, "version", state.FlowVersion, "error", err)
+			ne := WorkerError("flow_not_found", flowErrorCode, err.Error())
+			w.deleteCheckpoint(ctx, tenant, task.ExecutionID)
+			return nil, w.persistErrorTerminal(ctx, tenant, fenceGen, state, nil, ne)
+		}
+		return nil, fmt.Errorf("resume flow load: %w", err)
+	}
+
+	// §7 flow-fingerprint hard gate: resuming a checkpoint against a changed
+	// flow silently corrupts the run. The explicit opt-out is the carrier's
+	// allow_flow_hash_change (Python data.allow_flow_hash_change).
+	allowHashChange, _ := task.Data["allow_flow_hash_change"].(bool)
+	if !allowHashChange && state.FlowHash != "" && def.Hash != "" && state.FlowHash != def.Hash {
+		w.logger.Error("resume: flow definition changed since the checkpoint was written",
+			"execution_id", task.ExecutionID,
+			"stored_flow_hash", state.FlowHash, "current_flow_hash", def.Hash)
+		ne := WorkerError("flow_hash_mismatch", flowErrorCode, fmt.Sprintf(
+			"flow definition changed since execution %s started (stored=%s current=%s); "+
+				"resume refused (set allow_flow_hash_change=true on the carrier to override)",
+			task.ExecutionID, state.FlowHash, def.Hash))
+		ne.Details = map[string]any{
+			"stored_flow_hash":       state.FlowHash,
+			"current_flow_hash":      def.Hash,
+			"stored_flow_hash_algo":  state.FlowHashAlgo,
+			"current_flow_hash_algo": def.HashAlgo,
+			"upgrade_suspected":      state.FlowHashAlgo != "" && def.HashAlgo != "" && state.FlowHashAlgo != def.HashAlgo,
+		}
+		return nil, w.persistErrorTerminal(ctx, tenant, fenceGen, state, nil, ne)
+	}
+	return def, nil
 }
 
 // checkpointFromStateContext rebuilds a minimal checkpoint from a state row's
@@ -980,6 +1065,13 @@ func (w *Worker) classifyNodeFailure(ctx context.Context, tenant string, handle 
 
 	w.logger.Warn("node retryable failure below budget, re-enqueueing after backoff",
 		"execution_id", state.ExecutionID, "node", nodeID, "attempt", attempt, "budget", budget)
+	// §9.1 conversion support: snapshot the execution at the failure boundary
+	// so the converted resume carrier finds a resume position (M6 checkpoint
+	// machinery applied at the failure boundary). Best-effort evidence — the
+	// carrier conversion itself keys on the ROW's existence (Python
+	// _requeue_body_for_retry), and a continue carrier without a checkpoint
+	// still advances (fresh-run parity).
+	w.saveFailureCheckpoint(ctx, tenant, state, run)
 	return false, &NodeRetryableError{
 		ExecutionID: state.ExecutionID,
 		FailedNode:  nodeID,
@@ -987,6 +1079,52 @@ func (w *Worker) classifyNodeFailure(ctx context.Context, tenant string, handle 
 		Budget:      budget,
 		Err:         execErr,
 	}, nil
+}
+
+// saveFailureCheckpoint snapshots the runtime context captured at flow end
+// (rootRuntime holds the live context even for a failed attempt) into the
+// execution's checkpoint key. The snapshot carries the completed-node results
+// ($NODE), $LAST_NODE and the failure's $ERROR — the position a continue
+// carrier would resume from. Snapshot/persist failures only warn: losing the
+// evidence degrades the next carrier to fresh-run parity, never blocks the
+// retry.
+func (w *Worker) saveFailureCheckpoint(ctx context.Context, tenant string, state *ExecutionState, run *executionRun) {
+	if run == nil {
+		return
+	}
+	rootRuntime, _ := run.rootRuntime.(context.Context)
+	if rootRuntime == nil {
+		return
+	}
+	opts := &workflow.SuspendOptions{
+		ExecutionID: state.ExecutionID,
+		TenantID:    tenant,
+		FlowID:      state.FlowID,
+	}
+	snap, err := workflow.SnapshotRuntimeContext(rootRuntime, opts)
+	if err != nil {
+		w.logger.Warn("failure checkpoint snapshot failed; retry carrier continues without one",
+			"execution_id", state.ExecutionID, "error", err)
+		return
+	}
+	lastNode := ""
+	if rc := runtime.WorkflowRuntimeContext(rootRuntime); rc != nil {
+		lastNode = string(rc.LastNodeID)
+	}
+	cp := &workflow.Checkpoint{
+		SchemaVersion: workflow.CheckpointSchemaVersion,
+		ExecutionID:   state.ExecutionID,
+		TenantID:      tenant,
+		FlowID:        state.FlowID,
+		SuspendedNode: workflow.NodeID(lastNode),
+		ResumeType:    workflow.ResumeContinue,
+		Context:       snap,
+		CreatedAt:     nowISO(),
+	}
+	if err := w.checkpoints.SaveCheckpoint(ctx, cp); err != nil {
+		w.logger.Warn("failure checkpoint persist failed; retry carrier continues without one",
+			"execution_id", state.ExecutionID, "error", err)
+	}
 }
 
 // resetRetryProgress clears the retry counters for every node that advanced
@@ -1213,6 +1351,15 @@ func (w *Worker) resumeUnderLease(ctx context.Context, task *Task) error {
 		// M6: real wake-up — restore the checkpoint, dispatch to the suspended
 		// node's Resume and continue the flow.
 		return w.resumeSuspended(ctx, task, state, handle)
+	}
+
+	if state.Status == StatusRunning &&
+		(task.ResumeType == workflow.ResumeContinue || task.ResumeType == workflow.ResumeRetry) {
+		// §9.1 / #91: a converted retry carrier (or any continue/retry
+		// carrier) landing on a live execution continues THIS execution.
+		// Python: "running 执行没有失败节点可重跑……retry 在此的语义 = 从
+		// checkpoint 派发后继节点（与 continue 同路），必须真实重派".
+		return w.continueRunning(ctx, task, state, handle)
 	}
 
 	// Any other carrier/state combination has no advance semantics in this
@@ -1538,7 +1685,19 @@ func (w *Worker) requeueRetryableFailure(ctx context.Context, delivery *Delivery
 			return true, fmt.Errorf("%w: retry backoff aborted", ErrDrainAborted)
 		}
 	}
-	body := w.retryCarrierBody(ctx, task)
+	body, cerr := w.retryCarrierBody(ctx, task)
+	if cerr != nil {
+		// Tombstone probe failure: fail closed, the original stays pending
+		// (Python raises in the same position — 绝不 fail-open 重排).
+		return true, fmt.Errorf("retry carrier body: %w", cerr)
+	}
+	if body == nil {
+		// Deleted execution (tombstone): ack and drop — a re-enqueued copy
+		// would resurrect it (§9.1 / A51-01, flow_worker.py:313-389).
+		w.logger.Warn("retryable failure on a deleted execution; original acked without a re-enqueue",
+			"execution_id", task.ExecutionID, "node", nre.FailedNode)
+		return true, w.queue.Ack(ctx, task.MessageID)
+	}
 	messageID, err := w.queue.Enqueue(ctx, body, task.EnvelopeSchemaVer)
 	if err != nil {
 		w.logger.Warn("retry carrier enqueue failed; original left pending for reclaim",

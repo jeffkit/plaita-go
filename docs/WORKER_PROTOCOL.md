@@ -467,7 +467,7 @@ EventSubscription: {subscription_id, event_type(非空强制), filter_condition?
 - **MVP（一期）已落地**：`pkg/worker`（Stream 消费 + reclaim + DLQ 信封/schema 拒收/残留 sweep、三段租约 Lua + fence CAS 写、ExecutionState 字段级写回 + timeline/node_timings、取消标志轮询、注册表心跳 + 容量块、flow 来源读路径 + v2 指纹）、`cmd/plaita-worker`（env 配置 + 影子前缀）。
 - **二期（M4）已落地**：orphan watch（失租后仅进度心跳）、resume 载体语义（A47-F2：决议载体冲突窗口不 ack / 终态幂等 ack / suspended+continue 短路 + dispatch_pending 补偿 / event/timeout 归一化 continue）、dispatch_ledger（§6.3 schema + 入队唯一入口 + 读/对账）+ TaskNotForThisWorker 有界交接、DLQ replay（幂等标记 + 审计 + 确定性 id + schema 继承 + 墓碑）+ 死信守卫恢复克隆/预算终态化、drain 三态（D1/D2/D3）+ 信号优雅退出、节点级三层重试预算 + 退避重投。
 - **M6 checkpoint v1.5 已落地**（见 §9.4）：挂起边界快照（环安全/深度上限）、event/hitl_await 挂起节点、event/timeout 真恢复、Redis Pub/Sub 唤醒 + 订阅超时检查器、start 载体命中 suspended 幂等 ack。
-- **刻意偏差**：节点重投载体保持 start（同 execution_id 整条重放），不转 resume/continue（错误执行没有 checkpoint，需每步 checkpoint）；D2 中止的步不写终态、留 pending（无硬中断 B18-01）；仅根流程可挂起；事件 Pub/Sub 无回扫器（订阅超时/状态双写保证至少一次唤醒）。以上已在 AGENTS.md 对应章节逐条声明。
+- **刻意偏差**：~~节点重投载体保持 start~~ **已收敛（worker-tail，2026-10-20）**——可重试失败重投前查盘转 resume/continue（`_requeue_body_for_retry` 同构，含墓碑 ack 丢弃/读盘失败原样 start），失败边界写 checkpoint，continue 载体对 running 执行真推进；残余引擎面偏差：Go 引擎无中途入口，推进时从 flow 起点重入（已完成节点重放）。其余不变：D2 中止的步不写终态、留 pending（无硬中断 B18-01）；仅根流程可挂起；事件 Pub/Sub 无回扫器（订阅超时/状态双写保证至少一次唤醒）。以上已在 AGENTS.md 对应章节逐条声明。
 
 ### 10.2 缺口清单（按本协议文档逐章）
 
@@ -482,7 +482,7 @@ EventSubscription: {subscription_id, event_type(非空强制), filter_condition?
 | §7 flow 来源 | RedisFlowStorage 读路径（`{ns}:flow:{id}:{ver}` + flow_list/flow_versions SET + latest/数字版本序）；指纹算法（sort_keys JSON sha256 + algo v2 标记）——指纹是 resume 硬门，Go 必须同口径 | P0（同 Redis 即可对跑） | ✅ 读/指纹；resume 指纹硬门（flow_hash_mismatch + allow_flow_hash_change 放行）已落 |
 | §8 心跳 | 注册表键 + ServiceInfo JSON（status 生命周期、worker_capacity 块）+ 进度心跳（node_timings 在跑节点 `ended_at=""` 约定） | P1（keeper 误杀风险，随影子上线即需要） | ✅ 三层（含失租 orphan watch） |
 | §6 事件 | Go worker 第一阶段可只读不写业务事件；`timeline`/`node_timings` 落盘必须有（keeper 判据）；SSE 发布可后置 | P2 | ✅ timeline/耗时落盘 + execution events PUBLISH；业务事件 PUBLISH/订阅/唤醒（M6 §9.4） |
-| §9 退避/drain | 三层重试预算键 + 显式重投（先入队后 ack）+ resume 载体转换 + 信号处理 | P1 | ✅ 三层预算 + 退避重投 + drain 三态；重投载体仍为 start（无每步 checkpoint，三期转换） |
+| §9 退避/drain | 三层重试预算键 + 显式重投（先入队后 ack）+ resume 载体转换 + 信号处理 | P1 | ✅ 三层预算 + 退避重投 + drain 三态 + 重投载体查盘转 resume/continue（worker-tail：失败边界 checkpoint + continue 真推进；引擎中途入口缺位，推进为 flow 起点重入） |
 | §6.3 派发台账 | 台账 Stream + 入队唯一入口 + TaskNotForThisWorker 有界交接 | P1 | ✅ 二期 |
 | 控制面 | stop/status Pub/Sub 命令（`plaita:control:{instance}`）、`/metrics` | P3 | ❌ 未做 |
 

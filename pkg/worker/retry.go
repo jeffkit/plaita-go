@@ -202,16 +202,84 @@ func isRetryableNodeFailure(err error, run *executionRun) bool {
 }
 
 // retryCarrierBody builds the re-enqueued carrier for a retryable node
-// failure.
+// failure — the Go port of `_requeue_body_for_retry` (§9.1,
+// flow_worker.py:313-389, #91 载体转换): before re-enqueueing, a start
+// carrier is checked against the state row and converted to a
+// resume/continue carrier whenever a row exists, so the redelivered copy
+// continues the SAME execution instead of replaying it from the first node
+// (which would re-run side-effectful predecessors up to budget times).
+// Branch table, in the Python docstring's order:
 //
-// Protocol §9.1 converts a start carrier into a resume/continue carrier when a
-// checkpoint row exists. M6 writes checkpoints only at suspend boundaries, so
-// an error execution has no resume position; a continue carrier would fail
-// admission. The carrier therefore stays a start copy of the same
-// execution_id: the budget/backoff/re-enqueue semantics are identical, only
-// the replay起点 differs (whole-flow replay instead of step-boundary resume).
-// The conversion returns once per-step checkpoints exist (phase 3).
-func (w *Worker) retryCarrierBody(ctx context.Context, task *Task) map[string]any {
+//   - a non-start task passes through unchanged (it already carries
+//     checkpoint semantics);
+//   - no execution_id → start copy (fresh-start semantics unchanged);
+//   - deletion tombstone → (nil, nil): the caller must ack the original and
+//     NOT re-enqueue (A51-01 — a re-enqueued copy would resurrect the
+//     deleted execution);
+//   - tombstone probe failure → (nil, err): fail closed, the original stays
+//     pending (Python raises in the same position — 绝不 fail-open 重排);
+//   - state read failure → start copy (fail-safe: the conversion is an
+//     optimization and must never cost the message its cadence);
+//   - no state row (crash before the first persist) → start copy;
+//   - stored flow_id ≠ carrier flow_id → start copy (a converted copy would
+//     be poison-acked by the resume flow-id gate);
+//   - a row exists → {"type":"resume","resume_type":"continue", …} with
+//     params passed through when non-empty (#122). The version is
+//     deliberately dropped: the resume path resolves the definition from the
+//     state row's flow_version (§7).
+func (w *Worker) retryCarrierBody(ctx context.Context, task *Task) (map[string]any, error) {
+	if task.Type != "start" {
+		return taskPayloadDict(task), nil
+	}
+	if task.ExecutionID == "" {
+		return startCarrierBody(task), nil
+	}
+	tombstoned, err := w.executionTombstoned(ctx, task.TenantID, task.ExecutionID)
+	if err != nil {
+		w.logger.Warn("retry carrier tombstone probe failed; original left pending",
+			"execution_id", task.ExecutionID, "error", err)
+		return nil, err
+	}
+	if tombstoned {
+		w.logger.Warn("execution deleted (tombstone), retry re-enqueue dropped: the original will be acked",
+			"execution_id", task.ExecutionID, "tenant_id", task.TenantID)
+		return nil, nil
+	}
+	state, err := w.store.LoadExecutionState(ctx, task.TenantID, task.ExecutionID)
+	if err != nil {
+		// Read failure does not block the re-enqueue (原样 start, fail-safe).
+		w.logger.Warn("retry carrier state probe failed, re-enqueueing a start copy",
+			"execution_id", task.ExecutionID, "error", err)
+		return startCarrierBody(task), nil
+	}
+	if state == nil {
+		return startCarrierBody(task), nil
+	}
+	if state.FlowID != "" && state.FlowID != task.FlowID {
+		w.logger.Warn("retry carrier flow_id differs from the stored row, re-enqueueing a start copy",
+			"execution_id", task.ExecutionID, "carrier_flow", task.FlowID, "stored_flow", state.FlowID)
+		return startCarrierBody(task), nil
+	}
+	body := map[string]any{
+		"type":         "resume",
+		"flow_id":      task.FlowID,
+		"execution_id": task.ExecutionID,
+		"resume_type":  "continue",
+		"timestamp":    nowISO(),
+	}
+	if task.TenantID != "" {
+		body["tenant_id"] = task.TenantID
+	}
+	if len(task.Params) > 0 {
+		body["params"] = task.Params
+	}
+	w.logger.Info("retry carrier converted to resume/continue (state row exists, continuing the same execution)",
+		"execution_id", task.ExecutionID, "status", state.Status)
+	return body, nil
+}
+
+// startCarrierBody is the unchanged start copy (fresh-start semantics).
+func startCarrierBody(task *Task) map[string]any {
 	body := map[string]any{
 		"type":         "start",
 		"flow_id":      task.FlowID,
