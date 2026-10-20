@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jeffkit/plaita-go/pkg/workflow"
 )
 
 // failOnceHTTPFlow presets start → http → end where the http endpoint aborts
@@ -39,9 +41,11 @@ func failOnceHTTPFlow(t *testing.T, w *Worker, flowID string) *httptest.Server {
 	return srv
 }
 
-// TestNodeRetryRequeuesThenSucceeds (§9.1): a retryable node failure below
-// budget re-enqueues a fresh carrier (backoff skipped in tests), acking the
-// original; the retry runs and completes, clearing the counters.
+// TestNodeRetryRequeuesThenSucceeds (§9.1 + #91 载体转换): a retryable node
+// failure below budget snapshots a failure-boundary checkpoint, re-enqueues a
+// CONVERTED resume/continue carrier (the state row exists) and acks the
+// original; the redelivered carrier continues the same execution through the
+// resume path and completes, clearing the counters and the checkpoint.
 func TestNodeRetryRequeuesThenSucceeds(t *testing.T) {
 	oldBase := nodeRetryBackoffBase
 	nodeRetryBackoffBase = 0
@@ -58,7 +62,8 @@ func TestNodeRetryRequeuesThenSucceeds(t *testing.T) {
 	payload["flow_id"] = "retry_flow"
 	enqueueTask(t, rdb, cfg, payload, "")
 
-	// First attempt: retryable failure → carrier re-enqueued, original acked.
+	// First attempt: retryable failure → carrier converted + re-enqueued,
+	// original acked.
 	if _, err := w.ProcessOne(ctx); err != nil {
 		t.Fatalf("first ProcessOne: %v", err)
 	}
@@ -73,8 +78,14 @@ func TestNodeRetryRequeuesThenSucceeds(t *testing.T) {
 	if err := json.Unmarshal([]byte(msgs[0].Values["payload"].(string)), &carrier); err != nil {
 		t.Fatal(err)
 	}
-	if carrier["type"] != "start" || carrier["execution_id"] != executionID {
-		t.Fatalf("retry carrier wrong: %v", carrier)
+	if carrier["type"] != "resume" || carrier["resume_type"] != "continue" {
+		t.Fatalf("retry carrier = %v, want resume/continue (§9.1 conversion)", carrier)
+	}
+	if carrier["execution_id"] != executionID || carrier["flow_id"] != "retry_flow" {
+		t.Fatalf("retry carrier attribution lost: %v", carrier)
+	}
+	if _, hasVersion := carrier["version"]; hasVersion {
+		t.Fatalf("converted carrier must not pin a version (resume reads the row's): %v", carrier)
 	}
 	if got := rdb.Get(ctx, cfg.KeyPrefix+":execution:noderetry:"+executionID+":call").Val(); got != "1" {
 		t.Fatalf("per-node counter = %q, want 1", got)
@@ -85,9 +96,15 @@ func TestNodeRetryRequeuesThenSucceeds(t *testing.T) {
 	if state := loadStateRow(t, rdb, cfg, executionID); state.Status != StatusRunning {
 		t.Fatalf("status after retryable failure = %q, want running", state.Status)
 	}
+	// The failure-boundary checkpoint is the resume-position evidence.
+	cp := loadCheckpointRow(t, rdb, cfg, executionID)
+	if cp.ResumeType != workflow.ResumeContinue || cp.SuspendedNode == "" {
+		t.Fatalf("failure checkpoint = %+v, want a continue position", cp)
+	}
 
-	// Second attempt: the endpoint answers, the flow completes and every retry
-	// counter is cleared.
+	// Second attempt: the converted carrier continues the same execution, the
+	// endpoint answers, the flow completes and every retry counter and the
+	// checkpoint are cleaned up.
 	if _, err := w.ProcessOne(ctx); err != nil {
 		t.Fatalf("second ProcessOne: %v", err)
 	}
@@ -106,6 +123,92 @@ func TestNodeRetryRequeuesThenSucceeds(t *testing.T) {
 		if v := rdb.Get(ctx, key).Val(); v != "" {
 			t.Fatalf("counter %s not reset: %q", key, v)
 		}
+	}
+	if raw := rdb.Get(ctx, cfg.KeyPrefix+":execution:checkpoint:"+executionID).Val(); raw != "" {
+		t.Fatal("checkpoint must be deleted on the terminal write")
+	}
+}
+
+// TestNodeRetryTombstoneDropsReenqueue (§9.1 / A51-01): a retryable failure
+// on a deleted execution acks the original WITHOUT re-enqueueing — a fresh
+// carrier would resurrect the execution start_flow-side.
+func TestNodeRetryTombstoneDropsReenqueue(t *testing.T) {
+	oldBase := nodeRetryBackoffBase
+	nodeRetryBackoffBase = 0
+	defer func() { nodeRetryBackoffBase = oldBase }()
+
+	w, rdb, _, cfg := newTestWorker(t)
+	ctx := context.Background()
+	cfg.MaxDeliveries = 5
+	srv := failOnceHTTPFlow(t, w, "tombstone_retry_flow")
+	defer srv.Close()
+
+	executionID := newExecutionID()
+	payload := baseStartPayload(executionID)
+	payload["flow_id"] = "tombstone_retry_flow"
+	enqueueTask(t, rdb, cfg, payload, "")
+	// Platform-root deletion tombstone (§8.3), written before the run.
+	rdb.Set(ctx, cfg.KeyPrefix+":exec_tombstone:"+executionID,
+		`{"reason":"user","tenant":""}`, time.Minute)
+
+	if _, err := w.ProcessOne(ctx); err != nil {
+		t.Fatalf("ProcessOne: %v", err)
+	}
+	if n := streamLen(t, rdb, cfg.QueueName); n != 0 {
+		t.Fatalf("queue XLEN = %d, want 0 (tombstone: acked, no re-enqueue)", n)
+	}
+	if n := pendingCount(t, rdb, cfg); n != 0 {
+		t.Fatalf("PEL = %d, want 0 (original acked)", n)
+	}
+}
+
+// TestNodeRetryContinueFailsOnFlowHashMismatch (§7): the converted continue
+// carrier goes through the same fingerprint hard gate as any resume — a
+// definition changed between the failure and the redelivery terminalizes
+// flow_hash_mismatch instead of corrupting the run.
+func TestNodeRetryContinueFailsOnFlowHashMismatch(t *testing.T) {
+	oldBase := nodeRetryBackoffBase
+	nodeRetryBackoffBase = 0
+	defer func() { nodeRetryBackoffBase = oldBase }()
+
+	w, rdb, _, cfg := newTestWorker(t)
+	ctx := context.Background()
+	cfg.MaxDeliveries = 5
+	srv := failOnceHTTPFlow(t, w, "hash_retry_flow")
+	defer srv.Close()
+
+	executionID := newExecutionID()
+	payload := baseStartPayload(executionID)
+	payload["flow_id"] = "hash_retry_flow"
+	enqueueTask(t, rdb, cfg, payload, "")
+
+	if _, err := w.ProcessOne(ctx); err != nil {
+		t.Fatalf("first ProcessOne: %v", err)
+	}
+	// Rewrite the definition under the same flow/version and drop the cache
+	// (fresh-process semantics), then process the converted carrier.
+	changed := `{
+	  "flow_id": "hash_retry_flow",
+	  "nodes": [
+	    {"type": "start", "id": "start", "next": "call"},
+	    {"type": "http", "id": "call", "url": "http://changed.invalid/x", "method": "GET", "next": "end"},
+	    {"type": "end", "id": "end", "resultType": "success", "output": "done"}
+	  ]
+	}`
+	if err := w.flows.PresetFlowDefinition(ctx, "", "hash_retry_flow", "latest", []byte(changed)); err != nil {
+		t.Fatal(err)
+	}
+	w.flows.cache = map[string]FlowDefinition{}
+
+	if _, err := w.ProcessOne(ctx); err != nil {
+		t.Fatalf("second ProcessOne: %v", err)
+	}
+	state := loadStateRow(t, rdb, cfg, executionID)
+	if state.Status != StatusError || state.Error["error_type"] != "flow_hash_mismatch" {
+		t.Fatalf("state = %+v, want error/flow_hash_mismatch", state)
+	}
+	if n := streamLen(t, rdb, cfg.QueueName); n != 0 {
+		t.Fatalf("queue XLEN = %d, want 0", n)
 	}
 }
 
@@ -228,15 +331,20 @@ func TestNodeRetryBackoffSchedule(t *testing.T) {
 	}
 }
 
-// TestRetryCarrierKeepsAttribution: the retry carrier preserves flow/tenant
-// and params so a replayed run is the same execution.
+// TestRetryCarrierKeepsAttribution: with no state row on disk the retry
+// carrier stays a start copy (fresh-start semantics, §9.1 conversion branch)
+// and preserves flow/tenant/params/version so a replayed run is the same
+// execution.
 func TestRetryCarrierKeepsAttribution(t *testing.T) {
 	w, _, _, _ := newTestWorker(t)
 	task := &Task{
 		Type: "start", FlowID: "f1", ExecutionID: "e1", TenantID: "acme",
 		Version: "v3", Params: map[string]any{"x": 1},
 	}
-	body := w.retryCarrierBody(context.Background(), task)
+	body, err := w.retryCarrierBody(context.Background(), task)
+	if err != nil {
+		t.Fatalf("retryCarrierBody: %v", err)
+	}
 	if body["type"] != "start" || body["flow_id"] != "f1" || body["execution_id"] != "e1" ||
 		body["tenant_id"] != "acme" || body["version"] != "v3" {
 		t.Fatalf("carrier attribution lost: %v", body)
@@ -245,4 +353,100 @@ func TestRetryCarrierKeepsAttribution(t *testing.T) {
 	if params["x"] != 1 {
 		t.Fatalf("carrier params lost: %v", body["params"])
 	}
+}
+
+// TestRetryCarrierBodyConversion (§9.1, flow_worker.py:313-389): the
+// requeue-time branch table of the start→resume conversion.
+func TestRetryCarrierBodyConversion(t *testing.T) {
+	w, rdb, _, cfg := newTestWorker(t)
+	ctx := context.Background()
+
+	t.Run("state row exists → resume/continue, no version", func(t *testing.T) {
+		row, _ := json.Marshal(map[string]any{
+			"execution_id": "e2", "status": "running", "flow_id": "f1",
+		})
+		rdb.Set(ctx, cfg.Namespace("acme")+":execution:e2", string(row), 0)
+		task := &Task{
+			Type: "start", FlowID: "f1", ExecutionID: "e2", TenantID: "acme",
+			Version: "v3", Params: map[string]any{"x": 1},
+		}
+		body, err := w.retryCarrierBody(ctx, task)
+		if err != nil {
+			t.Fatalf("retryCarrierBody: %v", err)
+		}
+		if body["type"] != "resume" || body["resume_type"] != "continue" {
+			t.Fatalf("carrier = %v, want resume/continue", body)
+		}
+		if body["flow_id"] != "f1" || body["execution_id"] != "e2" || body["tenant_id"] != "acme" {
+			t.Fatalf("attribution lost: %v", body)
+		}
+		if params, _ := body["params"].(map[string]any); params["x"] != 1 {
+			t.Fatalf("params not passed through (#122): %v", body)
+		}
+		if _, hasVersion := body["version"]; hasVersion {
+			t.Fatalf("converted carrier must not pin a version: %v", body)
+		}
+	})
+
+	t.Run("flow_id mismatch → start copy", func(t *testing.T) {
+		row, _ := json.Marshal(map[string]any{
+			"execution_id": "e3", "status": "running", "flow_id": "other",
+		})
+		rdb.Set(ctx, stateKeyOf(cfg, "e3"), string(row), 0)
+		task := &Task{Type: "start", FlowID: "f1", ExecutionID: "e3"}
+		body, err := w.retryCarrierBody(ctx, task)
+		if err != nil {
+			t.Fatalf("retryCarrierBody: %v", err)
+		}
+		if body["type"] != "start" {
+			t.Fatalf("carrier = %v, want the start copy for a flow mismatch", body)
+		}
+	})
+
+	t.Run("state read failure → start copy (fail-safe)", func(t *testing.T) {
+		// Corrupt row: LoadExecutionState errors instead of returning nil.
+		rdb.Set(ctx, stateKeyOf(cfg, "e4"), "{not-json", 0)
+		task := &Task{Type: "start", FlowID: "f1", ExecutionID: "e4"}
+		body, err := w.retryCarrierBody(ctx, task)
+		if err != nil {
+			t.Fatalf("retryCarrierBody must degrade to a start copy, got %v", err)
+		}
+		if body["type"] != "start" {
+			t.Fatalf("carrier = %v, want the start copy on a read failure", body)
+		}
+	})
+
+	t.Run("non-start task passes through unchanged", func(t *testing.T) {
+		task := &Task{
+			Type: "resume", ResumeType: "event", FlowID: "f1", ExecutionID: "e5",
+			Data: map[string]any{"subscription_id": "s1"},
+		}
+		body, err := w.retryCarrierBody(ctx, task)
+		if err != nil {
+			t.Fatalf("retryCarrierBody: %v", err)
+		}
+		if body["type"] != "resume" || body["resume_type"] != "event" {
+			t.Fatalf("carrier = %v, want the original resume shape", body)
+		}
+	})
+
+	t.Run("tombstone → nil (ack, no re-enqueue)", func(t *testing.T) {
+		rdb.Set(ctx, cfg.KeyPrefix+":exec_tombstone:"+"e6", `{"reason":"user"}`, time.Minute)
+		task := &Task{Type: "start", FlowID: "f1", ExecutionID: "e6"}
+		body, err := w.retryCarrierBody(ctx, task)
+		if err != nil {
+			t.Fatalf("retryCarrierBody: %v", err)
+		}
+		if body != nil {
+			t.Fatalf("carrier = %v, want nil for a tombstoned execution", body)
+		}
+	})
+
+	t.Run("tombstone probe failure → error (leave pending)", func(t *testing.T) {
+		rdb.Close()
+		task := &Task{Type: "start", FlowID: "f1", ExecutionID: "e7"}
+		if _, err := w.retryCarrierBody(ctx, task); err == nil {
+			t.Fatal("expected the probe failure to surface (fail closed)")
+		}
+	})
 }

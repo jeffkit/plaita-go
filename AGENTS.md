@@ -65,7 +65,7 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
 - **dispatch_ledger**（§6.3，ledger.go）：`{prefix}:dispatch:ledger` 只增 Stream，`payload` JSON + `schema_version`；`EnqueueWithLedger` 是入队+记账唯一入口（target 同源写入消息体与台账，结构上不可能分叉）；`Read`/`Parity` 读侧对坏行/故障不抛。TaskNotForThisWorker 完整交接（worker.go handleForeignTarget）：目标不在册/非 running → 剥 target 广播重投；在册 running → 按 `{ns}:execution:affinityhandover:{id}` 计数（INCR+7d），≤3 enqueue→ack，达限终态化 `AffinityHandoverExhausted` 并留 pending；计数不可用 fail-closed 留 pending；**全程不 DLQ**。
 - **DLQ replay + 守卫恢复**（§2.4/§9.2，dlqreplay.go）：`ReplayDeadLetter` 幂等标记 `{prefix}:dlq:replay:{dlq_key}:{id}`（SET NX 7d，force 覆盖）、源信封 schema_version 继承（超版本入队前拒绝）、无 id 的 start 用 uuid5 确定性铸造、墓碑拒复活、审计 `{prefix}:dlq:replay:audit`、DLQ 原条不删。死信守卫：schema 拒收/终态/墓碑放行不克隆；租约在/读失败跳过；running 且节点预算耗尽（noderetry max ≥ max_deliveries 或 noderefetch ≥100）→ 终态化 `node_retry_budget_exhausted`；其余非终态+租约空 → 克隆源 payload（继承信封版本）后再放行死信。
 - **drain 三态**（§9.3，drain.go）：`RequestDrain`（D1，幂等，注册表 draining 立即 flush 3 重试 + 有界定时器）→ `ForceStop`（D2，无条件停领取 + 取消在途 run + 打断重试退避）→ 信号只调 RequestDrain（D3，main.go 二次信号强退）。drain 后读到的消息不 dispatch/不 ack 留 PEL；D2 中止的步**不写终态**、留 pending（本 build 无硬中断，保住可续跑/可重投优先）。
-- **节点级重试预算**（§9.1，retry.go）：`noderetry:{id}:{node}`（预算=max_deliveries）/`noderefetch:{id}`（100）/`nofail:{id}`（12）三层，INCR+7d；可重试判据 = 有失败节点 + 非超时/取消 + `workflow.IsRetryableError`；放行则指数退避 `min(30s, 1s·2^(n-1))`（0.2s 分片可被 D2 打断）→ enqueue→ack。预算耗尽/兜底上限 → 终态化 `node_retry_budget_exhausted`（code=-520）。成功推进清节点键；整跑 completed 再清连续失败计数。**偏差**：重投载体保持 start（同 execution_id 整条重放）——错误执行没有 checkpoint；转 resume 需每步 checkpoint（三期）。
+- **节点级重试预算**（§9.1，retry.go）：`noderetry:{id}:{node}`（预算=max_deliveries）/`noderefetch:{id}`（100）/`nofail:{id}`（12）三层，INCR+7d；可重试判据 = 有失败节点 + 非超时/取消 + `workflow.IsRetryableError`；放行则指数退避 `min(30s, 1s·2^(n-1))`（0.2s 分片可被 D2 打断）→ **重投载体查盘转换（#91，对齐 `_requeue_body_for_retry`）**：盘上有行 → resume/continue 载体（params 透传、不带 version；墓碑命中 ack 丢弃、读盘失败原样 start），失败边界快照 checkpoint（worker 侧 `SnapshotRuntimeContext`，best-effort）→ enqueue→ack。预算耗尽/兜底上限 → 终态化 `node_retry_budget_exhausted`（code=-520）。成功推进清节点键；整跑 completed 再清连续失败计数。**残余偏差（引擎面）**：Go 引擎尚无中途入口（`Workflow.Resume` 仅限挂起节点），continue 载体推进 running 执行时从 flow 起点重入引擎（已完成前序节点重放）；租约/指纹门/历史续接/checkpoint 生命周期均为 resume 路径语义，引擎补中途入口后收敛。
 
 ## M6 checkpoint v1.5（2026-10-19，分支 feat/checkpoint-v15）
 
@@ -76,7 +76,7 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
 - **节点**：event（event_type 表达式/event_filter 点路径/subscription_timeout/三种恢复状态）与 hitl_await（hitl_client 复用；发消息拿 session_id 即 pending；hitl_reply/超时唤醒；resume 解嵌套 event_data）。ir supportedNodeTypes 转正 + translateEvent/translateHitlAwait（event_type 非空、timeout>0 在加载期拒绝）。
 - **worker**：eventbus.go（订阅 Redis 持久化 + `{ns}:events:*` Pub/Sub 桥 + 超时索引/检查器 + 事件去重）；handleResume 在 suspended 上真恢复（检查点 → Resume → 续步），复用 executeAndFinalize 的取消轮询/租约看门狗/终态分类；恢复运行续接挂起行的 node_timings/timeline（seq 单调）。start 载体命中 suspended 执行 → 幂等 ack（不重放）。
 - **修正**：终态 context 的 `$NODE` 改为节点结果表（原误写 `CurrentNodeContext`）；`$CURRENT` 单独保留。
-- **限制**：仅根流程可挂起（child/loop/parallel 内挂起显式报错）；retry 载体的 start→resume 转换未做；事件 Pub/Sub 无回扫器（订阅超时与执行状态双写仍保证至少一次唤醒）。
+- **限制**：仅根流程可挂起（child/loop/parallel 内挂起显式报错）；事件 Pub/Sub 无回扫器（订阅超时与执行状态双写仍保证至少一次唤醒）。**M6 之后（本轮 worker-tail）**：retry 载体的 start→resume/continue 转换已做（§9.1，见二期「节点级重试预算」条目）——失败边界 checkpoint 由 worker 侧快照，continue 载体对 running 执行真推进（引擎面残余：从 flow 起点重入，见该条）。
 
 ## 常用命令
 
@@ -128,7 +128,7 @@ make test   # 已封装代理
 
 ### 沙箱支持（已拍板：要支持，2026-10-19）
 
-agentrun `workspace=` 分支从「拒载」改为「计划支持」。**对齐生产契约**（plaita-nodes `_execute_sandboxed`）：workspace 名 → `.plaita/sandboxes.json` 注册表（fail-closed 不自动建）→ driver → 沙箱内 agentproc → env 白名单 + envfile(0600) 注入 → lease/ensure/释放（成功 kill / 失败 pause 分流）。**Go 实现取形**：Docker driver 优先（本地Mac/容器宿主，docker API），AGS 经 E2B 兼容 HTTP API 接（不移植 4300 行 driver，调用其服务面）。顺序在 worker 主线之后（沙箱 lease 与 worker 的执行租约同族，一起设计）。
+agentrun `workspace=` 分支从「拒载」改为「计划支持」。**对齐生产契约**（plaita-nodes `_execute_sandboxed`）：workspace 名 → `.plaita/sandboxes.json` 注册表（fail-closed 不自动建）→ driver → 沙箱内 agentproc → env 白名单 + envfile(0600) 注入 → lease/ensure/释放（成功 kill / 失败 pause 分流）。**Go 实现取形**：Docker driver 优先（本地Mac/容器宿主，docker API），AGS 经 E2B 兼容 HTTP API 接（不移植 4300 行 driver，调用其服务面）。顺序在 worker 主线之后（沙箱 lease 与 worker 的执行租约同族，一起设计）。**M5 落地后的本轮收尾**：worker 在引擎执行 ctx 注入真实 execution_id（`sandbox.WithExecutionID`，ctx > `PLAITA_EXECUTION_ID` env > `$GLOBAL`），沙箱资源名/工作区身份 `{execution_id}:{ws_key}` = 真实执行 id，重投/续跑载体 re-attach 同一沙箱；此前 `(node_id, input)` 派生 `local-<hash>` 的兜底（`sandbox.DeriveExecutionID`）仅剩无 worker 装配的裸跑场景。
 
 ## 表达式对齐（已落地 2026-10-19，golden 45/45 绿）
 
@@ -142,7 +142,7 @@ agentrun `workspace=` 分支从「拒载」改为「计划支持」。**对齐�
 - **语句变量预解析架构**（plaitaexpr/evaluator.go `preResolveStatementVariables`）：`$F` 语句里的内建根变量先经 plaita 遍历求值、注入合成标识符，goval 只做函数调用——方括号 `X[0]`/`[-1]`（parser 归一为 `.#N`）、raw 修饰符、缺键语义在语句里与纯变量路径完全一致；`$PARENT.` 链整段吸收走 goval 导航。
 - **parser**：单引号字面量→双引号转换（goval 无单引号 token）、尾逗号剔除、字面量掩码防误改。
 
-**agentproc 节点（spawn 路径，2026-10-19 落地）**：选型拍板 = 只实现协议 host 侧（pkg/agentproc：spawn profile command → stdin 一行 turn → stdout NDJSON 事件组装），CLI 适配留在 agentproc hub bridge（与 Python 运行时**共用同一份 bridge.py**——影子对账要求两 runtime 适配器逐字节一致，diff 才能归因到引擎）；in-process executor 是 per-SDK 注册表，Go 不做（将来需要时按 spec four-case 规则插到 spawn 前）。注册表 = **同一份 agents.json/providers.json**（~/.plaita，`PLAITA_HOME` 可覆写）：provider 翻译器实现 recursive/claude 两个（与 Python `_ENV_TRANSLATORS` 同键），其他 executor 是锁定型 CLI 不接受 provider；**agents.json 条目必须带 `command`/`args`**（Go 走 spawn，缺了 fail-closed），如 `python3 <hub>/<executor>/bridge.py`。runner 语义 = spec v0.4：error 事件即失败（exit 0 也算）、streaming 时 body=partials 拼接（result.text 不重复追加）、非流式 body=result.text、无 result 无 partial 退 0 = 成功空 body、畸形行忽略、session 首个非空胜出（wire 非法丢弃）、超时 killpg 杀整组。输出 dict 对齐 Python 节点：`{text, cli, model, session_id, usage[, details]}`。`workspace` 沙箱分支拒载（AGS driver 未移植）。
+**agentproc 节点（spawn 路径，2026-10-19 落地）**：选型拍板 = 只实现协议 host 侧（pkg/agentproc：spawn profile command → stdin 一行 turn → stdout NDJSON 事件组装），CLI 适配留在 agentproc hub bridge（与 Python 运行时**共用同一份 bridge.py**——影子对账要求两 runtime 适配器逐字节一致，diff 才能归因到引擎）；in-process executor 是 per-SDK 注册表，Go 不做（将来需要时按 spec four-case 规则插到 spawn 前）。注册表 = **同一份 agents.json/providers.json**（~/.plaita，`PLAITA_HOME` 可覆写）：provider 翻译器实现 recursive/claude 两个（与 Python `_ENV_TRANSLATORS` 同键），其他 executor 是锁定型 CLI 不接受 provider；**agents.json 条目必须带 `command`/`args`**（Go 走 spawn，缺了 fail-closed），如 `python3 <hub>/<executor>/bridge.py`。runner 语义 = spec v0.4：error 事件即失败（exit 0 也算）、streaming 时 body=partials 拼接（result.text 不重复追加）、非流式 body=result.text、无 result 无 partial 退 0 = 成功空 body、畸形行忽略、session 首个非空胜出（wire 非法丢弃）、超时 killpg 杀整组。输出 dict 对齐 Python 节点：`{text, cli, model, session_id, usage[, details]}`。`workspace` 沙箱分支已随 M5 Docker driver 落地（见下节）。
 
 **golden 跑批**：`pkg/expression/golden_test.go` + `testdata/expression_golden.json`（45 条，由 `scripts/export_golden.py` 从 `plaita/tests/unit/test_expression_golden.py` 程序化导出，回灌校验后落盘）。**改表达式任何行为前先跑它**；Python 侧语义升级后重新导出：`cd ~/projects/infra4agent/plaita && python3 ~/projects/plaita-go/scripts/export_golden.py`。3 条依赖自定义注册表的用例不可导出（schema 无 registry 字段）；2 条 parse_function API 用例 runner 跳过（门面对应的是 evaluate 路径）。
 

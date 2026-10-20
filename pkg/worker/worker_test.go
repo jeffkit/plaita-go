@@ -341,12 +341,44 @@ func TestWorkerResumeMVP(t *testing.T) {
 		}
 	})
 
-	t.Run("running + continue → deterministic resume_not_supported", func(t *testing.T) {
+	t.Run("running + continue advances: missing flow → flow_not_found terminal", func(t *testing.T) {
+		// §9.1/#91: a continue carrier on a live execution continues it. With
+		// the definition gone the advance fails deterministically (the same
+		// terminal the start path writes), not resume_not_supported.
 		w, rdb, _, cfg := newTestWorker(t)
 		ctx := context.Background()
 		executionID := newExecutionID()
 		rdb.Set(ctx, stateKeyOf(cfg, executionID),
-			fmt.Sprintf(`{"execution_id":%q,"status":"running"}`, executionID), 0)
+			fmt.Sprintf(`{"execution_id":%q,"status":"running","flow_id":"never_synced"}`, executionID), 0)
+
+		payload := baseStartPayload(executionID)
+		payload["type"] = "resume"
+		payload["resume_type"] = "continue"
+		payload["flow_id"] = "never_synced"
+		enqueueTask(t, rdb, cfg, payload, "")
+
+		if _, err := w.ProcessOne(ctx); err != nil {
+			t.Fatalf("ProcessOne: %v", err)
+		}
+		state := loadStateRow(t, rdb, cfg, executionID)
+		if state.Status != StatusError {
+			t.Fatalf("status = %q, want error (deterministic failure)", state.Status)
+		}
+		if state.Error["error_type"] != "flow_not_found" {
+			t.Fatalf("error_type = %v, want flow_not_found", state.Error["error_type"])
+		}
+		if n := streamLen(t, rdb, cfg.QueueName); n != 0 {
+			t.Fatalf("queue XLEN = %d, want 0 (poison ack)", n)
+		}
+	})
+
+	t.Run("running + continue with a loadable flow continues and completes", func(t *testing.T) {
+		w, rdb, _, cfg := newTestWorker(t)
+		ctx := context.Background()
+		presetHelloWorld(t, w)
+		executionID := newExecutionID()
+		rdb.Set(ctx, stateKeyOf(cfg, executionID),
+			fmt.Sprintf(`{"execution_id":%q,"status":"running","flow_id":"hello_world_go"}`, executionID), 0)
 
 		payload := baseStartPayload(executionID)
 		payload["type"] = "resume"
@@ -357,14 +389,37 @@ func TestWorkerResumeMVP(t *testing.T) {
 			t.Fatalf("ProcessOne: %v", err)
 		}
 		state := loadStateRow(t, rdb, cfg, executionID)
-		if state.Status != StatusError {
-			t.Fatalf("status = %q, want error (deterministic failure)", state.Status)
-		}
-		if state.Error["error_type"] != "resume_not_supported" {
-			t.Fatalf("error_type = %v, want resume_not_supported", state.Error["error_type"])
+		if state.Status != StatusCompleted {
+			t.Fatalf("status = %q, want completed (the carrier must truly advance)", state.Status)
 		}
 		if n := streamLen(t, rdb, cfg.QueueName); n != 0 {
-			t.Fatalf("queue XLEN = %d, want 0 (poison ack)", n)
+			t.Fatalf("queue XLEN = %d, want 0 (acked after the advance)", n)
+		}
+		if v := rdb.Get(ctx, cfg.KeyPrefix+":execution:lease:"+executionID).Val(); v != "" {
+			t.Fatalf("lease must be released after the continuation, got %q", v)
+		}
+	})
+
+	t.Run("running + retry shares the continue path (must really dispatch)", func(t *testing.T) {
+		// Python: "running 执行没有失败节点可重跑……retry 在此的语义 = 从
+		// checkpoint 派发后继节点（与 continue 同路），必须真实重派".
+		w, rdb, _, cfg := newTestWorker(t)
+		ctx := context.Background()
+		presetHelloWorld(t, w)
+		executionID := newExecutionID()
+		rdb.Set(ctx, stateKeyOf(cfg, executionID),
+			fmt.Sprintf(`{"execution_id":%q,"status":"running","flow_id":"hello_world_go"}`, executionID), 0)
+
+		payload := baseStartPayload(executionID)
+		payload["type"] = "resume"
+		payload["resume_type"] = "retry"
+		enqueueTask(t, rdb, cfg, payload, "")
+
+		if _, err := w.ProcessOne(ctx); err != nil {
+			t.Fatalf("ProcessOne: %v", err)
+		}
+		if state := loadStateRow(t, rdb, cfg, executionID); state.Status != StatusCompleted {
+			t.Fatalf("status = %q, want completed", state.Status)
 		}
 	})
 
@@ -389,6 +444,31 @@ func TestWorkerResumeMVP(t *testing.T) {
 		}
 		if n := streamLen(t, rdb, cfg.QueueName); n != 0 {
 			t.Fatalf("queue XLEN = %d, want 0 (already_terminal ack)", n)
+		}
+	})
+
+	t.Run("error + retry → already_terminal idempotent ack", func(t *testing.T) {
+		// A terminalized error execution has no checkpoint (the error terminal
+		// deletes it); Python refuses a checkpoint-less retry too (plaita#240)
+		// and the terminal short-circuit acks the carrier without touching the
+		// row (§5.3 already_terminal).
+		w, rdb, _, cfg := newTestWorker(t)
+		ctx := context.Background()
+		executionID := newExecutionID()
+		rdb.Set(ctx, stateKeyOf(cfg, executionID),
+			fmt.Sprintf(`{"execution_id":%q,"status":"error","end_time":"2026-01-01T00:00:00"}`, executionID), 0)
+
+		payload := baseStartPayload(executionID)
+		payload["type"] = "resume"
+		payload["resume_type"] = "retry"
+		enqueueTask(t, rdb, cfg, payload, "")
+
+		if _, err := w.ProcessOne(ctx); err != nil {
+			t.Fatalf("ProcessOne: %v", err)
+		}
+		state := loadStateRow(t, rdb, cfg, executionID)
+		if state.Status != StatusError || state.Error != nil {
+			t.Fatalf("terminal row must stay untouched, got %+v", state)
 		}
 	})
 
