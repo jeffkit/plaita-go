@@ -1,26 +1,37 @@
-# See https://pre-commit.com for more information
-# See https://pre-commit.com/hooks.html for more hooks
+# Local hooks only. The previous config cloned hook code over `git://` — plaintext,
+# unauthenticated, and disabled by GitHub years ago, so `pre-commit install` failed
+# outright while the file still looked like a gate. It also re-ran the full test
+# suite and `go mod tidy` on every commit.
+#
+# These hooks are the same `make` targets CI runs, so the local gate cannot drift.
+minimum_pre_commit_version: "3.2.0"
 repos:
-  -   repo: https://github.com/pre-commit/pre-commit-hooks
-      rev: v4.4.0
-      hooks:
-        - id: trailing-whitespace
-        - id: end-of-file-fixer
-        - id: check-yaml
-        - id: check-added-large-files
-        - id: check-json
-
-  - repo: git://github.com/dnephin/pre-commit-golang
-    rev: v0.5.1
+  - repo: local
     hooks:
-      - id: go-fmt
+      - id: fmt-check
+        name: gofmt (make fmt-check)
+        entry: make fmt-check
+        language: system
+        pass_filenames: false
+        files: '\.go$'
+
       - id: go-vet
-      - id: go-lint
-      - id: go-imports
-      - id: validate-toml
-      - id: no-go-testing
-      - id: golangci-lint
-      - id: go-critic
-      - id: go-unit-tests
+        name: go vet (make vet)
+        entry: make vet
+        language: system
+        pass_filenames: false
+        files: '\.go$'
+
       - id: go-build
-      - id: go-mod-tidy
+        name: go build (make build)
+        entry: make build
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: go-test
+        name: go test (make test)
+        entry: make test
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
