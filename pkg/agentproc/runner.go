@@ -378,12 +378,36 @@ func killGroup(cmd *exec.Cmd) {
 	}
 }
 
+// HostEnvAllowlist is the host environment an agent process inherits
+// (plaita subprocess_env.SUBPROCESS_ENV_ALLOWLIST, the same public security
+// layer the Python gate / capture / agent nodes use). Nothing else crosses
+// into the child: the worker's provider keys, PLAITA_CREDENTIALS_KEY, DB /
+// Redis DSNs and every other tenant's secrets stay in the parent. Variables
+// the agent genuinely needs are declared explicitly in the agents.json
+// entry's env (spec.Env), which overrides this list.
+var HostEnvAllowlist = []string{
+	"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "PYTHONIOENCODING",
+}
+
+// HostEnvExtra mirrors plaita's SUBPROCESS_ENV_EXTRA deployment hook: host
+// variables every agent needs (e.g. HTTP(S)_PROXY) can be added at process
+// start. It is merged after the allowlist and before spec.Env (spec wins).
+// Only deployment bootstrap code should write it.
+var HostEnvExtra = map[string]string{}
+
+// composeEnv rebuilds the child environment from the allowlist, then the
+// deployment extras, then the agent's explicit env (later wins) — the same
+// merge order as plaita build_subprocess_env. The host process environment
+// is never copied wholesale.
 func composeEnv(extra map[string]string) []string {
 	env := map[string]string{}
-	for _, kv := range os.Environ() {
-		if i := strings.IndexByte(kv, '='); i > 0 {
-			env[kv[:i]] = kv[i+1:]
+	for _, key := range HostEnvAllowlist {
+		if v, ok := os.LookupEnv(key); ok {
+			env[key] = v
 		}
+	}
+	for k, v := range HostEnvExtra {
+		env[k] = v
 	}
 	for k, v := range extra {
 		env[k] = v

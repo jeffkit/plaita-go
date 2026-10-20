@@ -8,6 +8,14 @@
 // runtimes share one adapter implementation. In-process executors are a
 // per-SDK registry by spec; if one is ever needed in Go it slots in ahead
 // of the spawn per the spec's four-case rule.
+//
+// Credentials: providers.json holds provider API keys in plaintext, and
+// agents.json can carry secrets in an entry's env. Both config files are
+// therefore treated as private operator state: the loader refuses any file
+// readable by group or others (mode must be 0600 or stricter) and passes the
+// keys to the agent process only through its explicit env — never by
+// inheriting the worker's environment (see HostEnvAllowlist). Encryption at
+// rest is a separate change (A62-05); until then 0600 is the enforced floor.
 package agentproc
 
 import (
@@ -15,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -233,6 +242,9 @@ func expandVars(s string) string {
 // --- small JSON helpers ---
 
 func readJSONFile(path string) (map[string]any, error) {
+	if err := requirePrivateConfigFile(path); err != nil {
+		return nil, err
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -242,6 +254,33 @@ func readJSONFile(path string) (map[string]any, error) {
 		return nil, fmt.Errorf("%s: %w", filepath.Base(path), err)
 	}
 	return doc, nil
+}
+
+// requirePrivateConfigFile enforces the credential-file permission floor
+// (A62-05): agents.json / providers.json may contain provider API keys in
+// plaintext, so a group- or world-readable file hands them to every local
+// account. The check is fail-loud — there is no warn-and-continue path; the
+// operator either tightens the mode or the agent turn does not start.
+//
+// POSIX permission bits only: Windows reports synthetic modes, so the check
+// is skipped there (deployments on Windows must rely on NTFS ACLs).
+func requirePrivateConfigFile(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s: not a regular file", filepath.Base(path))
+	}
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return fmt.Errorf("%s has mode %04o: provider/agent credentials must not be readable "+
+			"by group or others (run chmod 600 %s); plaintext keys at this mode are readable "+
+			"by every local user", filepath.Base(path), perm, path)
+	}
+	return nil
 }
 
 // mapOrChild supports both {agents: {...}} and a bare top-level map.

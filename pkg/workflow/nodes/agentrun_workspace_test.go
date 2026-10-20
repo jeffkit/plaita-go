@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/jeffkit/plaita-go/internal/runtime"
 	"github.com/jeffkit/plaita-go/pkg/agentproc"
 	"github.com/jeffkit/plaita-go/pkg/sandbox"
 )
@@ -671,4 +672,34 @@ func containsArgPair(argv []string, first, second string) bool {
 		}
 	}
 	return false
+}
+
+// TestAgentRunSandboxAllowedForNonDefaultTenant is the positive control for
+// the A62-02 tenant gate: the workspace (sandbox) path stays available to a
+// non-default tenant — the container is the isolation boundary and
+// credentials travel only through the injected 0600 envfile.
+func TestAgentRunSandboxAllowedForNonDefaultTenant(t *testing.T) {
+	sandboxTestHome(t, fakeSandboxRegistry)
+	t.Setenv("TMPDIR", t.TempDir())
+
+	driver := &fakeSandboxDriver{}
+	node := &AgentRun{
+		BaseNode:      BaseNode{ID: "ag"},
+		Agent:         "runner",
+		Prompt:        "p",
+		Workspace:     "sbx",
+		Registry:      sandboxAgentRegistry(t, recursiveSandboxAgent),
+		SandboxDriver: func(string) (sandbox.Driver, error) { return driver, nil },
+	}
+	ctx := runtime.WithTenantID(agentRunContext(t, map[string]any{}), "acme")
+	res, err := node.Execute(ctx)
+	if err != nil {
+		t.Fatalf("sandbox path must stay available to a non-default tenant: %v", err)
+	}
+	if out := res.Result.(map[string]any); out["text"] != "ok" {
+		t.Errorf("text = %v", out["text"])
+	}
+	if len(driver.execCalls) != 1 {
+		t.Fatalf("exec calls = %d, want the sandbox turn to run", len(driver.execCalls))
+	}
 }

@@ -422,6 +422,43 @@ func ExecutionIDFromContext(ctx context.Context) string {
 	return id
 }
 
+// DefaultTenantID is plaita's default tenant id (plaita.tenant_context
+// DEFAULT_TENANT_ID). An empty tenant id maps to it.
+const DefaultTenantID = "default"
+
+// tenantIDContextKey carries the worker's tenant id for the current engine
+// execution. The worker injects it alongside the execution id; child / loop /
+// parallel executions inherit it through the context chain.
+type tenantIDContextKey struct{}
+
+// WithTenantID attaches the tenant id to ctx. Host-executing nodes read it
+// via TenantIDFromContext to apply the fail-closed tenant gate (plaita
+// refuse_non_default_tenant).
+func WithTenantID(ctx context.Context, tenantID string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, tenantIDContextKey{}, tenantID)
+}
+
+// TenantIDFromContext returns the tenant id attached by WithTenantID, or ""
+// when the host attached none. An empty id is the bare-engine / single-tenant
+// deployment (plaita's ImportError fallback in tenant_context).
+func TenantIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	id, _ := ctx.Value(tenantIDContextKey{}).(string)
+	return id
+}
+
+// IsNonDefaultTenant reports whether tenantID identifies a tenant other than
+// the default. The empty id is the default (plaita current_tenant() falls back
+// to DEFAULT_TENANT_ID).
+func IsNonDefaultTenant(tenantID string) bool {
+	return tenantID != "" && tenantID != DefaultTenantID
+}
+
 // WithWorkflowRuntimeContext returns a new context with workflow runtime context.
 func WithWorkflowRuntimeContext(ctx context.Context, workflowRuntimeContext *Context) context.Context {
 	if workflowRuntimeContext == nil {

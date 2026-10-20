@@ -22,7 +22,6 @@ require (
 	github.com/spf13/cast v1.5.0
 	github.com/stretchr/testify v1.8.4
 	github.com/tidwall/gjson v1.14.4
-	github.com/traefik/yaegi v0.15.1
 	golang.org/x/text v0.14.0
 	sigs.k8s.io/yaml v1.3.0
 )
