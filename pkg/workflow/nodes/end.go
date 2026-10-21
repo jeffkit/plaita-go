@@ -74,7 +74,12 @@ func (e *End) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
 		if errInfo == nil {
 			errInfo = &Error{}
 		}
-		return nil, &FlowResultError{Code: errInfo.Code, Message: errInfo.Message}
+		// plaita runner converts FlowResultError to ErrorResultException
+		// inside the `except FlowResultError` clause, which escapes run_node's
+		// retry loop entirely (issue #43): the error result is the flow's
+		// decision, not a transient fault. The wrapper keeps the message and
+		// the *FlowResultError contract (errors.As) intact.
+		return nil, workflow.NonRetryable(&FlowResultError{Code: errInfo.Code, Message: errInfo.Message})
 	case ResultTypeNoop:
 		return &workflow.ExecuteResult{}, nil
 	}

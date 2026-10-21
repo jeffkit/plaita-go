@@ -56,6 +56,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/jeffkit/plaita-go/pkg/workflow"
 )
 
 // pySandboxPythonBin is the sidecar interpreter. plaita uses sys.executable
@@ -278,6 +280,24 @@ func runPythonSubprocessBudget(ctx context.Context, code string, input any,
 	return result, nil
 }
 
+// pyDeterministicEnvelopeTypes is the node-F2 deterministic class by envelope
+// exception type (issue #43): a retry re-runs identical user code on identical
+// input, so these failures can never succeed on attempt 2. Python's core
+// classification is_retryable_error treats a bare ValueError the same way; the
+// subprocess backend loses the type by wrapping in RuntimeError (measured:
+// is_retryable_error(RuntimeError("ValueError: …")) == True), so the Go port
+// classifies on the envelope's preserved `type` field instead — the same
+// decision the in-process backend yields (ValueError → non-retryable).
+// Everything else keeps the historical retryable default (plaita's unknown
+// error posture), including infra-level failures (no output / bad JSON / non-
+// zero exit without envelope).
+var pyDeterministicEnvelopeTypes = map[string]bool{
+	"ValueError":  true,
+	"TypeError":   true,
+	"NameError":   true,
+	"SyntaxError": true,
+}
+
 // decodePythonRunnerOutput parses the JSON envelope written by the runner —
 // a verbatim port of plaita _decode_runner_output. The result is decoded with
 // json.Number preservation so integer-ness survives into the engine values
@@ -303,7 +323,11 @@ func decodePythonRunnerOutput(raw, stderr string) (any, error) {
 		if excMsg == "" {
 			excMsg = "(unknown)"
 		}
-		return nil, fmt.Errorf("%s: %s", excType, excMsg)
+		err := fmt.Errorf("%s: %s", excType, excMsg)
+		if pyDeterministicEnvelopeTypes[excType] {
+			return nil, workflow.NonRetryable(err)
+		}
+		return nil, err
 	}
 	return envelope["result"], nil
 }

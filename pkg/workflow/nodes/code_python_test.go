@@ -519,3 +519,38 @@ func TestPythonSidecarProductionSamples(t *testing.T) {
 		}
 	})
 }
+
+// TestDecodePythonRunnerOutputDeterministicClass (issue #43): the envelope
+// carries the original exception type, and the node-F2 deterministic class
+// (ValueError / TypeError / NameError / SyntaxError) must arrive at the
+// engine as a NonRetryable error — a retry cannot make user code correct.
+// Everything else keeps the historical retryable default (plaita's unknown
+// error posture; its subprocess backend wraps in RuntimeError the same way).
+// Error TEXT is unchanged either way.
+func TestDecodePythonRunnerOutputDeterministicClass(t *testing.T) {
+	rows := []struct {
+		raw       string
+		text      string
+		retryable bool
+	}{
+		{`{"ok": false, "error": "boom", "type": "ValueError"}`, "ValueError: boom", false},
+		{`{"ok": false, "error": "bad type", "type": "TypeError"}`, "TypeError: bad type", false},
+		{`{"ok": false, "error": "no name", "type": "NameError"}`, "NameError: no name", false},
+		{`{"ok": false, "error": "bad syntax", "type": "SyntaxError"}`, "SyntaxError: bad syntax", false},
+		{`{"ok": false, "error": "infra", "type": "RuntimeError"}`, "RuntimeError: infra", true},
+		{`{"ok": false, "error": "missing", "type": "KeyError"}`, "KeyError: missing", true},
+		{`{"ok": false}`, "Error: (unknown)", true},
+	}
+	for _, r := range rows {
+		_, err := decodePythonRunnerOutput(r.raw, "")
+		if err == nil {
+			t.Fatalf("decode(%s): expected error", r.raw)
+		}
+		if err.Error() != r.text {
+			t.Fatalf("decode(%s) text = %q, want %q", r.raw, err.Error(), r.text)
+		}
+		if got := workflow.IsRetryableError(err); got != r.retryable {
+			t.Errorf("decode(%s): IsRetryableError=%v, want %v", r.raw, got, r.retryable)
+		}
+	}
+}

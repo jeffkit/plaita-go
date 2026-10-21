@@ -23,6 +23,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // intAddOverflow adds two int64s, reporting overflow.
@@ -142,16 +143,24 @@ func mul(a, b any) (any, error) {
 	}
 	// sequence repetition: seq * int or int * seq
 	if as, ok := a.(string); ok && bInt {
-		return strings.Repeat(as, repeatCount(bi)), nil
+		n, err := pyRepeatCount(int64(utf8.RuneCountInString(as)), "chars", bi)
+		if err != nil {
+			return nil, err
+		}
+		return strings.Repeat(as, n), nil
 	}
 	if bs, ok := b.(string); ok && aInt {
-		return strings.Repeat(bs, repeatCount(ai)), nil
+		n, err := pyRepeatCount(int64(utf8.RuneCountInString(bs)), "chars", ai)
+		if err != nil {
+			return nil, err
+		}
+		return strings.Repeat(bs, n), nil
 	}
 	if al, ok := a.([]any); ok && bInt {
-		return repeatSlice(al, bi), nil
+		return repeatSlice(al, bi)
 	}
 	if bl, ok := b.([]any); ok && aInt {
-		return repeatSlice(bl, ai), nil
+		return repeatSlice(bl, ai)
 	}
 	return nil, typeErr("mul", a, b)
 }
@@ -164,27 +173,48 @@ func pyNumericToF(v any) float64 {
 	return f
 }
 
-func repeatCount(n int64) int {
-	if n <= 0 {
-		return 0
-	}
-	if n > int64(lenLimit) {
-		return 0 // absurd count: Python would raise/be bounded; clamp to empty-safe
-	}
-	return int(n)
-}
-
 // lenLimit bounds sequence repetition to keep Go allocations sane; Python
-// guards the same blow-up with its result-size gate.
+// guards the same blow-up with its result-size gate (#68). Per issue #45 边界
+// the limit itself stays at the engine's 1e8 budget (lowering it to Python's
+// ~100k soft limit is a separate decision) — only the failure mode changed:
+// over-limit is a named error, never a silently emptied sequence.
 const lenLimit = 100_000_000
 
-func repeatSlice(s []any, n int64) []any {
-	count := repeatCount(n)
+// pyRepeatCount resolves a repetition count with the Python result-size guard
+// shape (expression.py _fn_mul → _check_result_size): negative/zero repeats
+// yield an empty sequence, and a PROJECTED result over lenLimit is refused
+// before allocating (issue #45: the previous clamp to 0 returned "" for
+// absurd counts, deferring the failure to an unattributable downstream site).
+// The message mirrors Python's _size_refusal wording with the engine limit.
+func pyRepeatCount(seqLen int64, unit string, n int64) (int, error) {
+	if n <= 0 {
+		return 0, nil
+	}
+	if seqLen > 0 && n > int64(lenLimit)/seqLen {
+		projected := seqLen * n
+		if projected < 0 || projected/n != seqLen { // int64 overflow on absurd inputs
+			projected = math.MaxInt64
+		}
+		return 0, fmt.Errorf("$F.mul(%d * %d) result too large: %d %s (limit %d). "+
+			"Refusing to build an unbounded result.",
+			seqLen, n, projected, unit, int64(lenLimit))
+	}
+	return int(n), nil
+}
+
+func repeatSlice(s []any, n int64) ([]any, error) {
+	if len(s) == 0 {
+		return []any{}, nil // `[] * n` is empty for any n, Python included
+	}
+	count, err := pyRepeatCount(int64(len(s)), "elements", n)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]any, 0, len(s)*count)
 	for i := 0; i < count; i++ {
 		out = append(out, s...)
 	}
-	return out
+	return out, nil
 }
 
 // div is plaita $F.div(a, b) — Python `a / b`: true division, ALWAYS float
