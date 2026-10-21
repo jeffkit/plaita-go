@@ -2,6 +2,7 @@ package interpreter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/dop251/goja"
@@ -45,9 +46,35 @@ func (i *jsInterpreter) Eval(ctx context.Context, src string, opts ...Option) (a
 	return i.eval(ctx, src, o.jsEvalArgs)
 }
 
+// errJsInterrupted is the cause handed to Runtime.Interrupt when the context
+// is done; it surfaces wrapped in *goja.InterruptedError at the pending
+// RunString/function call, letting eval re-classify the abort against ctx.Err().
+var errJsInterrupted = errors.New("js interpreter: interrupted by context")
+
 func (i *jsInterpreter) eval(ctx context.Context, src string, evalArgs *JsEvalArgs) (any, error) {
+	// #48: the vm is ctx-blind by itself — an infinite loop in flow-authored
+	// JS pinned the single consumer past the execution budget forever, and
+	// the deadline's terminal classification (which only runs once Execute
+	// returns) never fired. Interrupt is safe to call from another goroutine
+	// while code is running; fired while idle it aborts the next run.
+	if ctx != nil {
+		if done := ctx.Done(); done != nil {
+			stop := make(chan struct{})
+			defer close(stop)
+			go func() {
+				select {
+				case <-done:
+					i.interpreter.Interrupt(errJsInterrupted)
+				case <-stop:
+				}
+			}()
+		}
+	}
 	_, err := i.interpreter.RunString(src)
 	if err != nil {
+		if interrupted := jsInterruptedByContext(ctx, err); interrupted != nil {
+			return nil, interrupted
+		}
 		return nil, fmt.Errorf("js interpreter: eval source code failed: %v", err)
 	}
 	jsFunction, ok := goja.AssertFunction(i.interpreter.Get(evalArgs.FuncName))
@@ -56,7 +83,26 @@ func (i *jsInterpreter) eval(ctx context.Context, src string, evalArgs *JsEvalAr
 	}
 	result, err := jsFunction(goja.Undefined(), i.interpreter.ToValue(evalArgs.Parameters))
 	if err != nil {
+		if interrupted := jsInterruptedByContext(ctx, err); interrupted != nil {
+			return nil, interrupted
+		}
 		return nil, fmt.Errorf("js interpreter: run js function failed: %v", err)
 	}
 	return result.Export(), nil
+}
+
+// jsInterruptedByContext re-classifies a goja interruption that the context
+// caused. The error wraps ctx.Err() — context.DeadlineExceeded for a node
+// timeout (absorbable by the timeout policy, as any ctx-aware node) and
+// context.Canceled for a worker cancellation (NOT a contextTimeoutError, so
+// a deadline/cancel cannot be swallowed by a continue-with timeout handler).
+func jsInterruptedByContext(ctx context.Context, err error) error {
+	if ctx == nil || ctx.Err() == nil {
+		return nil
+	}
+	var ie *goja.InterruptedError
+	if errors.As(err, &ie) {
+		return fmt.Errorf("js interpreter: execution interrupted: %w", ctx.Err())
+	}
+	return nil
 }
