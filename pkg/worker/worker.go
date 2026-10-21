@@ -456,13 +456,21 @@ func (w *Worker) handleStart(ctx context.Context, task *Task) error {
 	w.metrics.IncCounter(MetricLeaseAcquired, metricLabels("tenant", tenant))
 
 	// #29 start idempotency gate: a carrier for an execution that already has
-	// a state row is an idempotent ack — running rows are never re-run from a
-	// duplicate start (the lease only blocks *simultaneous* double runs, this
-	// gate blocks the *sequential* ones), terminal rows are never overwritten,
-	// suspended executions wait for their decision carrier, and duplicate
+	// a state row never re-runs the flow from a duplicate start (the lease
+	// only blocks *simultaneous* double runs, this gate blocks the
+	// *sequential* ones), terminal rows are never overwritten, and duplicate
 	// starts never reach the DLQ (tombstone semantics alignment: "重复 start
 	// 不进 DLQ"). An id already owned by ANOTHER flow is the Python
 	// ExecutionIdConflictError parity: poison ack (redelivery cannot self-heal).
+	//
+	// #47 routing inside the gate: the branch table is the Python
+	// _existing_start_checkpoint (plaita#234) — a RUNNING hit is the
+	// crash-recovery carrier (worker crash/OOM, deploy restart, D2
+	// force-stop, lease loss all converge to "running row + PEL message") and
+	// is converted into a continue carrier via the §9.1 machinery instead of
+	// being acked into a zombie; a SUSPENDED hit acks only after compensating
+	// a pending suspend dispatch (plaita#233, the handleResume short-circuit);
+	// terminal rows stay the plain idempotent ack.
 	if prev, perr := w.store.LoadExecutionState(ctx, tenant, executionID); perr != nil {
 		_ = w.lease.Release(ctx, handle)
 		return fmt.Errorf("state probe: %w", perr)
@@ -474,16 +482,28 @@ func (w *Worker) handleStart(ctx context.Context, task *Task) error {
 			w.metrics.IncCounter(MetricTaskDedupHitTotal, metricLabels("tenant", tenant, "reason", "flow_conflict"))
 			return nil
 		}
-		_ = w.lease.Release(ctx, handle)
-		w.metrics.IncCounter(MetricTaskDedupHitTotal, metricLabels("tenant", tenant, "status", prev.Status))
-		if prev.Status == StatusSuspended {
+		switch {
+		case prev.Status == StatusRunning:
+			return w.routeStartRedeliveryOnRunning(ctx, task, prev, handle)
+		case prev.Status == StatusSuspended:
+			_ = w.lease.Release(ctx, handle)
+			compensated, cerr := w.compensateSuspendDispatch(ctx, task, prev)
+			if cerr != nil {
+				// The owed service dispatch must be retried: leave the
+				// message pending (ServiceDispatchError semantics, §5.2).
+				return cerr
+			}
+			w.metrics.IncCounter(MetricTaskDedupHitTotal, metricLabels("tenant", tenant, "status", prev.Status))
 			w.logger.Info("start carrier for a suspended execution, idempotent ack (use a resume carrier to wake it)",
-				"execution_id", executionID)
-		} else {
+				"execution_id", executionID, "dispatch_compensated", compensated)
+			return nil
+		default:
+			_ = w.lease.Release(ctx, handle)
+			w.metrics.IncCounter(MetricTaskDedupHitTotal, metricLabels("tenant", tenant, "status", prev.Status))
 			w.logger.Info("duplicate start for an existing execution, idempotent ack (no overwrite)",
 				"execution_id", executionID, "status", prev.Status)
+			return nil
 		}
-		return nil
 	}
 
 	// A brand-new execution id must not inherit retry budgets from a previous
@@ -500,8 +520,13 @@ func (w *Worker) handleStart(ctx context.Context, task *Task) error {
 	// via the cancel path; a live run sees the flag through its poller and a
 	// suspended one through its cancel resume carrier.)
 	if hit, _, err := w.store.IsCancelRequested(ctx, tenant, executionID); err != nil {
+		_ = w.lease.Release(ctx, handle)
 		return fmt.Errorf("cancel probe: %w", err)
 	} else if hit {
+		// #47 (P3 side fix): this branch terminalizes WITHOUT going through
+		// executeAndFinalize, so the lease must be released here — the old
+		// code leaked it until TTL expiry, pinning the execution id.
+		_ = w.lease.Release(ctx, handle)
 		return w.persistCancelAtEntry(ctx, tenant, executionID, task)
 	}
 
@@ -552,6 +577,52 @@ func (w *Worker) handleStart(ctx context.Context, task *Task) error {
 		handle: handle,
 		state:  state,
 	})
+}
+
+// routeStartRedeliveryOnRunning is the #47 fix: a redelivered start carrier
+// that hit a RUNNING row is the crash-recovery carrier (worker crash/OOM,
+// deploy restart, D2 force-stop and lease loss all leave "running row + PEL
+// message"; the reclaim redelivers exactly this), so acking it stranded the
+// execution forever — no continue carrier, no terminal. The branch routes it
+// through the §9.1 conversion (retryCarrierBody, the same machine the retry
+// path uses — #29's own commit note conceded the stranding but only fixed the
+// retry side): running + per-step checkpoint → the converted continue carrier
+// enters mid-flow; running without one → fresh-run parity re-entry; deleted
+// execution (tombstone) → ack without a carrier.
+//
+// Ordering is the retry path's discipline (§9.1 enqueue→ack, executeAndFinalize
+// releasing before returning the retry): probe while THIS worker still holds
+// the lease (stable state view), release the lease, THEN enqueue. Enqueueing
+// under our own lease would hand the converted carrier a consumer that hits
+// the lease conflict and acks it under the §3.5 live-holder rule. A failed
+// enqueue (or probe) leaves the original pending for reclaim, which repeats
+// the conversion — at-least-once, never lost.
+func (w *Worker) routeStartRedeliveryOnRunning(ctx context.Context, task *Task,
+	prev *ExecutionState, handle *LeaseHandle) error {
+	body, err := w.retryCarrierBody(ctx, task)
+	_ = w.lease.Release(ctx, handle)
+	if err != nil {
+		// Tombstone/state probe failure: fail closed, the original stays
+		// pending and the reclaim retries the conversion (Python raises in
+		// the same position — 绝不 fail-open 重排).
+		return err
+	}
+	if body == nil {
+		// Deleted execution (tombstone): ack and drop — a re-enqueued copy
+		// would resurrect it (A51-01).
+		w.logger.Warn("redelivered start on a deleted execution; acked without a carrier",
+			"execution_id", task.ExecutionID)
+		return nil
+	}
+	if _, err := w.queue.Enqueue(ctx, body, task.EnvelopeSchemaVer); err != nil {
+		w.logger.Warn("recovery carrier enqueue failed; original left pending for reclaim",
+			"execution_id", task.ExecutionID, "error", err)
+		return fmt.Errorf("recovery carrier enqueue: %w", err)
+	}
+	w.metrics.IncCounter(MetricRetryTotal, metricLabels("tenant", task.TenantID, "flow", task.FlowID))
+	w.logger.Warn("redelivered start on a running execution converted to a continue carrier (crash recovery, enqueue→ack)",
+		"execution_id", task.ExecutionID, "row_status", prev.Status)
+	return nil
 }
 
 // executePlan bundles what executeAndFinalize needs.

@@ -207,49 +207,12 @@ func TestDuplicateStartTerminalNotOverwritten(t *testing.T) {
 	}
 }
 
-// TestDuplicateStartRunningRowNoOverwrite (#29): a start landing on a running
-// execution (the sequential double-run the lease cannot see) is an idempotent
-// ack; the live row is untouched.
-func TestDuplicateStartRunningRowNoOverwrite(t *testing.T) {
-	w, rdb, _, cfg := newTestWorker(t)
-	ctx := context.Background()
-	presetHelloWorld(t, w)
-
-	executionID := newExecutionID()
-	seeded := &ExecutionState{
-		ExecutionID: executionID,
-		FlowID:      "hello_world_go",
-		TenantID:    "",
-		Status:      StatusRunning,
-		StartTime:   nowISO(),
-		Context:     map[string]any{"$INPUT": map[string]any{"marker": "live-row"}},
-	}
-	if err := w.store.SaveExecutionState(ctx, "", seeded, 0); err != nil {
-		t.Fatal(err)
-	}
-
-	payload := baseStartPayload(executionID)
-	enqueueTask(t, rdb, cfg, payload, "")
-	if _, err := w.ProcessOne(ctx); err != nil {
-		t.Fatalf("ProcessOne: %v", err)
-	}
-	row := loadStateRow(t, rdb, cfg, executionID)
-	if row.Status != StatusRunning {
-		t.Fatalf("status = %q, want running (duplicate must not re-run/overwrite)", row.Status)
-	}
-	if v, ok := row.Context["$INPUT"].(map[string]any); !ok || v["marker"] != "live-row" {
-		t.Fatalf("live row context overwritten: %v", row.Context)
-	}
-	if row.EndTime != "" {
-		t.Fatalf("end_time = %q, want empty", row.EndTime)
-	}
-	if n := streamLen(t, rdb, cfg.QueueName); n != 0 {
-		t.Fatalf("queue XLEN = %d, want 0 (idempotent ack)", n)
-	}
-	if n := streamLen(t, rdb, cfg.DLQKey); n != 0 {
-		t.Fatalf("DLQ XLEN = %d, want 0", n)
-	}
-}
+// TestDuplicateStartRunningRowNoOverwrite (#29) was retired by #47: its
+// premise — a redelivered start on a running row is an idempotent ack — is
+// exactly the stranding bug (#47). The running branch now routes through the
+// §9.1 conversion; the replacement negative controls live in
+// idempotent_gate_routing_test.go (a genuinely-live execution never reaches
+// the gate: TestWorkerLeaseConflict covers the lease-conflict ack).
 
 // TestDuplicateStartFlowConflictPoisonAck (#29): an execution id owned by
 // another flow is poison-acked (ExecutionIdConflict parity) — no overwrite,
