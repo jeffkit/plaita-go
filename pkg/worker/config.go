@@ -9,8 +9,11 @@ package worker
 
 import (
 	"fmt"
+	"log"
+	"math"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -71,7 +74,24 @@ const (
 	// DefaultQuotaDeferMax bounds over-quota tail re-enqueues per carrier
 	// (§1.2, PLAITA_TENANT_QUOTA_DEFER_MAX=64) before quota_bypass admits it.
 	DefaultQuotaDeferMax = 64
+
+	// DefaultExecutionDeadline is the worker-level execution budget (#35,
+	// plaita#267: DEFAULT_EXECUTION_DEADLINE_SECONDS=1800) — the wall-clock
+	// ceiling for ONE engine invocation (one carrier's occupancy span of the
+	// single consumer). A suspended execution waiting for its decision
+	// carrier does not occupy the worker and does not accumulate budget;
+	// every resume/continue carrier gets a fresh span (plaita distributed
+	// strategy: 每步独立计,挂起等待不占预算).
+	DefaultExecutionDeadline = 1800 * time.Second
 )
+
+// ExecutionDeadlineEnv is the operator override for the execution budget
+// (seconds, decimals allowed). Invalid values (non-numeric / non-finite /
+// ≤0) NEVER degrade to "unlimited": they fall back to the default with a
+// warning (plaita#267 降级必须可观测). Disabling the budget is a deployment
+// decision expressible only through the Config hook (a negative
+// ExecutionDeadline), not through the environment.
+const ExecutionDeadlineEnv = "PLAITA_EXECUTION_DEADLINE_SECONDS"
 
 // Config carries every knob of the worker. All fields are overridable through
 // environment variables so a shadow deployment can rewrite the full key space
@@ -165,6 +185,18 @@ type Config struct {
 	// DisableTenantQuota: PLAITA_DISABLE_TENANT_QUOTA=1 — rollback switch
 	// bypassing the whole tenant-quota gate.
 	DisableTenantQuota bool
+
+	// ExecutionDeadline is the worker-level execution budget (#35, plaita#267):
+	// when one engine invocation outlives it, the run is cancelled
+	// cooperatively (no kill -9 — ctx-aware nodes bail out, the engine
+	// fail-fasts at the next attempt boundary) and terminalized with the
+	// named non-retryable error execution_deadline_exceeded. Zero means the
+	// DefaultExecutionDeadline (1800s); a NEGATIVE value is the deployment
+	// hook's explicit opt-out (the environment can never disable the gate —
+	// an invalid or ≤0 env value falls back to the default with a warning).
+	// An engine-level flow timeout (flow.timeout) composes as the stricter of
+	// the two: whichever deadline fires first ends the execution.
+	ExecutionDeadline time.Duration
 }
 
 // DefaultConfig returns the protocol-default configuration for the current
@@ -205,6 +237,8 @@ func configFromEnv(getenv func(string) string) *Config {
 		TenantRunningTTLSeconds: envInt(getenv, "PLAITA_TENANT_RUNNING_TTL_SECONDS", DefaultTenantRunningTTLSeconds),
 		QuotaDeferMax:           envInt(getenv, "PLAITA_TENANT_QUOTA_DEFER_MAX", DefaultQuotaDeferMax),
 		DisableTenantQuota:      getenv("PLAITA_DISABLE_TENANT_QUOTA") == "1",
+
+		ExecutionDeadline: envSecondsDuration(getenv, ExecutionDeadlineEnv, DefaultExecutionDeadline),
 	}
 	cfg.normalize()
 	return cfg
@@ -308,6 +342,14 @@ func (c *Config) normalize() {
 	if c.QuotaDeferMax <= 0 {
 		c.QuotaDeferMax = DefaultQuotaDeferMax
 	}
+	// Execution budget (#35): a zero Config literal means "unset" and takes
+	// the default; a negative value is the deployment hook's explicit
+	// opt-out and is kept as-is (the env can never express it — envSeconds
+	// rejects ≤0 back to the default, plaita#267's "never silently
+	// unlimited").
+	if c.ExecutionDeadline == 0 {
+		c.ExecutionDeadline = DefaultExecutionDeadline
+	}
 }
 
 // Namespace returns the tenant-routed key namespace (§3.1): the plain prefix
@@ -369,6 +411,23 @@ func envFloat(getenv func(string) string, key string, def float64) float64 {
 		return def
 	}
 	return f
+}
+
+// envSecondsDuration parses a positive finite seconds value into a Duration
+// (plaita#267 default_execution_deadline_ms): invalid input falls back to the
+// default WITH a warning — an operator typo must never turn the execution
+// budget into "unlimited".
+func envSecondsDuration(getenv func(string) string, key string, def time.Duration) time.Duration {
+	raw := strings.TrimSpace(getenv(key))
+	if raw == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsInf(f, 0) || math.IsNaN(f) || f <= 0 {
+		log.Printf("[worker] %s=%q is not a positive finite number of seconds; falling back to the default %s (never silently unlimited, plaita#267)", key, raw, def)
+		return def
+	}
+	return time.Duration(f * float64(time.Second))
 }
 
 func getenvFallback2(getenv func(string) string, keys ...string) string {

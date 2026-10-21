@@ -88,6 +88,15 @@ A1 r62/r63 情报（A62-02/04/05、issue #34）的落地件。Python 权威语�
 - **providers.json 明文（A62-05）**：`agentproc.readJSONFile` 对 agents.json / providers.json 做 fail-loud 权限检查——mode 0600 或更严，组/其他任何权限位 → 具名错误（含 `chmod 600 <path>`），无告警继续路径；Windows 跳过 POSIX 位检查（按 NTFS ACL）。明文 key 注入子进程的通道仍在（协议需要 provider env），加密/租户凭据路由另单；check-then-read 的 TOCTOU 不构成安全边界（本地运营者配置，威胁模型是误配泄露而非同机竞态）。
 - **宿主写面 + 平台 Redis 租户闸（#36/#37，2026-10-21）**：flow 控制路径的宿主写面五节点（writefile / git_publish / report / rate_limit / github_comment）在 Execute 入口接入共享租户闸（`refuseNonDefaultTenantWriteFace`，经泛化的共享拒绝核心 `refuseNonDefaultTenantReasoned`，与 #34 三门同族：`ErrTenantIsolationUnavailable` + marker + NonRetryable；#34 三门文案保持不变）。位置逐节点定在**首个宿主副作用之前**：github_comment 的闸在 dry-run 短路**之前**（其 dry-run 仍写宿主 artifact 草稿），宿主 GH_TOKEN/GITHUB_TOKEN 读取面被同一道闸覆盖；git_publish 的闸在 dry-run 短路**之后**（dry-run 无任何 git 操作，同 gate/capture 家族语义）；report 的 read action 同闸（读其他租户 report 通道与写同权）。redis 节点（#37）双层闸，在任何 target 解析/拨号之前：非 default 租户必须有 worker 级 target allowlist（env `PLAITA_REDIS_TARGET_ALLOWLIST` 或部署钩子 `SetRedisTargetAllowlist`，逗号/空白分隔 redis URL），未配置一律拒；配置后按 host:port/db 身份匹配（大小写不敏感，userinfo 凭据不参与），target 不在册即拒——注入 client 的 DI 旁路不绕过闸。default/无租户全部保持历史语义（正控各门有测）。**构造期不拒（IR 层面结论）**：租户是执行期 ctx 属性（worker 按 message 注入 `runtime.WithTenantID`），`Validate`/`ir.Load` 无租户语境，且同一份 flow JSON 跨租户复用、节点实例按执行构造——加载期拒绝会错伤其他租户与单租户部署，也会把策略决定提前到无策略输入的位置；故拒绝点固定在各节点 Execute 首个宿主副作用之前，构造期保持租户无关（dry-run 准入等运行时属性同理）。
 
+## 执行级 deadline 与构造期预算 caps（2026-10-21，分支 fix/exec-deadline；#35 = plaita#267 Go 同型）
+
+plaita 侧权威语义：`plaita/core/deadline.py` + `core/strategies.py`（#267，commit `1e57801`）+ r47 retryTimes cap。协议文档 §9.5 是完整口径。
+
+- **worker 级执行预算**（`pkg/worker/config.go` + `executeAndFinalize`）：env `PLAITA_EXECUTION_DEADLINE_SECONDS` 或部署钩子 `Config.ExecutionDeadline`，**默认 1800s**；env 非法/≤0 回退默认并 WARN（绝不静默无限额），显式关闭只能走钩子（负值）。**口径 = 一次引擎调用的占用跨度**（每载体独立计，挂起等待不占预算——对齐 plaita distributed「每步独立计」），不是执行全寿命。到期协作式取消（runCtx cancel；节点边界 fail-fast + go-retry ctx 优先，无 kill -9），终态分类插在 cancel/drain/suspend 之后、引擎错误之前：即使 handler 把 ctx 错误吞成 continue 也照样落账（对齐 Python「ExecutionDeadlineError 不可被 handler 吞」）。终态 = error + `error_type=execution_deadline_exceeded`（code -500）+ details 带 deadline/occupied 秒数 + timeline 事件 + metric `exec_deadline_total`；不重试、不进 DLQ，消费者立即释放（负控断言队尾任务恢复时延）。
+- **构造期 caps**（plaita r47/#267 同值，IR 装载期 + 引擎模型双层）：`errorHandler.retryTimes`（节点级+flow 级）≤ 10（`pkg/workflow/budget.go` `MaxRetryTimes`；引擎 `Validate` 顺带修掉了存量 `Min(0)` 对 uint 的 ozzo 阈值崩溃——非零值必炸的潜伏 bug）；节点 `timeout` ≤ 24h（`MaxNodeTimeout`）；flow 级 timeout **不 cap**（显式运营预算，运行时被 worker 预算取严封顶）。HTTP `requestTimeout` 改**整个请求共享总预算**（`nodes/http.go` reqDeadline，跳前检查、耗尽具名 `requestTimeout budget exhausted` → 1002 可重试族，同 plaita `_RequestBudgetExceeded`），delegate 路径同闸。
+- **与 r63「构造期不拒」结论不冲突**：租户闸拒的是执行期 ctx 属性；本轮 caps 拒的是 flow JSON 静态形状（retryTimes/timeout 数字），构造期即有完整输入，且 IR 是部署唯一入口。
+- **负控（先红后绿）**：`exec_deadline_test.go` 自循环 switch flow——pre-fix 基线 30s 仍独占（红，实测）；post-fix 预算内具名终态 + 队尾任务恢复 + 无 DLQ 污染；钩子关闸行为守恒。`budget_caps_test.go` retryTimes=11/timeout=24h+1ms 拒、=10/=24h 收。`http_budget_test.go` 两慢跳挤爆总预算 + 1ns 预算具名拒绝（pre-fix 双红，实测）。
+
 ## 常用命令
 
 ```bash

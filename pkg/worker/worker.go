@@ -641,6 +641,26 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
+	// #35 (plaita#267): the worker-level execution budget. One engine
+	// invocation may occupy the single consumer for at most
+	// cfg.ExecutionDeadline; past that the run is cancelled COOPERATIVELY
+	// (no kill -9: ctx-aware nodes bail out, ctx-blind ones get the engine's
+	// fail-fast at the next attempt boundary / go-retry's ctx-priority
+	// backoff abort) and the classification below terminalizes it with the
+	// named non-retryable execution_deadline_exceeded error — even when the
+	// surfaced engine error was absorbed by a timeout/error handler or nil.
+	execDeadline := w.cfg.ExecutionDeadline
+	var deadlineTimer *time.Timer
+	if execDeadline > 0 {
+		deadlineTimer = time.AfterFunc(execDeadline, func() {
+			run.markDeadlineHit()
+			w.logger.Error("execution deadline exceeded; cancelling the run cooperatively (terminal error will be written)",
+				"execution_id", task.ExecutionID, "tenant", tenant,
+				"deadline_seconds", execDeadline.Seconds())
+			cancelRun()
+		})
+		defer deadlineTimer.Stop()
+	}
 	// loopCtx outlives runCtx: the terminal persist + lease release must run
 	// on the consumer-loop context, since runCtx is cancelled as soon as the
 	// engine returns (by cancellation, lease loss or plain completion).
@@ -800,6 +820,13 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 		result, execErr = def.Workflow.Execute(ctx, task.Params)
 	}
 	susp := workflow.AsSuspend(execErr)
+	// Stop the deadline watch before classification: only firings that
+	// happened while the engine was actually running (real occupancy) may
+	// drive the terminal verdict — a boundary completion must not be
+	// re-classified as a deadline expiry by a late timer tick.
+	if deadlineTimer != nil {
+		deadlineTimer.Stop()
+	}
 	close(pollDone)
 	close(watchDone)
 	pollWG.Wait()
@@ -877,6 +904,44 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 		if err != nil {
 			_ = w.lease.Release(loopCtx, handle)
 			return fmt.Errorf("suspended persist: %w", err)
+		}
+	case run.deadlineExceeded():
+		// #35 (plaita#267): the execution budget expired. Checked after the
+		// suspend/lease/drain/cancel verdicts (a completed park leaves the
+		// worker and gets a fresh budget on its resume carrier; explicit
+		// cancel/drain intent wins) but BEFORE the engine error — a deadline
+		// cancellation must never be re-classified from the ctx-error chain
+		// the engine surfaces, nor be absorbed by a timeout/error handler
+		// (plaita made ExecutionDeadlineError unabsorbable for the same
+		// reason). Named, non-retryable, ordinary error terminal: no retry
+		// carrier, no DLQ entry — the consumer moves on immediately.
+		occupied := time.Since(execStarted).Seconds()
+		w.metrics.IncCounter(MetricExecDeadlineTotal, metricLabels("tenant", tenant))
+		w.logger.Error("execution deadline exceeded, terminalizing error (non-retryable)",
+			"execution_id", task.ExecutionID, "tenant", tenant,
+			"deadline_seconds", execDeadline.Seconds(), "occupied_seconds", occupied,
+			"flow_id", task.FlowID)
+		ne := WorkerError("execution_deadline_exceeded", flowErrorCode,
+			fmt.Sprintf("execution deadline of %s exceeded while the run occupied the worker for %.1fs (worker-level budget, plaita#267)",
+				execDeadline, occupied))
+		ne.Details = map[string]any{
+			"deadline_seconds": execDeadline.Seconds(),
+			"occupied_seconds": occupied,
+		}
+		if run.failedNode != "" {
+			ne.FailedNode = run.failedNode
+		}
+		ev := run.recordTimeline("execution_deadline_exceeded", map[string]any{
+			"deadline_seconds": execDeadline.Seconds(),
+			"occupied_seconds": occupied,
+		})
+		w.publishExecutionEvent(loopCtx, run.executionID, ev)
+		emitResult("failed")
+		if err := run.finalize(func() error {
+			return w.persistErrorTerminal(loopCtx, tenant, handle.FenceToken, plan.state, run, ne)
+		}); err != nil {
+			_ = w.lease.Release(loopCtx, handle)
+			return fmt.Errorf("deadline terminal persist: %w", err)
 		}
 	case execErr != nil:
 		terminalized, retryErr, err := w.classifyNodeFailure(loopCtx, tenant, handle, plan.state, run, execErr)

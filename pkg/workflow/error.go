@@ -122,13 +122,21 @@ func (r *RecoverableErrorHandlePolicy) Validate() error {
 	if r == nil || len(r.Strategy) == 0 {
 		return nil
 	}
+	// #35 (plaita#267): retryTimes is capped — it multiplies node attempts
+	// (exponential backoff at node level) and an unbounded value lets a
+	// legal flow monopolize a shared worker (issue probe: 1e9 retries ≈
+	// 191 days per delivery). Explicit comparison: ozzo's threshold rules
+	// cannot take the uint field (the old Min(0) errored on any nonzero
+	// value; uint is non-negative anyway).
+	if r.RetryTimes > MaxRetryTimes {
+		return fmt.Errorf("retryTimes: %d exceeds the cap %d (plaita#267/#35: a legal flow must not monopolize a shared worker)", r.RetryTimes, MaxRetryTimes)
+	}
 	return validation.ValidateStruct(r,
 		validation.Field(&r.Strategy, validation.In(
 			HandleStrategyAbort,
 			HandleStrategyContinue,
 			HandleStrategyContinueWith,
-		)),
-		validation.Field(&r.RetryTimes, validation.Min(0)))
+		)))
 }
 
 // Backoff returns the backoff strategy: plaita's exponential retry backoff,

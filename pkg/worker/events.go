@@ -103,6 +103,11 @@ type executionRun struct {
 	// (§9.3), no cancelled terminal is written.
 	drainCancelled   bool
 	drainCancelledAt string
+	// deadlineHit: the worker-level execution budget (#35, plaita#267)
+	// expired while this run occupied the consumer. The run was cancelled
+	// cooperatively and is terminalized with the named non-retryable
+	// execution_deadline_exceeded error — never left occupying the worker.
+	deadlineHit bool
 	// succeededNodes feeds the retry-counter reset (§9.1: any successful node
 	// advance clears the consecutive-failure counters).
 	succeededNodes map[string]bool
@@ -187,6 +192,28 @@ func (r *executionRun) drainAborted() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.drainCancelled
+}
+
+// markDeadlineHit records that the worker-level execution budget expired
+// (#35, plaita#267) and the run was cancelled cooperatively.
+func (r *executionRun) markDeadlineHit() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.deadlineHit = true
+	r.mu.Unlock()
+}
+
+// deadlineExceeded reports whether the execution budget expired during this
+// run.
+func (r *executionRun) deadlineExceeded() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.deadlineHit
 }
 
 // succeededNodeIDs returns the node ids that completed successfully (retry

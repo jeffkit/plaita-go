@@ -50,6 +50,8 @@ const (
 	MetricQuotaDeferredTotal  = "tenant_quota_deferred_total"
 	MetricQuotaBypassedTotal  = "tenant_quota_bypassed_total"
 	MetricQuotaRunning        = "tenant_quota_running" // gauge: admitted starts per tenant
+
+	MetricExecDeadlineTotal = "exec_deadline_total" // #35: executions terminalized by the worker-level execution budget
 )
 
 // metricLabels builds a label map from k/v pairs, dropping empty values so

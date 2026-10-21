@@ -19,6 +19,14 @@
 // separated redis URLs) or nodes.SetRedisTargetAllowlist — without one, every
 // redis target is refused for non-default tenants.
 //
+// Execution budget (#35, plaita#267): one engine invocation may occupy the
+// single consumer for at most PLAITA_EXECUTION_DEADLINE_SECONDS (default
+// 1800s; an invalid or ≤0 value falls back to the default with a warning —
+// never silently unlimited). Past the budget the run is cancelled
+// cooperatively and terminalized with the named non-retryable
+// execution_deadline_exceeded error; see docs/WORKER_PROTOCOL.md §9.5 for
+// the stacking with node timeout / retryTimes caps.
+//
 // Shutdown is the protocol's D3 path: SIGINT/SIGTERM only requests drain
 // (D1); the consumption loop exits at the task boundary, and a bounded timer
 // force-stops (D2) if in-flight work outlives PLAITA_WORKER_DRAIN_TIMEOUT.
