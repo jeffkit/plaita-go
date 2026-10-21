@@ -2,8 +2,10 @@ package interpreter
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func Test_jsInterpreter_Eval(t *testing.T) {
@@ -127,4 +129,70 @@ func Test_jsInterpreter_Eval(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Test_jsInterpreter_Eval_reboundsContextCancel (#48): an infinite loop in
+// flow-authored JS must return once the context is cancelled — pre-fix the vm
+// never looked at ctx and the Eval below hung forever (the watchdog fires red).
+func Test_jsInterpreter_Eval_reboundsContextCancel(t *testing.T) {
+	const spin = "function run(input) { while (true) {} }"
+
+	t.Run("cancel", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(200 * time.Millisecond)
+			cancel()
+		}()
+		began := time.Now()
+		done := make(chan error, 1)
+		go func() {
+			_, err := NewJsInterpreter().Eval(ctx, spin, WithJsEvalArgs(&JsEvalArgs{FuncName: "run"}))
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("err = %v, want context.Canceled (named cancellation)", err)
+			}
+			if el := time.Since(began); el > 3*time.Second {
+				t.Fatalf("Eval returned after %s — interrupt fired too late", el)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Eval still running 5s after cancel: ctx-blind vm (pre-#48 negative control)")
+		}
+	})
+
+	t.Run("deadline", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			_, err := NewJsInterpreter().Eval(ctx, spin, WithJsEvalArgs(&JsEvalArgs{FuncName: "run"}))
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Eval still running 5s past the deadline: ctx-blind vm (pre-#48 negative control)")
+		}
+	})
+
+	// A cancellation racing a trivial script is benign either way: the
+	// interrupt landed first → ctx-named error, or the script completed
+	// before the flag was set → plain result. Never a non-ctx error.
+	t.Run("cancel racing completion stays benign", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		got, err := NewJsInterpreter().Eval(ctx, "function run(input) { return 1+1 }",
+			WithJsEvalArgs(&JsEvalArgs{FuncName: "run"}))
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want nil or context.Canceled", err)
+		}
+		if err == nil && got != int64(2) {
+			t.Fatalf("got = %v, want 2", got)
+		}
+	})
 }

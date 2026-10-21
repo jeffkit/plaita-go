@@ -19,9 +19,15 @@ import (
 func agentRegistryForTest(t *testing.T) *agentproc.Registry {
 	t.Helper()
 	dir := t.TempDir()
+	// The echo double reads its turn line before emitting the result — the
+	// same readiness gate protocolDetailsRegistry uses. A bridge that never
+	// consumes stdin makes agentproc's stdin.Write race the child's exit:
+	// on a loaded CI runner the child wins and the write dies with EPIPE
+	// ("write turn: broken pipe" flake, 807829f first run). Real bridges
+	// read the turn first; the double must be equally faithful.
 	agents := `{"agents": {
 		"echo": {"executor": "testcli", "model": "test-model",
-			"command": "/bin/sh", "args": ["-c", "printf '%s\\n' '{\"type\":\"result\",\"text\":\"reply-from-agent\"}'"]}
+			"command": "/bin/sh", "args": ["-c", "IFS= read -r _ || true; printf '%s\\n' '{\"type\":\"result\",\"text\":\"reply-from-agent\"}'"]}
 	}}`
 	providers := `{"providers": {"p1": {"type": "anthropic", "apiBase": "https://x", "apiKey": "k", "model": "test-model"}}}`
 	if err := os.WriteFile(filepath.Join(dir, "agents.json"), []byte(agents), 0o600); err != nil {

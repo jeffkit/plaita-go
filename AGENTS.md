@@ -97,6 +97,35 @@ plaita 侧权威语义：`plaita/core/deadline.py` + `core/strategies.py`（#267
 - **与 r63「构造期不拒」结论不冲突**：租户闸拒的是执行期 ctx 属性；本轮 caps 拒的是 flow JSON 静态形状（retryTimes/timeout 数字），构造期即有完整输入，且 IR 是部署唯一入口。
 - **负控（先红后绿）**：`exec_deadline_test.go` 自循环 switch flow——pre-fix 基线 30s 仍独占（红，实测）；post-fix 预算内具名终态 + 队尾任务恢复 + 无 DLQ 污染；钩子关闸行为守恒。`budget_caps_test.go` retryTimes=11/timeout=24h+1ms 拒、=10/=24h 收。`http_budget_test.go` 两慢跳挤爆总预算 + 1ns 预算具名拒绝（pre-fix 双红，实测）。
 
+## 全节点 ctx 取消反弹矩阵（2026-10-21，分支 fix/ctx-rebound；#48 = #35 的成立前提）
+
+#35 的执行预算是**协作式**（到点只 cancelRun，`execution_deadline_exceeded` 分类在 Execute 返回后才可达），其隐含前提是每个节点都会反弹 ctx。#48 修补的两个 ctx 盲区击穿了它：**js code 的 goja vm 收了 ctx 从未引用**（死循环永久占死唯一消费者）、**sleep 裸 `time.Sleep` 且 Duration 无 cap**（`sleep 87600h` 一个配置值占死消费者）——Execute 永不返回 → 具名终态/exec_deadline_total 全无，watchdog 随 runCtx 静默退出（orphan 注册只在失租分支，此路径无）；叠 #47 转换 → 租约过期被别的 worker 取走 → start 载体撞 running 行路由 continue 转换 → **双引擎并发跑同一执行**（fence 只挡状态写，这类盲区节点恰是「写不进状态但副作用照跑」的反例面）。修复：goja 接 `vm.Interrupt`（ctx.Done 触发，`*goja.InterruptedError` 按 ctx.Err() 具名归类——`context.Canceled` 刻意**不**算 `contextTimeoutError`（那只认 DeadlineExceeded），预算取消不会被 continue-with timeout handler 吞掉；节点级 timeout（WithTimeout→DeadlineExceeded）照常走 timeout 策略）；sleep 改 `select{ctx.Done(), timer.C}` + 具名取消。行为守恒由既有三条 flow-timeout 策略测试（abort/continue/continue-with，走 sleep 节点）背书。
+
+**矩阵**（「预算到期后 Execute 最迟多久返回」上界；35 个注册类型全量过目）：
+
+| 节点/层 | 阻塞点 | ctx 反弹路径 | 到期返回上界 |
+|---|---|---|---|
+| sleep | 计时等待 | `select{ctx.Done(), timer}`（#48 修复；**IR 拒载**「not part of the plaita dialect」，仅裸引擎嵌入可达） | 即时 |
+| code(js) | goja vm | `vm.Interrupt`（#48 修复） | goja 下个中断点（ms 级） |
+| code(python) | 子进程 | `CommandContext` + Setpgid + Cancel=killpg + WaitDelay | 即时（杀组） |
+| gate / capture / git_publish | 子进程 | `exec.CommandContext` | 即时 |
+| agentrun(宿主) | 子进程 stdout 读取 | agentproc watchdog（ctx→killGroup）；spawn→write turn 窗口只写一行、管道缓冲可吞，不阻塞 | 即时 |
+| http / api_request / notify 族 / generic_webhook / github_comment / llm / decision | HTTP | `NewRequestWithContext`（http 另有共享 reqDeadline 预算，r64） | 连接/读超时族 |
+| email_send | SMTP 会话 | 拨号 `DialContext(ctx)`；会话整体 20s deadline（`conn.SetDeadline`，对齐 Python timeout=20——非 ctx 即时但有界） | ≤20s |
+| redis | go-redis | 全 API ctx | 连接/读超时族 |
+| hitl(阻塞版) | 轮询间隔 | `select{ctx.Done(), time.After}`；轮询 HTTP reqCtx | 即时 |
+| event / hitl_await | 挂起驻留 | Execute 立即返回 SuspendError（不占 Execute 跨度） | 即时 |
+| loop / child / parallel | 子执行 | ctx 贯传（parallel 分支 CloneContext），每子节点 executeNode 入口 ctx fail-fast | 子节点族上界 |
+| assignment / switch / if / parse_json / end / start / reference | 无 | 纯计算（reference 另被 IR 拒载） | 0 |
+
+引擎面兜底：`executeNode` 每次 attempt 入口 `ctx.Err()` fail-fast；可重试错误经 go-retry 循环顶 + 退避 select 的 ctx 优先立即放弃（常数退避 10ms 内）。worker 消费环内部等待（drain force-stop 轮询 20ms、queue/eventbus 重连退避）非 Execute 面，全部 select/`time.After` 有界。**残余豁免**：parallel 后台分支（JoinBranches 空 = fire-and-forget）在 deadline 后仍会跑到其叶子节点的反弹点为止——叶子全 ctx-aware，故仍有界；无孤儿面（节点内不持锁）。
+
+**Python 侧硬杀语义 parity（A2 建议项，结论入档）**：权威 = `plaita/core/runner.py` `_run_with_timeout`——sync 节点在裸 daemon 线程跑、`wait_for(shield(fut))` 到点弃置 future + `cancel_event.set()`，**run_node 必返回**（卡死线程被遗弃、后台继续烧 CPU/做副作用，Python 杀不了线程）；async 节点 wait_for cancel 同为协作式。真硬杀只在进程边界（code sidecar / 宿主命令 killpg，同 Go 侧）。即 Python 的不变量也是「Execute 必返回」而非「执行体必死」；Go 修复后同一不变量成立且更强——goja Interrupt 真正停掉 VM，无遗弃僵尸。plaita 无 sleep 节点（plaita-nodes 无对应物；Go 的 sleep 是前身引擎遗产，IR 已拒载）。
+
+**双实例并发面推演（#47 叠加；A2 声明未实弹部分，本轮补推演留档）**：修复前窗口 = deadline 到点 → Execute 不返回 → watchdog 随 runCtx 退出且无 orphan 注册 → 租约无续约过期 → 其他 worker 取走 → #47 start 载体转换 continue → 第二实例并发跑。修复后 = 到点 → Interrupt/select 即时反弹 → Execute 返回 → deadlineExceeded 具名终态 → 租约释放，窗口闭合。租约真丢路径（renew 失败）的 orphan 注册/心跳语义不变。本轮未实弹双 worker 抢占（miniredis 单实例测试环境）；负控的 follower 恢复 + PEL/DLQ 零污染断言覆盖可观测面（`ctx_rebound_test.go`）。
+
+**负控（先红后绿，#48）**：`internal/interpreter/goja_test.go` cancel/deadline 两子测试 pre-fix 双红（实测）；`pkg/workflow/ctx_rebound_test.go` sleep 87600h + WithCancel pre-fix 红（实测）；`pkg/worker/ctx_rebound_test.go` js 死循环 worker 层——pre-fix 30s 仍独占（红，实测），post-fix 预算内（2s）具名终态 + follower 恢复 + 队列零污染。
+
 ## 常用命令
 
 ```bash
