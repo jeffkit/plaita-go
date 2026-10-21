@@ -92,6 +92,13 @@ func Test_index_python_domains(t *testing.T) {
 		{name: "str substring index", expr: `$F.index('abc','b')`, want: 1},
 		{name: "str miss", expr: `$F.index('abc','z')`, wantErr: true},
 		{name: "int has no index", expr: `$F.index(42, 4)`, wantErr: true},
+		// issue #40 acceptance rows: Python str.index counts CHARACTERS — the
+		// strings.Index byte offset drifted with the text (é is two bytes,
+		// 👍 four), mis-cutting downstream slice/getListItem.
+		{name: "str index counts runes: accented", expr: `$F.index('héllo', 'l')`, want: 2},
+		{name: "str index counts runes: emoji", expr: `$F.index('a👍b', 'b')`, want: 2},
+		{name: "str index counts runes: cjk", expr: `$F.index('中文测试', '测')`, want: 2},
+		{name: "str index multi-char needle", expr: `$F.index('héllo wörld', 'wör')`, want: 6},
 	}
 	e := Evaluator{}
 	ctx := runtime.WithWorkflowRuntimeContext(context.Background(), &runtime.Context{
@@ -265,11 +272,12 @@ func Test_reverse_eval(t *testing.T) {
 
 func Test_getListItem_python_semantics(t *testing.T) {
 	cases := []struct {
-		name    string
-		expr    string
-		input   any
-		want    any
-		wantErr bool
+		name            string
+		expr            string
+		input           any
+		want            any
+		wantErr         bool
+		wantErrContains string
 	}{
 		{name: "list index", expr: `$F.getListItem($INPUT, 1)`, input: []any{"1", "2"}, want: "2"},
 		// issue #21 acceptance row: negative index reads from the end
@@ -279,10 +287,22 @@ func Test_getListItem_python_semantics(t *testing.T) {
 		{name: "str index returns char", expr: `$F.getListItem('abc', 1)`, input: map[string]any{}, want: "b"},
 		{name: "str negative index", expr: `$F.getListItem('abc', -1)`, input: map[string]any{}, want: "c"},
 		{name: "str out of range", expr: `$F.getListItem('abc', 9)`, input: map[string]any{}, wantErr: true},
+		// issue #42 acceptance rows: Python `a['k']` on a dict — the str-key
+		// branch used to be unreachable because pyIndexArg rejected str first
+		// ("'str' object cannot be interpreted as an integer").
+		{name: "dict str key", expr: `$F.getListItem($INPUT.m, 'k')`, input: map[string]any{"m": map[string]any{"k": 5}}, want: 5},
+		{name: "dict missing key is KeyError", expr: `$F.getListItem($INPUT.m, 'nope')`, input: map[string]any{"m": map[string]any{"k": 5}}, wantErrContains: "KeyError"},
+		// a JSON dict never has non-str keys, so the int path keeps its
+		// existing KeyError message; list IndexError rows above stay intact.
+		{name: "dict int key stays KeyError", expr: `$F.getListItem($INPUT.m, 0)`, input: map[string]any{"m": map[string]any{"k": 5}}, wantErrContains: "KeyError"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			got, err := evalSliceExpr(t, c.expr, c.input)
+			if c.wantErrContains != "" {
+				assert.ErrorContains(t, err, c.wantErrContains)
+				return
+			}
 			if c.wantErr {
 				assert.Error(t, err)
 				return
