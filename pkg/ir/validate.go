@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/jeffkit/plaita-go/pkg/duration"
 	"github.com/jeffkit/plaita-go/pkg/expression/plaitaexpr"
 	"github.com/jeffkit/plaita-go/pkg/workflow"
 )
@@ -34,6 +35,18 @@ import (
 // (childFlow / branches[].flow), so $NODE references resolve against the
 // current graph's ids only — plaita's $NODE scope semantics.
 func validateDoc(doc map[string]any, sc scope) error {
+	// Budget caps (#35, plaita#267): the flow-level retryTimes shares the
+	// node-level cap. The flow-level timeout is deliberately NOT capped: an
+	// explicit flow timeout is an operator's budget decision (plaita#267
+	// points longer budgets at it), and at runtime it composes with the
+	// worker execution deadline as the stricter of the two.
+	if h, ok := doc["errorHandler"].(map[string]any); ok {
+		flowID, _ := doc["id"].(string)
+		if err := checkRetryTimesCap(flowID, h, "flow"); err != nil {
+			return err
+		}
+	}
+
 	nodes, err := docNodes(doc)
 	if err != nil {
 		return err
@@ -145,6 +158,9 @@ func validateDoc(doc map[string]any, sc scope) error {
 	// they apply to every node incl. end — end.output is the $NODE ref hot spot.
 	flowID, _ := doc["id"].(string)
 	for _, n := range nodes {
+		if err := checkBudgetCaps(flowID, n); err != nil {
+			return err
+		}
 		if err := checkNodeRefs(flowID, n, ids); err != nil {
 			return err
 		}
@@ -157,6 +173,50 @@ func validateDoc(doc map[string]any, sc scope) error {
 		warnUnknownNodeFields(flowID, n)
 	}
 	return nil
+}
+
+// --- budget caps (#35, plaita#267 alignment) ---
+
+// checkBudgetCaps rejects the flow shapes whose retry/timeout budgets could
+// monopolize a shared single-consumer worker (plaita#267's Go half landed at
+// the model layer; the IR loader is this repo's deployment-form model):
+//
+//   - errorHandler.retryTimes > workflow.MaxRetryTimes (10, plaita r47 cap) —
+//     retryTimes multiplies node attempts (engine exponential backoff), so an
+//     unbounded value lets a legal flow occupy a worker for days (issue
+//     probe: retryTimes=1e9 ≈ 191 days per delivery);
+//   - node timeout > workflow.MaxNodeTimeout (24h, plaita#267
+//     MAX_NODE_TIMEOUT_MS) — a node that can pin a worker for a year must not
+//     be expressible; longer budgets belong in an explicit flow-level timeout,
+//     which at runtime still sits under the worker execution deadline.
+//
+// Runs after normalization: timeout is the canonical ISO-8601 spelling here.
+func checkBudgetCaps(flowID string, n map[string]any) error {
+	if h, ok := n["errorHandler"].(map[string]any); ok {
+		if err := checkRetryTimesCap(flowID, h, fmt.Sprintf("node %q", nodeLabel(n))); err != nil {
+			return err
+		}
+	}
+	if s, ok := n["timeout"].(string); ok && s != "" {
+		if d, err := duration.ParseISO8601(s); err == nil && d.TimeDuration() > workflow.MaxNodeTimeout {
+			return fmt.Errorf("ir: flow %q: node %q: timeout %s exceeds the %s cap (plaita#267/#35); "+
+				"a longer budget needs an explicit flow-level timeout, which still sits under the worker execution deadline",
+				flowID, nodeLabel(n), s, workflow.MaxNodeTimeout)
+		}
+	}
+	return nil
+}
+
+// checkRetryTimesCap applies workflow.MaxRetryTimes to one handler object and
+// reports the offending owner (flow / node label) in the message.
+func checkRetryTimesCap(flowID string, handler map[string]any, owner string) error {
+	v, err := asFloat(handler["retryTimes"])
+	if err != nil || v <= workflow.MaxRetryTimes {
+		return nil
+	}
+	return fmt.Errorf("ir: flow %q: %s: errorHandler.retryTimes %s exceeds the cap %d (plaita#267/#35): "+
+		"retryTimes multiplies node attempts and would let a legal flow monopolize a shared worker",
+		flowID, owner, strconv.FormatFloat(v, 'f', -1, 64), workflow.MaxRetryTimes)
 }
 
 // --- R5 / R6: expression reference scanning (ports _collect_refs) ---

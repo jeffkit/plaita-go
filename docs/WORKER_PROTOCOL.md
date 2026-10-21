@@ -458,6 +458,29 @@ EventSubscription: {subscription_id, event_type(非空强制), filter_condition?
 - **节点结果写回**：`$NODE` 现在存**节点结果表**（`runtime.ExecuteNodeResults`）；此前 worker 的终态 context 误写 `CurrentNodeContext`，本轮修正，`$CURRENT` 单独保留。恢复运行会把挂起行的 `node_timings`/`timeline` 续接到终态行（seq 单调）。
 - **作用域**：仅根流程可挂起；child/loop/parallel 子流程内的挂起节点返回显式引擎错误（快照无法表达嵌套恢复位置）。
 
+### 9.5 执行级 deadline 与构造期预算 caps（plaita-go #35，plaita#267 Go 同型，2026-10-21）
+
+**问题**：worker 是单消费者（registry `concurrency=1`），而 `retryTimes` / 节点 `timeout` 此前无上界、执行无总预算——一份合法 flow 即可把一个 worker 独占数小时到数月（issue 探针：`retryTimes=300` 实测独占 4.96s，1e9 外推 ≈191 天/次投递）。语义基准 = plaita `core/deadline.py` + `core/strategies.py`（#267，commit `1e57801`）。
+
+**worker 级执行预算**（`pkg/worker/config.go` + `executeAndFinalize`）：
+
+- `PLAITA_EXECUTION_DEADLINE_SECONDS`（`worker.ExecutionDeadlineEnv`，秒、支持小数）或部署钩子 `Config.ExecutionDeadline`。**默认 1800s**（对齐 plaita `DEFAULT_EXECUTION_DEADLINE_SECONDS`，与 runbook「停滞 >1800s 判死」同口径）。
+- env 非法值（非数字 / 非有限 / ≤0）**回退默认并打 WARNING**，绝不静默变成「无限额」（plaita#267 契约）；显式关闭只能走部署钩子（`Config.ExecutionDeadline < 0`），env 表达不了这个决定。
+- **预算口径 = 一次引擎调用的占用跨度**（一个载体的 `executeAndFinalize`），不是执行全寿命：挂起等待决议载体的时间不占 worker、不累计预算；每个 resume/continue 载体拿全新预算（对齐 plaita distributed 策略「每步独立计」）。自循环/超长重试这类**单载体内**的占用正被此预算终止。
+- 到期处置是**协作式取消，不是 kill -9**：`runCtx` 被取消 → ctx-aware 节点（http/redis/子进程等待）当场退出，ctx 盲节点在下一个 attempt 边界 fail-fast（引擎对已过期 ctx 直接拒绝执行），go-retry 退避对 ctx.Done 有优先响应——引擎快速冒泡后，worker 终态化。
+- **终态具名且不可吸收**：分类序在 lease/drain/cancel/suspend 之后、引擎错误之前——即使节点/流程的 timeoutHandler/errorHandler 把 ctx 错误吞成 continue（plaita 为同一理由让 `ExecutionDeadlineError` 不可被 handler 吞），到期照样落账。终态 = `status=error`，`error.error_type="execution_deadline_exceeded"`（code=-500 flow 族，对齐 Python「FlowTimeoutError 家族但独立具名」），`details` 带 `deadline_seconds`/`occupied_seconds`；timeline 记 `execution_deadline_exceeded` 事件；metric `exec_deadline_total`。**不重试、不进 DLQ**（普通错误终态 + ack，消费者立即释放给下一个任务——恢复时延可观测）。
+- 与 flow 显式 `timeout` 的叠加：两者取**更严者**——引擎级 flow deadline 先到按既有引擎超时语义（`flowBudgetBinding` → timeoutHandler），worker 预算先到按上述具名终态。
+
+**构造期 caps**（`pkg/workflow/budget.go` + `pkg/ir/validate.go`，加载期具名拒绝）：
+
+| 预算 | 上限 | 拒绝点 | 依据 |
+|---|---|---|---|
+| `errorHandler.retryTimes`（节点级 + flow 级） | 10 | `ir.Load`（`retryTimes N exceeds the cap 10`）+ 引擎 `RecoverableErrorHandlePolicy.Validate` | plaita B2 r47 cap；retryTimes 乘节点尝试（引擎指数退避），无上界 = 单 flow 可表达数月占用 |
+| 节点 `timeout` | 24h | `ir.Load`（`timeout PT90000S exceeds the 24h0m0s cap`） | plaita#267 `MAX_NODE_TIMEOUT_MS`；更长预算走 flow 级显式 timeout（不 cap，运行时仍被 worker 预算封顶） |
+| HTTP `requestTimeout` | 30s 缺省，整个请求（含全部重定向跳）**共享总预算** | 跳前检查，耗尽 → 具名 `requestTimeout budget exhausted`（1002 可重试族，同 plaita `_RequestBudgetExceeded`=TimeoutError） | plaita#267：逐跳重置曾让 600s × 21 跳 = 单 attempt 3.5h |
+
+**负控**（`pkg/worker/exec_deadline_test.go` / `pkg/ir/budget_caps_test.go` / `pkg/workflow/nodes/http_budget_test.go`，先红后绿）：自循环 switch flow 在 pre-fix 基线 30s 看门狗内仍占用消费者（红）；post-fix 在预算内终态化、错误签名正确、队尾任务立即恢复处理；钩子关闸时行为守恒（仍 running）。caps:retryTimes=11 / 节点 timeout=24h+1ms 在 IR 装载期具名拒绝，=10 / =24h 照常装载；flow 级 timeout 不 cap。
+
 ---
 
 ## 10. Go 移植注意

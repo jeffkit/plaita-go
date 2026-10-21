@@ -51,9 +51,10 @@ const (
 
 // Transport guardrails (issue #13), mirroring plaita/plaita/node/http.py:
 const (
-	// defaultRequestTimeoutSecs mirrors request_timeout=30.0 — each request
-	// (including every redirect hop) is bounded, so an unresponsive peer can
-	// never pin a worker forever.
+	// defaultRequestTimeoutSecs mirrors request_timeout=30.0 — the budget of
+	// the WHOLE request including every redirect hop (#35/plaita#267: hops
+	// draw down one shared deadline; an unresponsive peer can never pin a
+	// worker forever, and a redirect chain cannot multiply the budget).
 	defaultRequestTimeoutSecs = 30.0
 	// defaultMaxRedirects mirrors max_redirects=5.
 	defaultMaxRedirects = 5
@@ -75,6 +76,13 @@ const (
 	httpCookiesEnv = "PLAITA_HTTP_COOKIES"
 )
 
+// errRequestBudgetExceeded marks the shared requestTimeout budget (#35,
+// plaita#267) running out mid-redirect-follow. It surfaces through an error
+// frame that carries the request snapshot → 1002 (send_request_fail,
+// retryable) — the same family plaita's _RequestBudgetExceeded(TimeoutError)
+// lands in.
+var errRequestBudgetExceeded = errors.New("requestTimeout budget exhausted before the next redirect hop")
+
 // HTTP is workflow plain http node
 type HTTP struct {
 	BaseNode
@@ -90,7 +98,7 @@ type HTTP struct {
 	// Transport guardrails (plaita parity; see the constants above).
 	// Note pkg/ir fail-closed rejects flows that DECLARE the SSRF fields —
 	// these back the engine-direct JSON path and the operator switch.
-	RequestTimeoutSecs   float64  `json:"requestTimeout,omitempty"`       // per-request (per-hop) timeout, default 30s
+	RequestTimeoutSecs   float64  `json:"requestTimeout,omitempty"`       // whole-request timeout incl. all redirect hops (one shared budget), default 30s
 	MaxRedirects         *int     `json:"maxRedirects,omitempty"`         // redirect follow cap, default 5
 	AllowedHosts         []string `json:"allowedHosts,omitempty"`         // host allowlist: exact / *.suffix / CIDR
 	DeniedHosts          []string `json:"deniedHosts,omitempty"`          // host denylist: same formats
@@ -549,8 +557,12 @@ func (h *httpExecutor) handleRequest(ctx context.Context) (*httpResponse, error)
 	method := h.Method
 	headers := h.Headers
 
-	// every hop gets its own request-time budget (plaita timeout is per
-	// send); cancels are collected and released when the exchange ends
+	// #35 (plaita#267): requestTimeout is the budget of the WHOLE request —
+	// every redirect hop draws down the same deadline instead of resetting
+	// it (per-hop resets let requestTimeout=600 × maxRedirects=20 hold a
+	// single attempt for 3.5h). Cancels are collected and released when the
+	// exchange ends.
+	reqDeadline := time.Now().Add(h.requestTimeout())
 	var cancels []context.CancelFunc
 	defer func() {
 		for _, cancel := range cancels {
@@ -558,7 +570,7 @@ func (h *httpExecutor) handleRequest(ctx context.Context) (*httpResponse, error)
 		}
 	}()
 	nextHopCtx := func() context.Context {
-		hopCtx, cancel := context.WithTimeout(ctx, h.requestTimeout())
+		hopCtx, cancel := context.WithTimeout(ctx, time.Until(reqDeadline))
 		cancels = append(cancels, cancel)
 		return hopCtx
 	}
@@ -567,6 +579,15 @@ func (h *httpExecutor) handleRequest(ctx context.Context) (*httpResponse, error)
 		request, berr := buildRequest(hopCtx, method, body, headers, target)
 		if berr != nil {
 			return nil, nil, berr
+		}
+		if remaining := time.Until(reqDeadline); remaining <= 0 {
+			// Budget spent mid-follow: the request snapshot rides along →
+			// send_request_fail (1002, retryable) — plaita's
+			// _RequestBudgetExceeded is a TimeoutError (1002 family) for the
+			// same reason.
+			return request, nil, fmt.Errorf(
+				"requestTimeout=%s exhausted before the next redirect hop (the budget spans the whole request incl. all redirects, plaita#267): %w",
+				h.requestTimeout(), errRequestBudgetExceeded)
 		}
 		if h.Policy.active() {
 			// restricted: every hop is re-checked — a 302 must not carry the
@@ -600,6 +621,11 @@ func (h *httpExecutor) handleRequest(ctx context.Context) (*httpResponse, error)
 		request, berr := buildRequest(nextHopCtx(), method, body, headers, current)
 		if berr != nil {
 			return nil, berr
+		}
+		if remaining := time.Until(reqDeadline); remaining <= 0 {
+			return &httpResponse{rawRequest: request}, fmt.Errorf(
+				"requestTimeout=%s exhausted before the next redirect hop (the budget spans the whole request incl. all redirects, plaita#267): %w",
+				h.requestTimeout(), errRequestBudgetExceeded)
 		}
 		response, derr := delegator.Do(request, h.Delegate.Params)
 		if derr != nil {
