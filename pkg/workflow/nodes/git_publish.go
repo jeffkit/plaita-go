@@ -144,6 +144,15 @@ func (g *GitPublish) Execute(ctx context.Context) (*workflow.ExecuteResult, erro
 			"dry_run":   true,
 		}, NextNode: g.NextNode()}, nil
 	}
+
+	// Tenant gate (#36), after the dry-run short-circuit (which performs no
+	// git operation) and before the first git invocation: worktree_dir /
+	// branch are flow-controlled host write/push faces.
+	if err := refuseNonDefaultTenantWriteFace(ctx, "git_publish",
+		"the node would commit, push and merge git branches"); err != nil {
+		return nil, err
+	}
+
 	if mergeMode == "main" && g.MainClone == nil {
 		return nil, fmt.Errorf("git_publish %q: merge_mode=main 需要 main_clone 字段", g.ID)
 	}

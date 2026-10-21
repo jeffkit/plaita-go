@@ -72,6 +72,13 @@ func (r *Report) GetType() workflow.NodeType { return nodeTypeReport }
 // Execute validates the action name first, then resolves the report path and
 // reads or appends.
 func (r *Report) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
+	// Tenant gate (#36): base_dir/token are flow-controlled host faces (the
+	// read action reads other tenants' channels just as freely as write
+	// appends to them) — refused before any filesystem touch.
+	if err := refuseNonDefaultTenantWriteFace(ctx, "report",
+		"the node would read and write the host report channel"); err != nil {
+		return nil, err
+	}
 	action := r.Action
 	if action == "" {
 		action = "write"

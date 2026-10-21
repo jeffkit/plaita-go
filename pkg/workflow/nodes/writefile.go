@@ -96,6 +96,11 @@ func (w *WriteFile) GetType() workflow.NodeType { return nodeTypeWritefile }
 
 // Execute evaluates path/content and writes the file inside the jail.
 func (w *WriteFile) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
+	// Tenant gate (#36): the path is flow-controlled, so the node is a host
+	// write face — refused before any evaluation or jail resolution.
+	if err := refuseNonDefaultTenantWriteFace(ctx, "writefile", "the node would write host files"); err != nil {
+		return nil, err
+	}
 	if w.Path == nil {
 		return nil, fmt.Errorf("writefile %q: missing path field", w.ID)
 	}

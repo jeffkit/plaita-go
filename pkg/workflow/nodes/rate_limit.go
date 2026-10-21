@@ -113,6 +113,12 @@ func (r *RateLimit) nowFloat() float64 {
 // safety whitelist, then dispatches on action. Unknown actions are a named
 // deterministic error (never retried).
 func (r *RateLimit) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
+	// Tenant gate (#36): key/store_dir are flow-controlled — a tenant could
+	// clear or exhaust another tenant's limiter on the shared host.
+	if err := refuseNonDefaultTenantWriteFace(ctx, "rate_limit",
+		"the node would read and write the host rate-limit counters"); err != nil {
+		return nil, err
+	}
 	key, err := r.evalKey(ctx)
 	if err != nil {
 		return nil, err

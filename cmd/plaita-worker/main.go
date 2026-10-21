@@ -14,6 +14,11 @@
 // keys. Explicit PLAITA_QUEUE_NAME / PLAITA_CONSUMER_GROUP / PLAITA_DLQ_KEY /
 // PLAITA_DISPATCH_LEDGER_KEY overrides win over the derived defaults.
 //
+// Tenant-scoped flows reach the redis node only through the deployment's
+// target allowlist (#37): PLAITA_REDIS_TARGET_ALLOWLIST (comma/whitespace-
+// separated redis URLs) or nodes.SetRedisTargetAllowlist — without one, every
+// redis target is refused for non-default tenants.
+//
 // Shutdown is the protocol's D3 path: SIGINT/SIGTERM only requests drain
 // (D1); the consumption loop exits at the task boundary, and a bounded timer
 // force-stops (D2) if in-flight work outlives PLAITA_WORKER_DRAIN_TIMEOUT.

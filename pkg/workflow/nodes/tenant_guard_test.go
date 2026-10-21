@@ -20,12 +20,14 @@ import (
 // public marker, dry runs stay allowed (nothing executes), and the default
 // tenant keeps the historical semantics.
 
-func assertTenantRefusal(t *testing.T, err error, sentinel, nodeType string) {
+// requireTenantRefusalError checks the shared refusal shape (family sentinel
+// error, public marker, named tenant, deterministic). Gates whose zero-
+// execution proof is not a single file (redis state, git history) reuse this
+// and assert their own side-effect sentinels.
+func requireTenantRefusalError(t *testing.T, err error, nodeType string) {
 	t.Helper()
 	if err == nil {
-		_, statErr := os.Stat(sentinel)
-		t.Fatalf("%s ran for a non-default tenant (sentinel exists=%v); want the tenant refusal",
-			nodeType, statErr == nil)
+		t.Fatalf("%s ran for a non-default tenant; want the tenant refusal", nodeType)
 	}
 	if !errors.Is(err, ErrTenantIsolationUnavailable) {
 		t.Fatalf("%s error = %v, want ErrTenantIsolationUnavailable", nodeType, err)
@@ -39,6 +41,16 @@ func assertTenantRefusal(t *testing.T, err error, sentinel, nodeType string) {
 	if workflow.IsRetryableError(err) {
 		t.Errorf("%s tenant refusal must be deterministic (NonRetryable), got retryable", nodeType)
 	}
+}
+
+func assertTenantRefusal(t *testing.T, err error, sentinel, nodeType string) {
+	t.Helper()
+	if err == nil {
+		_, statErr := os.Stat(sentinel)
+		t.Fatalf("%s ran for a non-default tenant (sentinel exists=%v); want the tenant refusal",
+			nodeType, statErr == nil)
+	}
+	requireTenantRefusalError(t, err, nodeType)
 	if _, statErr := os.Stat(sentinel); !os.IsNotExist(statErr) {
 		t.Fatalf("%s command executed for a non-default tenant (sentinel %s exists)", nodeType, sentinel)
 	}

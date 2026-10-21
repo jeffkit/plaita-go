@@ -26,30 +26,59 @@ const TenantIsolationMarker = "PLAITA_SUBPROCESS_TENANT_ISOLATION_UNAVAILABLE"
 // that does not mount host credentials (plaita's docker backend).
 var ErrTenantIsolationUnavailable = errors.New(TenantIsolationMarker)
 
-// refuseNonDefaultTenant is the shared tenant gate for host-executing
-// subprocess nodes, porting plaita-nodes _tenant_guard.refuse_non_default_tenant.
-// An empty tenant id is the bare-engine / single-tenant deployment and passes
-// (plaita's current_tenant() falls back to DEFAULT_TENANT_ID there).
-//
-// The refusal is deterministic (workflow.NonRetryable): retrying cannot change
-// the tenant, and the engine must not burn its retry budget on a policy
-// decision. nodeType labels the refusal ("gate", "capture", "code python") —
-// the message and the log line carry the tenant but never a file-system path.
-func refuseNonDefaultTenant(ctx context.Context, nodeType string) error {
+// refuseNonDefaultTenantReasoned is the shared refusal core behind every
+// tenant gate in this package (#34 subprocess family, #36 host write face,
+// #37 redis platform state): a non-default tenant gets the family sentinel
+// (ErrTenantIsolationUnavailable, carrying the public marker), the refusal is
+// deterministic (NonRetryable — retrying cannot change the tenant and must
+// not burn the retry budget), and the log line is observable without echoing
+// a path or credential. Empty tenant (bare engine / single-tenant deployment)
+// and "default" never reach the refusal.
+func refuseNonDefaultTenantReasoned(ctx context.Context, nodeType, reason string) error {
 	tenant := runtime.TenantIDFromContext(ctx)
 	if !runtime.IsNonDefaultTenant(tenant) {
 		return nil
 	}
 	// Fail-closed gates must be observable (degradations are never silent in
 	// this engine); the error itself also lands on the execution event stream.
-	log.Printf("%s subprocess refused non-default tenant=%s (%s); command not executed",
-		nodeType, tenant, TenantIsolationMarker)
+	log.Printf("%s refused non-default tenant=%s (%s); not executed", nodeType, tenant, TenantIsolationMarker)
 	return workflow.NonRetryable(fmt.Errorf(
-		"%w: %s subprocess cannot isolate credentials for tenant %q: the child would run "+
+		"%w: %s refused for tenant %q: %s",
+		ErrTenantIsolationUnavailable, nodeType, tenant, reason))
+}
+
+// refuseNonDefaultTenant is the shared tenant gate for host-executing
+// subprocess nodes, porting plaita-nodes _tenant_guard.refuse_non_default_tenant.
+// An empty tenant id is the bare-engine / single-tenant deployment and passes
+// (plaita's current_tenant() falls back to DEFAULT_TENANT_ID there).
+//
+// nodeType labels the refusal ("gate", "capture", "code python") — the
+// message and the log line carry the tenant but never a file-system path.
+func refuseNonDefaultTenant(ctx context.Context, nodeType string) error {
+	tenant := runtime.TenantIDFromContext(ctx)
+	if !runtime.IsNonDefaultTenant(tenant) {
+		return nil
+	}
+	return refuseNonDefaultTenantReasoned(ctx, nodeType, fmt.Sprintf(
+		"the subprocess cannot isolate credentials: the child would run "+
 			"as the worker user with unrestricted host file-system access, and all tenants "+
 			"share one credentials key, so its command could read the default tenant's "+
 			"credentials; refusing to execute. Run tenant-scoped commands in a container "+
 			"that does not mount host credentials (plaita docker backend); the default "+
-			"tenant keeps the historical semantics",
-		ErrTenantIsolationUnavailable, nodeType, tenant))
+			"tenant keeps the historical semantics"))
+}
+
+// refuseNonDefaultTenantWriteFace gates the flow-controlled host write face
+// (#36): writefile / git_publish / report / rate_limit / github_comment. What
+// the node would do is stated per node ("the node would write host files"),
+// the shared suffix carries the policy: a tenant's flow gets no host write
+// face in this engine (no opt-out — the write lands as the worker user on a
+// host shared by every tenant); the default tenant keeps the historical
+// semantics.
+func refuseNonDefaultTenantWriteFace(ctx context.Context, nodeType, what string) error {
+	return refuseNonDefaultTenantReasoned(ctx, nodeType, what+
+		" as the worker user on the host shared by every tenant; tenant flows get no "+
+		"host write face in this engine and there is no opt-out; run tenant-scoped "+
+		"writes in a container that does not mount host credentials (plaita docker "+
+		"backend); the default tenant keeps the historical semantics")
 }

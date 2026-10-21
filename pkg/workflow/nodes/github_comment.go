@@ -81,6 +81,14 @@ func (g *GithubComment) GetType() workflow.NodeType { return nodeTypeGithubComme
 //
 // Output: {"posted", "note"} (+ "dry_run": true on the dry-run path).
 func (g *GithubComment) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
+	// Tenant gate (#36), BEFORE the dry-run short-circuit: the dry-run path
+	// still writes the artifact draft to the host (a host write face), and
+	// the live path reads the host GH_TOKEN/GITHUB_TOKEN — both sit behind
+	// this one gate.
+	if err := refuseNonDefaultTenantWriteFace(ctx, "github_comment",
+		"the node would write host artifact drafts and spend the host GH_TOKEN/GITHUB_TOKEN identity on GitHub API calls"); err != nil {
+		return nil, err
+	}
 	if g.Repo == nil || g.IssueNumber == nil || g.Text == nil {
 		return nil, fmt.Errorf("github_comment %q: 节点缺少 repo/issue_number/text 字段", g.ID)
 	}
