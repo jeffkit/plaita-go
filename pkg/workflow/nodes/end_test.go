@@ -166,3 +166,27 @@ func TestEnd_ErrorResultType_PropagatesThroughChild(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "boom")
 }
+
+// TestEndErrorResultNotRetryable (issue #43): resultType=error is the flow's
+// decision, not a transient fault — plaita converts FlowResultError to
+// ErrorResultException inside the `except FlowResultError` clause, which
+// escapes run_node's retry loop entirely. The construction point therefore
+// wraps the error as NonRetryable; text and the *FlowResultError contract
+// (errors.As through the wrapper) stay intact.
+func TestEndErrorResultNotRetryable(t *testing.T) {
+	end := &End{
+		BaseNode:   BaseNode{ID: "end"},
+		ResultType: ResultTypeError,
+		Error:      &Error{Code: "400", Message: "boom"},
+	}
+	_, err := end.Execute(runtime.WithWorkflowRuntimeContext(context.TODO(), &runtime.Context{}))
+	require.Error(t, err)
+	if workflow.IsRetryableError(err) {
+		t.Fatalf("end error result must be deterministic, got retryable: %v", err)
+	}
+	var flowErr *FlowResultError
+	require.ErrorAs(t, err, &flowErr, "FlowResultError contract must survive the wrapper")
+	require.Equal(t, "400", flowErr.Code)
+	require.Equal(t, "boom", flowErr.Message)
+	require.Contains(t, err.Error(), "FlowResultError: code=400, message=boom")
+}

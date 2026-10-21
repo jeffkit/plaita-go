@@ -18,12 +18,9 @@ package plaitaexpr
 
 import (
 	"fmt"
-	"reflect"
 	"sort"
 	"strings"
 	"unicode/utf8"
-
-	"github.com/spf13/cast"
 )
 
 // length is plaita $F.len/$F.length — Python builtin len: str (runes), list
@@ -244,8 +241,11 @@ func setListItem(s []any, i int64, item any) (any, error) {
 // sortSlice is plaita $F.sort(a[, key][, desc]) — Python
 // `sorted(a, key=lambda x: x.get(sort_key) if isinstance(x, dict) else x,
 // reverse=desc)`: returns a NEW sorted list (the input is copied first, so a
-// live context list is never reordered in place).
-func sortSlice(slice []any, args ...any) []any {
+// live context list is never reordered in place). Python raises TypeError on
+// the first incomparable pair (issue #44 — sorted() never silently reorders
+// mixed types), so ordering goes through the shared Compare primitive and a
+// comparison failure surfaces as a named error instead of a bogus result.
+func sortSlice(slice []any, args ...any) (any, error) {
 	var (
 		desc    bool
 		sortKey string
@@ -265,62 +265,38 @@ func sortSlice(slice []any, args ...any) []any {
 	newSlice := make([]any, len(slice))
 	copy(newSlice, slice)
 
+	var cmpErr error
 	sort.SliceStable(newSlice, func(i, j int) bool {
-		aObj, bObj := newSlice[i], newSlice[j]
-		return lessObj(aObj, bObj, desc, sortKey)
+		if cmpErr != nil {
+			return false
+		}
+		a, b := sortKeyOf(newSlice[i], sortKey), sortKeyOf(newSlice[j], sortKey)
+		c, err := Compare("$F.sort", a, b)
+		if err != nil {
+			// Python's exact message shape: '<' is the only operator sorted()
+			// uses (reverse=True still compares with <).
+			cmpErr = fmt.Errorf("$F.sort: '<' not supported between instances of '%s' and '%s'",
+				pyTypeName(a), pyTypeName(b))
+			return false
+		}
+		if desc {
+			return c > 0
+		}
+		return c < 0
 	})
-	return newSlice
+	if cmpErr != nil {
+		return nil, cmpErr
+	}
+	return newSlice, nil
 }
 
-func lessObj(aObj any, bObj any, desc bool, sortKey string) bool {
-	aValue := reflect.ValueOf(aObj)
-	if aValue.Kind() == reflect.Ptr {
-		aValue = aValue.Elem()
+// sortKeyOf is Python `x.get(sort_key) if isinstance(x, dict) else x`: a dict
+// element projects onto sortKey and a MISSING key falls back to None — which
+// then fails comparisons exactly like Python (issue #44: the previous
+// fallback-to-element silently mixed projected and unprojected values).
+func sortKeyOf(v any, key string) any {
+	if m, ok := v.(map[string]any); ok {
+		return m[key]
 	}
-	bValue := reflect.ValueOf(bObj)
-	if bValue.Kind() == reflect.Ptr {
-		bValue = bValue.Elem()
-	}
-	switch aValue.Kind() {
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		aInt := cast.ToInt64(aObj)
-		bInt := cast.ToInt64(bObj)
-		if desc {
-			return aInt > bInt
-		}
-		return aInt < bInt
-	case reflect.Float32, reflect.Float64:
-		aFloat := cast.ToFloat64(aObj)
-		bFloat := cast.ToFloat64(bObj)
-		if desc {
-			return aFloat > bFloat
-		}
-		return aFloat < bFloat
-	case reflect.String:
-		aStr := cast.ToString(aObj)
-		bStr := cast.ToString(bObj)
-		if desc {
-			return aStr > bStr
-		}
-		return aStr < bStr
-	case reflect.Struct:
-		if sortKey == "" {
-			return false
-		}
-		aSortField := aValue.FieldByName(sortKey)
-		bSortField := bValue.FieldByName(sortKey)
-		// only support single field(not nested)
-		return lessObj(aSortField.Interface(), bSortField.Interface(), desc, "")
-	case reflect.Map:
-		if sortKey == "" {
-			return false
-		}
-		aSortField := aValue.MapIndex(reflect.ValueOf(sortKey))
-		bSortField := bValue.MapIndex(reflect.ValueOf(sortKey))
-		// only support single field(not nested)
-		return lessObj(aSortField.Interface(), bSortField.Interface(), desc, "")
-	default:
-		return false
-	}
+	return v
 }
