@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	validation "github.com/go-ozzo/ozzo-validation"
 	"github.com/go-redis/redis/v8"
 
+	"github.com/jeffkit/plaita-go/internal/runtime"
 	"github.com/jeffkit/plaita-go/internal/types"
 	"github.com/jeffkit/plaita-go/pkg/expression"
 	"github.com/jeffkit/plaita-go/pkg/workflow"
@@ -28,6 +30,74 @@ func init() {
 // cached per evaluated target URL (target is an expression and may change per
 // execution), a bounded LRU that closes evicted connections.
 const redisClientCacheMax = 8
+
+// redisTargetAllowlistEnv is the worker-level reachable-Redis declaration
+// (#37): comma- or whitespace-separated redis URLs. Tenant-scoped flows may
+// only point the redis node at explicitly declared instances.
+const redisTargetAllowlistEnv = "PLAITA_REDIS_TARGET_ALLOWLIST"
+
+// redisTargetAllowlistOverride is the process-level allowlist hook (same
+// shape as SetWritefileWorkspaceRootOverride); it wins over the env var.
+var redisTargetAllowlistOverride []string
+
+// SetRedisTargetAllowlist installs the deployment's reachable-Redis allowlist
+// (deployment hook): entries are redis URLs (userinfo/credentials never
+// participate in matching) or bare host:port[/db]. The allowlist constrains
+// only non-default tenants (#37); the default tenant keeps the historical
+// semantics.
+func SetRedisTargetAllowlist(targets []string) {
+	redisTargetAllowlistOverride = targets
+}
+
+// redisTargetAllowlist resolves the effective allowlist: the process-level
+// override wins, else the env var is parsed per call (read is cheap; tests
+// can t.Setenv).
+func redisTargetAllowlist() []string {
+	if len(redisTargetAllowlistOverride) > 0 {
+		return redisTargetAllowlistOverride
+	}
+	raw := os.Getenv(redisTargetAllowlistEnv)
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, item := range strings.Fields(strings.ReplaceAll(raw, ",", " ")) {
+		out = append(out, item)
+	}
+	return out
+}
+
+// redisTargetIdentity reduces a redis URL (or bare host:port[/db]) to the
+// host:port/db identity the allowlist matches on: credentials in userinfo
+// never participate, host comparison is case-insensitive. ok=false for
+// anything without an explicit host and port (clientFor would reject it
+// anyway).
+func redisTargetIdentity(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw != "" && !strings.Contains(raw, "://") {
+		raw = "redis://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" || u.Port() == "" {
+		return "", false
+	}
+	return strings.ToLower(u.Host) + u.Path, true
+}
+
+// redisTargetAllowlisted reports whether the evaluated target's identity is
+// on the effective allowlist.
+func redisTargetAllowlisted(target string) bool {
+	id, ok := redisTargetIdentity(target)
+	if !ok {
+		return false
+	}
+	for _, entry := range redisTargetAllowlist() {
+		if eid, entryOK := redisTargetIdentity(entry); entryOK && eid == id {
+			return true
+		}
+	}
+	return false
+}
 
 // RedisNode represents a Redis node
 type RedisNode struct {
@@ -87,10 +157,36 @@ func (r *RedisNode) Execute(ctx context.Context) (*workflow.ExecuteResult, error
 		return s, nil
 	}
 
+	// Tenant gate (#37): target/command/arguments are flow-controlled, so a
+	// non-default tenant's flow can address the worker's own Redis — the
+	// platform state store holding every tenant's execution state, queues,
+	// leases and checkpoints. Fail-closed before any target resolution or
+	// dial: a non-default tenant needs an explicitly configured target
+	// allowlist, and its evaluated target must be on it. The injected
+	// test client (r.client) bypasses target resolution, not this gate.
+	restricted := runtime.IsNonDefaultTenant(runtime.TenantIDFromContext(ctx))
+	if restricted && len(redisTargetAllowlist()) == 0 {
+		return nil, refuseNonDefaultTenantReasoned(ctx, "redis node",
+			"the flow-controlled target could reach the worker's own Redis — the platform "+
+				"state store holding every tenant's execution state, queues, leases and "+
+				"checkpoints; no redis target allowlist is configured for this worker "+
+				"(set "+redisTargetAllowlistEnv+" or SetRedisTargetAllowlist), so every "+
+				"redis target is refused for this tenant; the default tenant keeps the "+
+				"historical semantics")
+	}
+
 	target, err := evalField(r.Target, "target")
 	if err != nil {
 		return nil, err
 	}
+	if restricted && !redisTargetAllowlisted(target) {
+		return nil, refuseNonDefaultTenantReasoned(ctx, "redis node",
+			"the evaluated target is not on the configured redis target allowlist "+
+				"(matching is on host:port/db identity, credentials excluded); refusing to dial; "+
+				"declare tenant-reachable instances via "+redisTargetAllowlistEnv+
+				" or SetRedisTargetAllowlist; the default tenant keeps the historical semantics")
+	}
+
 	command, err := evalField(r.Command, "command")
 	if err != nil {
 		return nil, err

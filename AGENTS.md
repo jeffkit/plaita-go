@@ -86,6 +86,7 @@ A1 r62/r63 情报（A62-02/04/05、issue #34）的落地件。Python 权威语�
 - **agentrun 宿主直跑（A62-02）**：①`pkg/agentproc/runner.go` 的 `composeEnv` 不再继承全量 `os.Environ()`，改为白名单重建（`HostEnvAllowlist` = PATH/HOME/TMPDIR/LANG/LC_ALL/LC_CTYPE/PYTHONIOENCODING，同 plaita `build_subprocess_env`）+ 部署钩子 `HostEnvExtra`（同 `SUBPROCESS_ENV_EXTRA`；spec env 覆盖）——agent 进程只看到显式声明的 env，worker 的 `PLAITA_CREDENTIALS_KEY`/provider key 不随子进程走。**代理等部署变量必须经 `HostEnvExtra` 显式加**。②`agentrun` 宿主路径的租户闸见上；`workspace` 沙箱分支不受影响（容器边界 + 0600 envfile）。bare engine / 单租户部署（无租户上下文）保持放行，同 plaita 无租户层语义。`PLAITA_ALLOW_HOST_AGENT_RUN` 式 opt-out 未移植（默认拒绝，单机信任部署需另立单）。
 - **code 的 Go/yaegi 后端（A62-04）**：`internal/interpreter/yeagi.go` + `GoArgs`/`GO_*` 常量删除，yaegi 依赖移出 go.mod；`code` 节点构造期（`Validate`）与执行期（`Execute`，防直接构造绕过）均以 `ErrInProcessGoUnsupported` 拒绝 `language:"go"`。支持面 = javascript（goja，进程内，保留原语义）+ python（subprocess sidecar）。IR `translateCode` 原本就拒 Go，worker 路径不变。
 - **providers.json 明文（A62-05）**：`agentproc.readJSONFile` 对 agents.json / providers.json 做 fail-loud 权限检查——mode 0600 或更严，组/其他任何权限位 → 具名错误（含 `chmod 600 <path>`），无告警继续路径；Windows 跳过 POSIX 位检查（按 NTFS ACL）。明文 key 注入子进程的通道仍在（协议需要 provider env），加密/租户凭据路由另单；check-then-read 的 TOCTOU 不构成安全边界（本地运营者配置，威胁模型是误配泄露而非同机竞态）。
+- **宿主写面 + 平台 Redis 租户闸（#36/#37，2026-10-21）**：flow 控制路径的宿主写面五节点（writefile / git_publish / report / rate_limit / github_comment）在 Execute 入口接入共享租户闸（`refuseNonDefaultTenantWriteFace`，经泛化的共享拒绝核心 `refuseNonDefaultTenantReasoned`，与 #34 三门同族：`ErrTenantIsolationUnavailable` + marker + NonRetryable；#34 三门文案保持不变）。位置逐节点定在**首个宿主副作用之前**：github_comment 的闸在 dry-run 短路**之前**（其 dry-run 仍写宿主 artifact 草稿），宿主 GH_TOKEN/GITHUB_TOKEN 读取面被同一道闸覆盖；git_publish 的闸在 dry-run 短路**之后**（dry-run 无任何 git 操作，同 gate/capture 家族语义）；report 的 read action 同闸（读其他租户 report 通道与写同权）。redis 节点（#37）双层闸，在任何 target 解析/拨号之前：非 default 租户必须有 worker 级 target allowlist（env `PLAITA_REDIS_TARGET_ALLOWLIST` 或部署钩子 `SetRedisTargetAllowlist`，逗号/空白分隔 redis URL），未配置一律拒；配置后按 host:port/db 身份匹配（大小写不敏感，userinfo 凭据不参与），target 不在册即拒——注入 client 的 DI 旁路不绕过闸。default/无租户全部保持历史语义（正控各门有测）。**构造期不拒（IR 层面结论）**：租户是执行期 ctx 属性（worker 按 message 注入 `runtime.WithTenantID`），`Validate`/`ir.Load` 无租户语境，且同一份 flow JSON 跨租户复用、节点实例按执行构造——加载期拒绝会错伤其他租户与单租户部署，也会把策略决定提前到无策略输入的位置；故拒绝点固定在各节点 Execute 首个宿主副作用之前，构造期保持租户无关（dry-run 准入等运行时属性同理）。
 
 ## 常用命令
 
@@ -169,8 +170,8 @@ agentrun `workspace=` 分支从「拒载」改为「计划支持」。**对齐�
 
 ## 已知问题
 
-- ~~error_node 上游遗留红~~ **已修平（2026-10-19 audit wave，#12/#13 http 契约修复顺带解决；撤代理后 1002=期望）**。
-- `TestWorkflow_Execute/test_execute_workflow_with_http_request_info`（当前唯一红）：`$ERROR.http.Info.Request.Method` 取到 `[]`，end 按 string 校验报错。用例打真实出网（`http://tencent.com`），出口不可达时确定性红。**CI 与 `make test` 经 `scripts/ci-skip.txt` 跳过，`make test-all` 复现**。2026-10-21 复核：同表的 `test_execute_workflow_with_error_node` 已绿（旧条目把它记成了这条红）。
+- ~~error_node 上游遗留红~~ **已修平（2026-10-19 audit wave，#12/#13 http 契约修复顺带解决）**。
+- `TestWorkflow_Execute` 两条子测试都打真实出网（`http://tencent.com`），红随出口状态翻转：`test_execute_workflow_with_http_request_info`（`$ERROR.http.Info.Request.Method` 取到 `[]`，end 按 string 校验报错）在 `scripts/ci-skip.txt` 内，**CI 与 `make test` 跳过，`make test-all` 复现**；`test_execute_workflow_with_error_node` 不在 skip 清单——出口可达时绿（2026-10-21 上午复核），出口不可达时同型红（同日第六十三轮实测，stash 后基线复跑同红，非新增）。
 - `Test_now_today_eval`：gomonkey `time.Now` 补丁在同一测试二进制内多次重放不稳（darwin/arm64 实测 `-count=3` 第 3 次起红），CI skip。`$F.now/$F.today` 的 CI 覆盖因此只剩 `Test_strftime_directives`（直接测 strftime 层）。`Test_today_eval`/`Test_now_eval` 已不存在，skip 清单与测试注释同步剔除。
 - `go vet ./...`：2026-10-21 复核 rc=0 无输出（旧条目里的 providers lock 值拷贝告警已不在）。
 
