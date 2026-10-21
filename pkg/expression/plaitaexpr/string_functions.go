@@ -7,11 +7,13 @@ package plaitaexpr
 //   - lower/upper do full Unicode case mapping via golang.org/x/text/cases
 //     (Python 'straße'.upper() == 'STRASSE' — per-rune Go ToUpper would keep
 //     the ß);
-//   - capitalize uppercases the first character and LOWERCASES the rest
+//   - capitalize TITLECASES the first character (Python titlecase mapping,
+//     issue #41: ß → "Ss" not "SS") and LOWERCASES the rest
 //     ('hello WORLD' → 'Hello world');
 //   - title is str.title: every non-letter starts a new word, the first
-//     letter of each word is uppercased and the rest lowercased
-//     ("they're" → "They'Re", x/text's Title does not split on apostrophes);
+//     letter of each word is TITLECASED and the rest lowercased
+//     ("they're" → "They'Re" — x/text's Title caser is only used per single
+//     rune, its word segmentation does not split on apostrophes);
 //   - split('abc', '') is a ValueError (empty separator);
 //   - join requires str elements (TypeError otherwise — the old cast based
 //     variant silently stringified non-strings);
@@ -30,6 +32,15 @@ import (
 var pyCaser = cases.Upper(language.Und)
 var pyLowerCaser = cases.Lower(language.Und)
 
+// pyTitleCaser provides the Unicode TITLECASE mapping for word-initial
+// characters (Python str.capitalize/str.title use it for the first letter,
+// NOT uppercase): ß → "Ss", ligature ﬀ → "Ff", Georgian stays put while
+// upper maps it to Mtavruli. x/text's Title caser matches Python's titlecase
+// mapping on every code point where upper ≠ title (135 of them, probe
+// verified against Python 3.13); we only ever feed it single runes, so its
+// word segmentation (which differs from str.title) never comes into play.
+var pyTitleCaser = cases.Title(language.Und)
+
 func lower(s string) string {
 	return pyLowerCaser.String(s)
 }
@@ -41,7 +52,8 @@ func upper(s string) string {
 }
 
 func capitalize(s string) string {
-	// Python str.capitalize: first character uppercased, the REST lowercased.
+	// Python str.capitalize: first character TITLECASED (issue #41: ß →
+	// "Ss", not "SS"), the REST lowercased ('hello WORLD' → 'Hello world').
 	if s == "" {
 		return s
 	}
@@ -49,18 +61,18 @@ func capitalize(s string) string {
 	if r == utf8.RuneError && size <= 1 {
 		return s
 	}
-	return pyCaser.String(string(r)) + pyLowerCaser.String(s[size:])
+	return pyTitleCaser.String(string(r)) + pyLowerCaser.String(s[size:])
 }
 
 func title(s string) string {
 	// Python str.title: a "word" starts after every non-alphabetic
-	// character; its first letter is uppercased and the remaining letters
-	// lowercased ("they're bill's" → "They'Re Bill'S").
+	// character; its first letter is TITLECASED (issue #41) and the
+	// remaining letters lowercased ("they're bill's" → "They'Re Bill'S").
 	var b strings.Builder
 	prevIsLetter := false
 	for _, r := range s {
 		if !prevIsLetter && unicode.IsLetter(r) {
-			b.WriteString(pyCaser.String(string(r)))
+			b.WriteString(pyTitleCaser.String(string(r)))
 		} else {
 			b.WriteString(pyLowerCaser.String(string(r)))
 		}

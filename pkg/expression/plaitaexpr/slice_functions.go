@@ -41,8 +41,10 @@ func length(v any) (int, error) {
 }
 
 // index is plaita $F.index(a, b) — Python `a.index(b)`: substring search on
-// str, == membership search on list; a miss is a ValueError (plaita
-// propagates the native exception; the Go sentinel -1 masked misses).
+// str (issue #40: the result counts CHARACTERS like str.index — the raw
+// strings.Index byte offset drifted under multi-byte text), == membership
+// search on list; a miss is a ValueError (plaita propagates the native
+// exception; the Go sentinel -1 masked misses).
 func index(container any, item any) (int, error) {
 	switch c := container.(type) {
 	case string:
@@ -54,7 +56,7 @@ func index(container any, item any) (int, error) {
 		if i < 0 {
 			return 0, fmt.Errorf("$F.index: substring not found")
 		}
-		return i, nil
+		return utf8.RuneCountInString(c[:i]), nil
 	case []any:
 		for i, v := range c {
 			if Equal(v, item) {
@@ -170,7 +172,19 @@ func reverse(s []any) []any {
 // getListItem is plaita $F.getListItem(a, b) — Python `a[b]`: list/string/
 // dict indexing with negative indices; out-of-range is an IndexError (the
 // Go nil sentinel masked real errors and made missing items look like None).
+// Dict STR keys look up before the integer coercion (issue #42: pyIndexArg
+// rejected str first, so the KeyError branch was unreachable dead code).
 func getListItem(v any, i any) (any, error) {
+	if t, ok := v.(map[string]any); ok {
+		// Python `a[b]` on a dict: key lookup, KeyError on miss.
+		if k, ok := i.(string); ok {
+			val, found := t[k]
+			if !found {
+				return nil, fmt.Errorf("$F.getListItem: KeyError: %q", k)
+			}
+			return val, nil
+		}
+	}
 	idx, err := pyIndexArg("getListItem", i)
 	if err != nil {
 		return nil, err
@@ -198,16 +212,9 @@ func getListItem(v any, i any) (any, error) {
 		}
 		return string(runes[j]), nil
 	case map[string]any:
-		// Python `a[b]` on a dict: key lookup, KeyError on miss.
-		k, ok := i.(string)
-		if !ok {
-			return nil, fmt.Errorf("$F.getListItem: KeyError: %v", i)
-		}
-		val, found := t[k]
-		if !found {
-			return nil, fmt.Errorf("$F.getListItem: KeyError: %q", k)
-		}
-		return val, nil
+		// Non-str key on a dict: a JSON dict never has such keys, so it is
+		// always a miss (Python dict[5] → KeyError: 5).
+		return nil, fmt.Errorf("$F.getListItem: KeyError: %v", i)
 	}
 	return nil, fmt.Errorf("$F.getListItem: '%s' object is not subscriptable", pyTypeName(v))
 }

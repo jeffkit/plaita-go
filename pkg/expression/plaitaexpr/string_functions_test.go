@@ -53,6 +53,11 @@ func Test_capitalize_python_semantics(t *testing.T) {
 		// (the rest is LOWERCASED — the old variant kept WORLD)
 		{name: "rest lowercased", expr: `$F.capitalize('hello WORLD')`, want: "Hello world"},
 		{name: "basic", expr: `$F.capitalize($INPUT)`, want: "Hello world"},
+		// issue #41 acceptance rows: the FIRST character uses the Unicode
+		// TITLECASE mapping (Python str.capitalize), not uppercase — ß → "Ss"
+		// ("SS" is what str.upper gives), digraph ǆ → ǅ.
+		{name: "eszett titlecase", expr: `$F.capitalize('ß abc')`, want: "Ss abc"},
+		{name: "digraph titlecase", expr: `$F.capitalize('ǆ')`, want: "ǅ"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -73,6 +78,14 @@ func Test_title_python_semantics(t *testing.T) {
 		// Python str.title splits on EVERY non-letter (apostrophes included)
 		{name: "apostrophe splits words", expr: `$F.title("they're")`, want: "They'Re"},
 		{name: "digits split words", expr: `$F.title('abc1d')`, want: "Abc1D"},
+		// issue #41 acceptance rows: word-INITIAL letters use the Unicode
+		// TITLECASE mapping (Python str.title): ß → "Ss", ligature ﬀ → "Ff",
+		// Georgian stays put (upper would map it to Mtavruli), Greek iota
+		// subscript decomposes as U+1FBA + U+0345.
+		{name: "eszett titlecase", expr: `$F.title('ß x')`, want: "Ss X"},
+		{name: "ligature titlecase", expr: `$F.title('ﬀ x')`, want: "Ff X"},
+		{name: "georgian title is identity", expr: `$F.title('ა x')`, want: "ა X"},
+		{name: "greek ypogegrammeni", expr: `$F.title('ᾲ x')`, want: "Ὰͅ X"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
