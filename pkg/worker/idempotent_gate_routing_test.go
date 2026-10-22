@@ -351,6 +351,136 @@ func TestRedeliveredStartOnDeletedExecutionNoResurrection(t *testing.T) {
 	}
 }
 
+// #83 negative controls: the console writes a `queued` placeholder row BEFORE
+// the carrier is enqueued (plaita#273) — the row is acceptance evidence, not
+// processing evidence. The #29 gate used to ack the carrier against it
+// ("duplicate start ... status=queued") and the execution stayed queued
+// forever. The queued branch must continue into the normal start path.
+
+// seedQueuedPlaceholder seeds the console placeholder row (plaita#273 shape:
+// status=queued, empty context, invoker=console, no TTL — the worker never
+// writes this status).
+func seedQueuedPlaceholder(t *testing.T, w *Worker, executionID string) {
+	t.Helper()
+	seeded := &ExecutionState{
+		ExecutionID:    executionID,
+		FlowID:         "hello_world_go",
+		Status:         StatusQueued,
+		StartTime:      nowISO(),
+		LastUpdateTime: nowISO(),
+		Invoker:        "console",
+		Context:        map[string]any{},
+	}
+	if err := w.store.SaveExecutionState(context.Background(), "", seeded, 0); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestQueuedPlaceholderStartExecutes (#83): a start carrier consumed against
+// a queued placeholder must take the execution over with a normal start
+// (running row written under the lease, flow executed to its terminal), not
+// ack into a zombie — and must not count as a dedup hit.
+func TestQueuedPlaceholderStartExecutes(t *testing.T) {
+	w, rdb, _, cfg := newTestWorker(t)
+	rec := newRecordingMetrics()
+	w.SetMetrics(rec)
+	ctx := context.Background()
+	presetHelloWorld(t, w)
+
+	executionID := newExecutionID()
+	seedQueuedPlaceholder(t, w, executionID)
+	enqueueTask(t, rdb, cfg, baseStartPayload(executionID), "")
+
+	if _, err := w.ProcessOne(ctx); err != nil {
+		t.Fatalf("ProcessOne: %v", err)
+	}
+	row := loadStateRow(t, rdb, cfg, executionID)
+	if row.Status != StatusCompleted || row.EndTime == "" {
+		t.Fatalf("status = %q end = %q, want completed (placeholder must be taken over, not acked)", row.Status, row.EndTime)
+	}
+	if row.Invoker != "worker" {
+		t.Fatalf("invoker = %q, want worker (the running row replaces the console placeholder)", row.Invoker)
+	}
+	if n := streamLen(t, rdb, cfg.QueueName); n != 0 {
+		t.Fatalf("queue XLEN = %d, want 0", n)
+	}
+	if n := pendingCount(t, rdb, cfg); n != 0 {
+		t.Fatalf("PEL = %d, want 0", n)
+	}
+	if n := streamLen(t, rdb, cfg.DLQKey); n != 0 {
+		t.Fatalf("DLQ XLEN = %d, want 0", n)
+	}
+	if got := rec.total(MetricTaskDedupHitTotal); got != 0 {
+		t.Fatalf("task_dedup_hit_total = %d, want 0 (a placeholder is not a duplicate)", got)
+	}
+}
+
+// TestQueuedPlaceholderCancelAtEntry (#83, plaita#273 item-3 parity): the
+// console's direct cancel of a queued row writes the flag first (then CASes
+// the row); a start carrier consumed in that window must hit the entry
+// cancel checkpoint and terminalize cancelled — on top of the placeholder row.
+func TestQueuedPlaceholderCancelAtEntry(t *testing.T) {
+	w, rdb, _, cfg := newTestWorker(t)
+	ctx := context.Background()
+	presetHelloWorld(t, w)
+
+	executionID := newExecutionID()
+	seedQueuedPlaceholder(t, w, executionID)
+	rdb.Set(ctx, cfg.KeyPrefix+":execution:cancel:"+executionID, "operator", time.Minute)
+	enqueueTask(t, rdb, cfg, baseStartPayload(executionID), "")
+
+	if _, err := w.ProcessOne(ctx); err != nil {
+		t.Fatalf("ProcessOne: %v", err)
+	}
+	row := loadStateRow(t, rdb, cfg, executionID)
+	if row.Status != StatusCancelled || row.EndTime == "" {
+		t.Fatalf("status = %q end = %q, want cancelled at entry", row.Status, row.EndTime)
+	}
+	if v := rdb.Get(ctx, cfg.KeyPrefix+":execution:lease:"+executionID).Val(); v != "" {
+		t.Fatalf("lease leaked by the cancel-at-entry branch: %q", v)
+	}
+}
+
+// TestQueuedPlaceholderFlowConflictStillRejected (#83 contrast face): the
+// flow-ownership probe sits BEFORE the status branches — a carrier for another
+// flow is poison-acked even against a queued placeholder, takeover or not.
+func TestQueuedPlaceholderFlowConflictStillRejected(t *testing.T) {
+	w, rdb, _, cfg := newTestWorker(t)
+	rec := newRecordingMetrics()
+	w.SetMetrics(rec)
+	ctx := context.Background()
+	presetHelloWorld(t, w)
+
+	executionID := newExecutionID()
+	seeded := &ExecutionState{
+		ExecutionID:    executionID,
+		FlowID:         "another_flow",
+		Status:         StatusQueued,
+		StartTime:      nowISO(),
+		LastUpdateTime: nowISO(),
+		Invoker:        "console",
+		Context:        map[string]any{},
+	}
+	if err := w.store.SaveExecutionState(ctx, "", seeded, 0); err != nil {
+		t.Fatal(err)
+	}
+	enqueueTask(t, rdb, cfg, baseStartPayload(executionID), "")
+
+	if _, err := w.ProcessOne(ctx); err != nil {
+		t.Fatalf("ProcessOne: %v", err)
+	}
+	row := loadStateRow(t, rdb, cfg, executionID)
+	if row.FlowID != "another_flow" || row.Status != StatusQueued {
+		t.Fatalf("placeholder overwritten: flow=%s status=%s", row.FlowID, row.Status)
+	}
+	if n := streamLen(t, rdb, cfg.QueueName); n != 0 {
+		t.Fatalf("queue XLEN = %d, want 0 (poison ack)", n)
+	}
+	if got := rec.labelOf(MetricTaskDedupHitTotal, "reason"); got != "flow_conflict" {
+		t.Fatalf("dedup hit reason = %q, want flow_conflict", got)
+	}
+}
+
 // TestCancelAtEntryReleasesLease (#47 side fix, P3): a start cancelled at the
 // entry checkpoint terminalizes WITHOUT going through executeAndFinalize —
 // the lease must be released on that path, not pinned until TTL expiry.

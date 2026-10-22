@@ -19,6 +19,11 @@ import (
 
 // Execution statuses (§5.1).
 const (
+	// StatusQueued is the console's placeholder row (plaita#273): written
+	// BEFORE the start carrier is enqueued so the id is immediately GET-able
+	// and cancellable. This worker never writes it — a queued row is
+	// acceptance evidence, not processing evidence (#83).
+	StatusQueued    = "queued"
 	StatusRunning   = "running"
 	StatusSuspended = "suspended"
 	StatusCompleted = "completed"
