@@ -1,5 +1,8 @@
 # Deliberately thin: fmt + vet + build + unit tests. No matrix, no layers —
-# the suite is all-local (fake bridges, temp dirs) and finishes in ~1min.
+# the suite is all-local (fake bridges, temp dirs) and finishes in ~1min. The
+# trailing #80 node-parity tail is the only step that leaves the Go world: it
+# checks out two Python repos (plaita, plaita-nodes) and diffs their live
+# node registry against ir.SupportedNodeTypes().
 #
 # Gate parity: every step below has a `make` counterpart (`make ci`), and the
 # skipped-test list has exactly one source of truth (scripts/ci-skip.txt) shared
@@ -54,3 +57,39 @@ jobs:
         # Skip list: scripts/ci-skip.txt (see AGENTS.md "已知问题"). The Makefile
         # reads the same file, so `make test` and CI cannot drift apart.
         run: go test ./... -count=1 -skip "$(cat scripts/ci-skip.txt)"
+
+      # #80 node parity (same steps as `make node-parity`). The two authority
+      # checkouts are data inputs and deliberately track `main` by branch: the
+      # gate exists to turn red the moment either side adds a node type
+      # unilaterally, so SHA-pinning them would defeat its purpose. The
+      # SHA-pinning audit rule covers `uses:` actions only.
+      - name: checkout plaita (python registry authority)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: jeffkit/plaita
+          ref: main
+          persist-credentials: false
+          path: plaita-authority
+
+      - name: checkout plaita-nodes (plugin authority)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: jeffkit/plaita-nodes
+          ref: main
+          persist-credentials: false
+          path: plaita-nodes-authority
+
+      - name: setup python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: install plaita + plaita-nodes
+        # plaita first so plaita-nodes' `plaita>=0.5.0` resolves against the
+        # checked-out authority, never a PyPI copy.
+        run: |
+          pip install ./plaita-authority
+          pip install ./plaita-nodes-authority
+
+      - name: node parity (python <-> go)
+        run: make node-parity PLAITA_REPO=plaita-authority PLAITA_NODES_REPO=plaita-nodes-authority

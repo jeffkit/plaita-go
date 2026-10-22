@@ -6,7 +6,12 @@
 GOPROXY ?= https://goproxy.cn,direct
 SKIP := $(shell cat scripts/ci-skip.txt)
 
-.PHONY: build test test-all vet fmt-check audit lint ci
+# #80 node-parity gate: the Python authority checkouts (monorepo siblings by
+# default; CI passes the workflow-checkout paths).
+PLAITA_REPO ?= $(CURDIR)/../plaita
+PLAITA_NODES_REPO ?= $(CURDIR)/../plaita-nodes
+
+.PHONY: build test test-all vet fmt-check audit lint node-parity ci
 
 build:
 	GOPROXY=$(GOPROXY) go build ./...
@@ -32,4 +37,15 @@ audit:
 
 lint: fmt-check vet
 
-ci: fmt-check vet build test audit
+# Extracts the authoritative node-type list from the plaita NodeRegistry
+# (core + entry-point plugins) and diffs it against ir.SupportedNodeTypes()
+# with an explicit exception table (pkg/ir/node_parity_test.go). Any
+# unilateral addition on either side turns this red (#80 需求 4).
+node-parity:
+	@out=$$(mktemp -t plaita-node-types.XXXXXX); \
+	python3 scripts/extract_python_node_types.py \
+	  --plaita $(PLAITA_REPO) --plaita-nodes $(PLAITA_NODES_REPO) --out $$out || { rm -f $$out; exit 1; }; \
+	PLAITA_NODE_TYPES_JSON=$$out go test ./pkg/ir -run TestNodeParityWithPython -count=1; \
+	rc=$$?; rm -f $$out; exit $$rc
+
+ci: fmt-check vet build test node-parity audit

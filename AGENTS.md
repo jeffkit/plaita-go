@@ -180,13 +180,23 @@ plaita 侧权威语义：`plaita/core/deadline.py` + `core/strategies.py`（#267
 - **回写**：`PLAITA_CONSOLE_FLOW_SOURCE_WRITEBACK=1` 才把拉到的定义按 Preset 形态回写引擎 Redis（fleet 自愈）；**默认关**——保持对 #303「删除后目标侧不复活」purge 语义只读。
 - **负控**：`console_flowsource_test.go` 八件（miss→拉取成功+回写自洽/404 具名+负缓存/不可达瞬态非 NotFound/瞬态重试后成功/既有命中零回归〔console 零调用〕/latest 解析+租户头透传/draft 拒载/payload 注入与数字字面量保真）。pre 基线编译级红（新符号无接受面）。
 
+## CI Python↔Go 节点清单差分（#80 收尾，2026-10-22，r83，分支 fix/issue80-73-residuals）
+
+防单侧新增漂移的活体门（#80 需求 4）：`make node-parity`（ci.yml 同步含此步）先用 `scripts/extract_python_node_types.py` 从 **plaita NodeRegistry 现场提取**权威节点类型清单（core 内建 + `plaita.nodes` entry points 插件——plaita 自带 server 五类 + plaita-nodes 发行版 22 类；须 `pip install` 两个 checkout，entry points 来自 dist-info，sys.path 替代不了），再由 `pkg/ir/node_parity_test.go` 把它与 `ir.SupportedNodeTypes()` 对拍。
+
+- **判据**：双向差集必须与 `node_parity_test.go` 内的显式例外表完全一致，任何单侧新增/删除不改表即红；**过期例外条目同样红**（差集已不含它=表格漂移，通常是 Go 补齐了该类型，必须摘条）。
+- **当前例外（2026-10-22 实测差集 = 恰好这三条）**：python-only `sql_query` → 移交 #84（驱动选型/凭据面/plaita#205 上限语义前置）；go-only `code`（Python 刻意不进默认 registry，register_code_node 显式 opt-in；Go 为受限 JS 语言白名单 fail-closed）与 `redis`（Python 的 RedisNode 未自动注册；Go 为历史 33 类内建常驻）。
+- **skip 语义**：`PLAITA_NODE_TYPES_JSON` 未设时测试 skip——普通 `go test ./...` 无 plaita checkout 不该红；只有 `make node-parity` / CI 的 parity 步骤设置该 env。提取器遇「entry points 不可见 / 插件加载失败」硬失败（exit 2），**绝不输出缩水清单**（残缺权威=假绿）。
+- **CI 侧权威 checkout 按 `ref: main` 活体跟踪**（非 SHA pin）——门的用途就是任一侧单方面新增立刻红，pin 死权威源等于废掉它；`uses:` 动作的 SHA-pin 审计规则不覆盖数据输入。
+
 ## 常用命令
 
 ```bash
 # 本机 GOPROXY 可能指向内网 goproxy.woa.com（外网不可达），本仓统一走公共代理
 GOPROXY=https://goproxy.cn,direct go build ./...
 GOPROXY=https://goproxy.cn,direct go test ./...
-make ci     # = ci.yml 同形：gofmt 检查 + vet + build + test（含 skip）+ workflow 审计
+make ci     # = ci.yml 同形：gofmt 检查 + vet + build + test（含 skip）+ node-parity + workflow 审计
+make node-parity   # #80：plaita NodeRegistry 权威清单 ↔ ir.SupportedNodeTypes() 差分（例外表见 pkg/ir/node_parity_test.go）
 make test   # 只跑测试；skip 清单与 CI 共用 scripts/ci-skip.txt
 make test-all   # 不带 skip（无出口网络时 http_request_info 会红，见「已知问题」）
 make lint   # gofmt 检查 + vet（golangci-lint 配置存在但未接线）
