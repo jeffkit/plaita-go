@@ -161,6 +161,15 @@ plaita 侧权威语义：`plaita/core/deadline.py` + `core/strategies.py`（#267
 - **capability contract（#300 形状演进）**：supported += 五类（白名单自动生成不变）；manifest 增第六键 `node_dependencies`（部署依赖标注：五节点的恢复都依赖外部 service 消费队列+发布事件，无消费者则停留 suspended——订阅超时兜底除外；additive 键，只读 #300 五键的 consumer 不受影响）；ContractVersion bump **"2026-10-22.3"**。
 - **已知残差（记录不修）**：①delay/approval/redis_queue/kafka_queue/http_callback 的 **service 层 Go 实装不存在**（队列消费者/延迟排程/审批记录/回调 ingress 都是部署侧设施——Python plaita worker 或控制面承担；capability node_dependencies 如实标注）；②`$NODE.<id>.event_data` 里 service 发布的易变时间戳在 golden 规范化层剔键（两侧同款 denylist+32hex/13位ms 打码）；③Python plain-run 分布式 resume 不续跑后继图（worker 下一跳载体驱动），Go 一步到位——runtime 编排差异，节点状态面无分歧。
 
+## flow 定义指纹对齐（#60，2026-10-22，r81，分支 fix/hash-alignment）
+
+`FlowDefinitionHash` 与 Python `compute_flow_definition_hash` 不等价，混编舰队（同 Redis 同 queue 双引擎）resume 硬门把未改定义判成 `flow_hash_mismatch`。权威 = `plaita/server/flow_worker.py` 的 `canonical_flow_definition_json`（`json.dumps(sort_keys=True, ensure_ascii=False, separators=(",",":"), default=str)` over `json.loads` 后的存储定义）。
+
+- **实现（pkg/worker/canonicaljson.go）**：弃 `json.Marshal`（escapeHTML 改写 `<>&`、无条件转义 U+2028/U+2029、`\u0008`/`\u000c` 非 `\b`/`\f` 短形式、转义 DEL、json.Number 字面量直通），自写 CPython 编码器规则移植——①字符串 = `py_encode_basestring` ESCAPE_DCT 全集（`\b\f\t\n\r\"\\` 短形式 + 其余 <0x20 小写 `\u00xx`，其余一切码点原样 UTF-8）；②数字 = json.loads 口径：整数面保留精确十进制（`-0`→`0`，大整数精确），浮点面 `float.__repr__`（最短往返数字 + decpt∈(-4,16] 定点/否则科学计数 ≥2 位指数 + 整数值 `.0` 尾 + `1e400`→`Infinity`/`1e-400`→`0.0`，ParseFloat ErrRange 取 ±Inf/0 值）；③输入 = 严格单文档（trailing data 拒绝，同 json.loads）；④键序 = UTF-8 字节序 == 码点序（sort_keys 等价）。**新钉差异面（r120 十族之外）**：`\b`/`\f` 短转义、整数 `-0`、DEL 不转义、`1e400`→`Infinity`——全部随实现收敛。**已记录残差**：NaN/Infinity 字面量 Python parse_constant 宽容接受、Go 严格拒（解码层接受面分歧，含 NaN 定义在 Go 本就不可运行）；lone surrogate Python 在 encode 期炸、Go 换 U+FFFD（Python 侧 hash 本就不可达）。
+- **golden（活体导出）**：`scripts/export_flow_hash_golden.py`（plaita 仓根运行）→ `pkg/worker/testdata/flow_hash_golden.json` 55 例 = A1 r120 十族（`a1_*`，issue 四锚点 hash 导出期自校验）+ 数字/转义/Unicode/结构扩展矩阵 + **仓内语料回放**（ir/testdata 全部 8 文件 + examples）+ goerr 拒收钉（NaN/Infinity/trailing）。`flow_hash_golden_test.go` 逐例断言**规范文本逐字节相等** + hash 相等 + 矩阵规模守卫（a1≥10、extended≥20）。离线差分 fuzz harness（`flow_hash_fuzz_test.go`，`PLAITA_FLOW_HASH_FUZZ` env 门）两轮种子 × 50 万例（随机 double 全域/数字拼写/字符串/嵌套结构）**全部逐字节一致**。
+- **算法标记改名**：`FlowHashAlgoV2` = `flow-definition-json-sortkeys-v2-go`（Go 戳记）。语义与 Python 逐字节等价后共享标记本可成立，但「同名不同实现」正是 `upgrade_suspected` 恒 false 的根因（r120 增量②）；改名后：旧 Go 行（旧标记+错 hash）→ `upgrade_suspected=true` 可解释分支（运维放行 = 载体 `allow_flow_hash_change=true`）；Python 行（v2 标记+同 hash）→ hash 相等直接过门，下次落盘自然 refresh 标记。**ir_contract_version 不参与判定**（manifest 演进漂移、Python 无同形字段、算法身份已由标记承载——结论入 `docs/WORKER_PROTOCOL.md` §7 与 config.go 注释）。resume 硬门判据本身未动（issue 边界）。
+- **混编端到端负控（先红后绿，stash 基线实测）**：`flow_hash_e2e_test.go` 三件——`TestMixedFleetResumeWithPythonHash`（Python 指纹写入共享 state 行 → Go resume 照跑；pre-fix 红，签名与 issue 实测一致：stored≠current、同标签、upgrade_suspected:false、`flow_hash_mismatch`）+ `TestMixedFleetResumeStillRejectsRealChange`（真变更仍拒，门未放宽）+ `TestMixedFleetLegacyGoRowExplainsUpgrade`（旧 Go 行升级嫌疑置真）。e2e 流定义内嵌分歧内容（`&`/`<>` 字符串 + 指数字面量），ir.Load 可载。
+
 ## 常用命令
 
 ```bash
