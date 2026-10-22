@@ -55,17 +55,41 @@ func (c loopCollection) Elements(ctx context.Context) ([]any, error) {
 		return nil, err
 	}
 
-	return coerceLoopCollection(v)
+	return coerceCollectionLabel(v, "loop")
 }
 
-// coerceLoopCollection ports plaita loop._coerce_collection（issue #27）：
-//   - 字符串先按 JSON 数组字面量解析（"[1,2,3]" → 3 个元素；字段描述宣称
-//     "也可为字面量数组"，而表达式引擎不解析数组字面量、原样返回字符串）；
-//   - 不是 JSON 数组的普通字符串按单元素集合处理（不再 cast 报错，也不再
-//     逐字符迭代），并打 warning 便于作者发现；
-//   - nil → 空集合；slice/array → 逐元素；map → Python list(dict) 语义取键；
+// collectionElements is the shared entry for the map/filter/find/reduce
+// family (#80 phase 1): same coercion, error/warning labels carry the owning
+// node type instead of a hardcoded "loop".
+func collectionElements(ctx context.Context, nodeType string, c loopCollection) ([]any, error) {
+	if len(c.array) > 0 {
+		return c.array, nil
+	}
+	if len(c.expr) == 0 {
+		return nil, nil
+	}
+	v, err := expression.Eval(ctx, c.expr)
+	if err != nil {
+		return nil, err
+	}
+	return coerceCollectionLabel(v, nodeType)
+}
+
+// coerceLoopCollection ports plaita loop._coerce_collection（issue #27）with
+// the loop label; the map/filter/find/reduce family goes through
+// collectionElements (#80 phase 1).
+//
+// coerceCollectionLabel 的归一规则（五节点共用）：
+//   - 字符串先按 JSON 数组字面量解析（"[1,2,3]" → 3 个元素）；
+//   - 不是 JSON 数组的普通字符串按单元素集合处理（不逐字符迭代），打 warning；
+//   - nil → 空集合；slice/array → 逐元素；map → Python list(dict) 语义取键
+//     （Go map 无序，与 Python dict 插入序的分歧沿用 loop 既有行为）；
 //   - 其余不可迭代标量对齐 Python 的 TypeError，返回错误。
 func coerceLoopCollection(v any) ([]any, error) {
+	return coerceCollectionLabel(v, "loop")
+}
+
+func coerceCollectionLabel(v any, label string) ([]any, error) {
 	switch t := v.(type) {
 	case nil:
 		return nil, nil
@@ -83,7 +107,7 @@ func coerceLoopCollection(v any) ([]any, error) {
 		if len(logged) >= 80 {
 			logged = logged[:77] + "..."
 		}
-		log.Printf("loop collection 表达式求值为普通字符串，按单元素集合处理（不逐字符迭代）: %q", logged)
+		log.Printf("%s collection 表达式求值为普通字符串，按单元素集合处理（不逐字符迭代）: %q", label, logged)
 		return []any{t}, nil
 	case []any:
 		return t, nil
@@ -110,7 +134,7 @@ func coerceLoopCollection(v any) ([]any, error) {
 		}
 		return keys, nil
 	default:
-		return nil, fmt.Errorf("loop collection: %T is not iterable", v)
+		return nil, fmt.Errorf("%s collection: %T is not iterable", label, v)
 	}
 }
 

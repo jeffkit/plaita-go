@@ -105,16 +105,19 @@ var supportedNodeTypes = map[string]bool{
 	// M6 checkpoint v1.5（2026-10-19）：挂起恢复地基解锁的挂起节点
 	"event":      true,
 	"hitl_await": true,
+
+	// #80 phase 1（2026-10-22）：核心集合/循环节点按 Python 语义补齐
+	// （plaita/node/loop.py BaseCollectionNode 家族 + While）
+	"map":    true,
+	"filter": true,
+	"find":   true,
+	"reduce": true,
+	"while":  true,
 }
 
 // knownUnsupported types carry a targeted hint; anything else unknown gets a
 // generic message listing what is available.
 var knownUnsupported = map[string]string{
-	"map":       "collection variant, not ported yet (base loop is supported)",
-	"filter":    "collection variant, not ported yet (base loop is supported)",
-	"find":      "collection variant, not ported yet (base loop is supported)",
-	"reduce":    "collection variant, not ported yet (base loop is supported)",
-	"while":     "condition loop variant, not ported yet (base loop is supported)",
 	"case":      "legacy switch dialect, use switch",
 	"calculate": "calculate node is not ported yet",
 	"mock":      "mock node is not ported yet",
