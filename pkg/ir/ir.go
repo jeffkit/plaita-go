@@ -106,6 +106,12 @@ var supportedNodeTypes = map[string]bool{
 	"redis_queue":   true,
 	"kafka_queue":   true,
 	"http_callback": true,
+
+	// #84（2026-10-22，r84）：SQL 查询连接器（plaita-nodes database.py）。
+	// database/sql + 纯 Go 驱动矩阵（pgx/mysql/modernc sqlite，无 cgo）；
+	// 凭据面 / 上限 fail-closed（plaita#205）/ 参数改写 / 错误分类见
+	// pkg/workflow/nodes/sql_query.go 与 AGENTS.md「sql_query 节点」节。
+	"sql_query": true,
 }
 
 // knownUnsupported types carry a targeted hint; anything else unknown gets a

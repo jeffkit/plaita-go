@@ -23,10 +23,11 @@ import "sort"
 // ContractVersion is the IR capability contract version carried in the
 // manifest (plaita#300: ir_contract_version). Bump when the accept-list or
 // normalization semantics change shape in a way consumers must notice.
-// 2026-10-22.3 = #80 phase 3（r79）：server 扩展节点五类转正 + manifest 新增
-// node_dependencies 部署依赖标注键（.2 = #80 phase 2：case/mock/reference
+// 2026-10-22.4 = #84（r84）：sql_query 转正（accept-list 变更，无新 manifest
+// 键）（.3 = #80 phase 3：server 扩展节点五类转正 + manifest 新增
+// node_dependencies 部署依赖标注键；.2 = #80 phase 2：case/mock/reference
 // 转正、calculate/ignore 确认拒载；同日 phase 1 为初始 "2026-10-22"）。
-const ContractVersion = "2026-10-22.3"
+const ContractVersion = "2026-10-22.4"
 
 // EngineName is the manifest engine identifier（console ENGINE_TO_RUNTIME 把
 // 它映射到 go runtime 池；写错/漂移会让清单被 console 判为无效条目、能力门
