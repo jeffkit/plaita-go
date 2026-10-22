@@ -353,6 +353,189 @@ func TestListExecutionsValidationAndTruncation(t *testing.T) {
 	}
 }
 
+// ---- list projection error posture (#74) ----
+//
+// Negative controls, red on the pre-fix baseline (200 + silently gutted
+// page behind one WARN):
+//   - TestListExecutionsWrongTypeMemberFailsRequest: 0 rows / total=10 /
+//     truncated=false for a 10-row index.
+//   - TestListExecutionsWrongTypeMemberNotPartialList: total=100 /
+//     truncated=false for a 600-row index (whole chunk #1 dropped).
+//   - TestListExecutionsNeverReportsContradictoryCompletePage: the
+//     total>0 && executions==[] && truncated=false contradiction leaked.
+// The row-level miss control (TestListExecutionsVanishedMemberStillSkipsRow)
+// stayed green on both sides — the row-level skip policy is unchanged.
+
+// seedBulk writes n execution rows (ids exec-00001…) through the real store
+// save path, start times one minute apart so the index order is
+// deterministic.
+func (h *testHarness) seedBulk(t *testing.T, n int) {
+	t.Helper()
+	base := time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC)
+	for i := 1; i <= n; i++ {
+		h.seedExecution(t, "", fmt.Sprintf("exec-%05d", i), "flow-a", worker.StatusCompleted,
+			base.Add(time.Duration(i)*time.Minute).Format("2006-01-02T15:04:05.000000"), nil)
+	}
+}
+
+// corruptStateKey turns one state row from a string into a hash: the index
+// member stays, but GET answers WRONGTYPE — a pipeline-level failure for
+// every chunk containing the key (external write / prefix collision shape).
+func (h *testHarness) corruptStateKey(t *testing.T, key string) {
+	t.Helper()
+	if err := h.rdb.Del(context.Background(), key).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.rdb.HSet(context.Background(), key, "stolen", "1").Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestListExecutionsWrongTypeMemberFailsRequest(t *testing.T) {
+	h := newHarness(t)
+	h.seedBulk(t, 10)
+	h.corruptStateKey(t, "plaita:execution:exec-00003")
+
+	// #74 acceptance A: a pipeline-level error fails the request (option 1)
+	// instead of answering a silently gutted page. Pre-fix red signature:
+	// 200 with executions=[], total=10, truncated=false.
+	rec := h.do(t, http.MethodGet, "/executions?size=20", nil)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (pre-fix red: 200 / 0 rows / total=10 / truncated=false): %s",
+			rec.Code, rec.Body.String())
+	}
+}
+
+func TestListExecutionsWrongTypeMemberNotPartialList(t *testing.T) {
+	h := newHarness(t)
+	h.seedBulk(t, 600)
+	// ZREVRANGE walks score-desc: the first chunk projects exec-00600 down
+	// to exec-00101, so exec-00400 sits inside it (issue case B, chunk #1).
+	h.corruptStateKey(t, "plaita:execution:exec-00400")
+
+	// #74 acceptance B: fail the request rather than answer with the second
+	// chunk as a complete-looking list. Pre-fix red signature: 200 /
+	// total=100 / truncated=false — 500 rows gone behind one WARN.
+	rec := h.do(t, http.MethodGet, "/executions?status=completed&size=20", nil)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (pre-fix red: 200 / total=100 / truncated=false): %s",
+			rec.Code, rec.Body.String())
+	}
+}
+
+func TestListExecutionsNeverReportsContradictoryCompletePage(t *testing.T) {
+	h := newHarness(t)
+	h.seedBulk(t, 10)
+	h.corruptStateKey(t, "plaita:execution:exec-00003")
+
+	// #74 acceptance C (invariant): no response may claim a complete,
+	// non-empty index with zero rows — the exact shape the baseline leaked
+	// for this scenario.
+	rec := h.do(t, http.MethodGet, "/executions?size=20", nil)
+	if rec.Code == http.StatusOK {
+		var body executionListResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Total > 0 && len(body.Executions) == 0 && !body.Truncated {
+			t.Fatalf("contradictory complete page leaked: total=%d truncated=%v rows=%d",
+				body.Total, body.Truncated, len(body.Executions))
+		}
+	}
+}
+
+func TestListExecutionsVanishedMemberStillSkipsRow(t *testing.T) {
+	h := newHarness(t)
+	h.seedBulk(t, 10)
+
+	// Healthy control: 10 rows, nothing truncated.
+	code, body := h.getJSON(t, "/executions?size=20", nil)
+	if code != http.StatusOK {
+		t.Fatalf("healthy status = %d", code)
+	}
+	rows, _ := body["executions"].([]any)
+	if len(rows) != 10 || body["total"] != float64(10) || body["truncated"] != false {
+		t.Fatalf("healthy list wrong: rows=%d total=%v truncated=%v", len(rows), body["total"], body["truncated"])
+	}
+
+	// Row-level miss (#74 boundary preserved): a state key that vanished
+	// between index read and GET is a redis.Nil row error — the row is
+	// skipped, the other 9 survive, no 500, no spurious truncation.
+	if err := h.rdb.Del(context.Background(), "plaita:execution:exec-00003").Err(); err != nil {
+		t.Fatal(err)
+	}
+	code, body = h.getJSON(t, "/executions?size=20", nil)
+	if code != http.StatusOK {
+		t.Fatalf("row-level miss must not fail the request: status = %d", code)
+	}
+	rows, _ = body["executions"].([]any)
+	if len(rows) != 9 {
+		t.Fatalf("rows = %d, want 9", len(rows))
+	}
+	if body["total"] != float64(10) || body["truncated"] != false {
+		t.Fatalf("miss list envelope wrong: total=%v truncated=%v", body["total"], body["truncated"])
+	}
+}
+
+// ---- out-of-bounds page precheck (#79) ----
+
+func TestListExecutionsOutOfBoundsPageShortCircuits(t *testing.T) {
+	h := newHarness(t)
+	h.seedBulk(t, 3000)
+
+	// #79 acceptance A/B: a page past the index end answers from the ZCARD
+	// the list already holds — no ZREVRANGE window, no per-row GETs, same
+	// response shape (executions=[], total=ZCARD, truncated=false). Pre-fix
+	// red signature: 3002 redis commands (1 ZCARD + 1 ZREVRANGE + 3000
+	// GETs) for an empty page.
+	for _, q := range []string{"?page=16&size=200", "?page=9999&size=200"} {
+		before := h.mr.CommandCount()
+		code, body := h.getJSON(t, "/executions"+q, nil)
+		spent := h.mr.CommandCount() - before
+		if code != http.StatusOK {
+			t.Fatalf("%s status = %d", q, code)
+		}
+		if rows, _ := body["executions"].([]any); len(rows) != 0 {
+			t.Fatalf("%s rows = %d, want empty page", q, len(rows))
+		}
+		if body["total"] != float64(3000) || body["truncated"] != false {
+			t.Fatalf("%s envelope wrong: total=%v truncated=%v", q, body["total"], body["truncated"])
+		}
+		if spent > 2 {
+			t.Fatalf("%s spent %d redis commands, want <= 2 (pre-fix red: 3002)", q, spent)
+		}
+	}
+}
+
+func TestListExecutionsInBoundsPagesUnchanged(t *testing.T) {
+	h := newHarness(t)
+	h.seedBulk(t, 3000)
+
+	// Acceptance C: in-bounds pages keep the full-window projection —
+	// the last full page of a 3000-row index still returns 200 rows.
+	_, body := h.getJSON(t, "/executions?page=15&size=200", nil)
+	rows, _ := body["executions"].([]any)
+	if len(rows) != 200 || body["total"] != float64(3000) {
+		t.Fatalf("page 15: rows = %d total = %v", len(rows), body["total"])
+	}
+	_, body = h.getJSON(t, "/executions?size=20", nil)
+	rows, _ = body["executions"].([]any)
+	if len(rows) != 20 || body["total"] != float64(3000) {
+		t.Fatalf("first page: rows = %d total = %v", len(rows), body["total"])
+	}
+
+	// Empty index: page 1 is the card==0 corner of the precheck and must
+	// answer the empty page, not an error.
+	h2 := newHarness(t)
+	code, body := h2.getJSON(t, "/executions?page=1", nil)
+	if code != http.StatusOK {
+		t.Fatalf("empty index status = %d", code)
+	}
+	if rows, _ := body["executions"].([]any); len(rows) != 0 || body["total"] != float64(0) || body["truncated"] != false {
+		t.Fatalf("empty index envelope wrong: %v", body)
+	}
+}
+
 // ---- events endpoint ----
 
 func TestEventsPaginationAndIncremental(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
@@ -128,7 +129,11 @@ func (s *Server) handleListExecutions(w http.ResponseWriter, r *http.Request) {
 		s.writeInternal(w, r, "execution index read", err)
 		return
 	}
-	rows := s.projectRows(r.Context(), members, tenant, statusFilter, flowFilter)
+	rows, err := s.projectRows(r.Context(), members, tenant, statusFilter, flowFilter)
+	if err != nil {
+		s.writeInternal(w, r, "execution list projection", err)
+		return
+	}
 	sort.SliceStable(rows, func(i, j int) bool {
 		return strOr(rows[i].StartTime) > strOr(rows[j].StartTime)
 	})
@@ -156,9 +161,12 @@ func (s *Server) handleListExecutions(w http.ResponseWriter, r *http.Request) {
 }
 
 // listCandidates resolves the candidate state keys for one list request.
-// Unfiltered queries take a true index page (only offset+size members are
-// projected, total = ZCARD — the console's A2R20-03 fast path); filtered
-// queries scan at most filterMaxCandidates newest members.
+// Unfiltered queries take a true index page: the newest offset+size members
+// are projected (a global window; total = ZCARD — the console's A2R20-03
+// fast path), and a page past the index end short-circuits to the empty
+// page on the ZCARD already in hand (#79) instead of projecting the whole
+// window only to slice itself down to nothing; filtered queries scan at
+// most filterMaxCandidates newest members.
 func (s *Server) listCandidates(ctx context.Context, ns string, page, size int, filtered bool) ([]string, int, bool, error) {
 	indexKey := ns + ":execution:index"
 	card, err := s.rdb.ZCard(ctx, indexKey).Result()
@@ -166,6 +174,14 @@ func (s *Server) listCandidates(ctx context.Context, ns string, page, size int, 
 		return nil, 0, false, err
 	}
 	if !filtered {
+		// A2R28-03 page-boundary precheck (Python parity, #79): an offset
+		// beyond the index end costs a couple of commands, not a full
+		// projection; the response shape (executions=[], total=ZCARD,
+		// truncated=false) is unchanged.
+		offset := (page - 1) * size
+		if card == 0 || int64(offset) >= card {
+			return nil, int(card), false, nil
+		}
 		need := (page-1)*size + size
 		stop := int64(need) - 1
 		if card < int64(need) {
@@ -193,8 +209,10 @@ func (s *Server) listCandidates(ctx context.Context, ns string, page, size int, 
 // projectRows pipelines GET + decode of the candidate state keys and applies
 // the status/flow filters. Read errors on individual rows skip the row (a
 // corrupt row must not take the whole list down — same posture as the
-// console's per-key fallback); a Redis pipeline failure fails the request.
-func (s *Server) projectRows(ctx context.Context, members []string, tenant, statusFilter, flowFilter string) []executionView {
+// console's per-key fallback); a Redis pipeline failure fails the request
+// (#74): dropping the chunk used to answer 200 with a partial list that
+// still claimed truncated=false and total=ZCARD.
+func (s *Server) projectRows(ctx context.Context, members []string, tenant, statusFilter, flowFilter string) ([]executionView, error) {
 	rows := make([]executionView, 0, len(members))
 	const chunk = 500
 	for start := 0; start < len(members); start += chunk {
@@ -210,14 +228,22 @@ func (s *Server) projectRows(ctx context.Context, members []string, tenant, stat
 		}
 		if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
 			// Individual missing keys surface as redis.Nil inside the cmds;
-			// a pipeline-level error is a real failure.
-			s.logger.Warn("execution list projection failed", "error", err)
-			continue
+			// a pipeline-level error (connection, LOADING, OOM, ...) is a
+			// real failure — fail the request, never silently shrink the
+			// list (#74).
+			return nil, err
 		}
 		for i, cmd := range cmds {
 			raw, err := cmd.Result()
 			if err != nil {
-				continue // vanished between index read and GET — skip the row
+				if errors.Is(err, redis.Nil) {
+					continue // vanished between index read and GET — skip the row
+				}
+				// Exec only surfaces the first command error, so a
+				// non-miss row failure after a miss (WRONGTYPE state key:
+				// external write / prefix collision) lands here — it must
+				// not pass as a skipped row either (#74).
+				return nil, fmt.Errorf("get execution state %s: %w", batch[i], err)
 			}
 			var state worker.ExecutionState
 			if err := json.Unmarshal([]byte(raw), &state); err != nil {
@@ -233,7 +259,7 @@ func (s *Server) projectRows(ctx context.Context, members []string, tenant, stat
 			rows = append(rows, summaryView(&state, tenant, batch[i]))
 		}
 	}
-	return rows
+	return rows, nil
 }
 
 // summaryView builds the list row: Python's list path deliberately leaves
