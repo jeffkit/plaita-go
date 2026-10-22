@@ -97,6 +97,15 @@ var supportedNodeTypes = map[string]bool{
 	"case":      true,
 	"mock":      true,
 	"reference": true,
+
+	// #80 phase 3（2026-10-22，r79）：server 扩展节点五类（挂起型，恢复由外部
+	// service 消费 {prefix}:{subtype}:queue 后发布事件驱动；部署依赖见
+	// capability.go 的 NodeDependencies）。
+	"delay":         true,
+	"approval":      true,
+	"redis_queue":   true,
+	"kafka_queue":   true,
+	"http_callback": true,
 }
 
 // knownUnsupported types carry a targeted hint; anything else unknown gets a

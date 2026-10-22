@@ -23,9 +23,10 @@ import "sort"
 // ContractVersion is the IR capability contract version carried in the
 // manifest (plaita#300: ir_contract_version). Bump when the accept-list or
 // normalization semantics change shape in a way consumers must notice.
-// 2026-10-22.2 = #80 phase 2（r78）：case/mock/reference 转正、calculate/
-// ignore 确认拒载（同日 phase 1 为 .1 的初始 "2026-10-22"）。
-const ContractVersion = "2026-10-22.2"
+// 2026-10-22.3 = #80 phase 3（r79）：server 扩展节点五类转正 + manifest 新增
+// node_dependencies 部署依赖标注键（.2 = #80 phase 2：case/mock/reference
+// 转正、calculate/ignore 确认拒载；同日 phase 1 为初始 "2026-10-22"）。
+const ContractVersion = "2026-10-22.3"
 
 // supportedFeatures names the engine-level capabilities the manifest
 // advertises (plaita#300 example set). Sorted.
@@ -49,13 +50,41 @@ func UnsupportedNodeTypes() []string {
 	return out
 }
 
-// Capability is the plaita#300 worker capability manifest.
+// nodeDependencies 标注 server 扩展节点（#80 phase 3）的部署期依赖：这五类
+// 是挂起型节点，Go worker 只负责「挂起 + 按 {prefix}:{subtype}:queue 派发服
+// 务任务 + 经事件总线接收恢复」——真正的等待/监听/审批决策在消费该队列的外
+// 部 service（plaita Python 侧 ServiceManager 同族，或控制面手工事件）。缺
+// 消费者时节点会一直 suspended（订阅超时兜底除外）。纯计算/动作节点无此依
+// 赖，不入表。
+var nodeDependencies = map[string]string{
+	"delay":         "external delay service consumes {prefix}:delay:queue (Redis ZSET schedule) and publishes the resume event",
+	"approval":      "external approval service consumes {prefix}:approval:queue; decisions arrive via a control-plane entry (submit_approval_decision of the plaita service family)",
+	"redis_queue":   "external listener service connects to the configured Redis (list/stream/pubsub) and publishes redis_message",
+	"kafka_queue":   "external listener service connects to the configured Kafka broker and publishes kafka_message",
+	"http_callback": "external HTTP ingress routes callback requests into the callback service entry; registration state lives in Redis",
+}
+
+// NodeDependencies returns a sorted copy of the deployment-dependency
+// annotations carried in the manifest (additive key, plaita#300 five-key
+// shape untouched semantically — consumers reading the five keys are
+// unaffected).
+func NodeDependencies() map[string]string {
+	out := make(map[string]string, len(nodeDependencies))
+	for k, v := range nodeDependencies {
+		out[k] = v
+	}
+	return out
+}
+
+// Capability is the plaita#300 worker capability manifest（+phase 3 的
+// node_dependencies 部署依赖标注键）。
 type Capability struct {
-	Engine               string   `json:"engine"`
-	IRContractVersion    string   `json:"ir_contract_version"`
-	SupportedNodeTypes   []string `json:"supported_node_types"`
-	UnsupportedNodeTypes []string `json:"unsupported_node_types"`
-	Features             []string `json:"features"`
+	Engine               string            `json:"engine"`
+	IRContractVersion    string            `json:"ir_contract_version"`
+	SupportedNodeTypes   []string          `json:"supported_node_types"`
+	UnsupportedNodeTypes []string          `json:"unsupported_node_types"`
+	Features             []string          `json:"features"`
+	NodeDependencies     map[string]string `json:"node_dependencies,omitempty"`
 }
 
 // CapabilityManifest builds the capability manifest from the live
@@ -68,5 +97,6 @@ func CapabilityManifest() Capability {
 		SupportedNodeTypes:   SupportedNodeTypes(),
 		UnsupportedNodeTypes: UnsupportedNodeTypes(),
 		Features:             supportedFeatures,
+		NodeDependencies:     NodeDependencies(),
 	}
 }

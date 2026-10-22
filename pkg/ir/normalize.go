@@ -253,6 +253,16 @@ func normalizeNode(n map[string]any, res *flowResolver) error {
 		return translateEvent(n)
 	case "hitl_await":
 		return translateHitlAwait(n)
+	case "delay":
+		return translateDelay(n)
+	case "approval":
+		return translateApproval(n)
+	case "redis_queue":
+		return translateRedisQueue(n)
+	case "kafka_queue":
+		return translateKafkaQueue(n)
+	case "http_callback":
+		return translateHTTPCallback(n)
 	}
 	return nil
 }

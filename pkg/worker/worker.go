@@ -1097,6 +1097,13 @@ func seedRunFromState(run *executionRun, state *ExecutionState) {
 // The checkpoint itself was already written by the engine at the suspend
 // boundary; it is re-saved through the worker store so the key layout is
 // owned by the worker even if a different store was injected.
+//
+// 挂起服务派发（§5.2，plaita#233）：挂起行携带 dispatch_pending 凭据与状态
+// 同一次落盘，随后 RPUSH `{prefix}:{subtype}:queue`，成功后清凭据（再落一次
+// 盘）；RPUSH 失败消息不 ack——凭据在，补派路径（start 幂等门 / suspended+
+// continue 短路）负责重派。派发是 at-least-once（清凭据落盘失败 → 下一次
+// 载体重派 → 服务队列可能出现重复任务），与 Python 侧队列消费者的幂等假设
+// 一致。
 func (w *Worker) persistSuspended(ctx context.Context, tenant string, handle *LeaseHandle,
 	state *ExecutionState, run *executionRun, susp *workflow.SuspendError) error {
 	cp := susp.Checkpoint
@@ -1112,10 +1119,119 @@ func (w *Worker) persistSuspended(ctx context.Context, tenant string, handle *Le
 		state.NodeTimings = run.snapshotNodeTimings()
 		state.Timeline = run.snapshotTimeline()
 	}
+	if svcType, svcCfg, ok := suspendServiceConfig(susp); ok {
+		state.DispatchPending = map[string]any{
+			"pending":        true,
+			"service_type":   svcType,
+			"service_config": svcCfg,
+			"node_id":        string(susp.NodeID),
+			"recorded_at":    nowISO(),
+		}
+	}
 	if err := w.checkpoints.SaveCheckpoint(ctx, cp); err != nil {
 		return err
 	}
-	return w.store.SaveExecutionState(ctx, tenant, state, handle.FenceToken)
+	if err := w.store.SaveExecutionState(ctx, tenant, state, handle.FenceToken); err != nil {
+		return err
+	}
+	if state.DispatchPending == nil {
+		return nil
+	}
+	return w.pushPendingServiceTask(ctx, tenant, taskExecutionIDOf(state), state, handle.FenceToken)
+}
+
+// suspendServiceConfig extracts the extended-node service_config from the
+// suspended node's result (checkpoint $NODE table). Non-service suspensions
+// (event/hitl_await) carry none.
+func suspendServiceConfig(susp *workflow.SuspendError) (string, map[string]any, bool) {
+	if susp == nil || susp.Checkpoint == nil {
+		return "", nil, false
+	}
+	nodeResults, _ := susp.Checkpoint.Context["$NODE"].(map[string]any)
+	nodeState, _ := nodeResults[string(susp.NodeID)].(map[string]any)
+	if nodeState == nil {
+		return "", nil, false
+	}
+	svcCfg, _ := nodeState["service_config"].(map[string]any)
+	if svcCfg == nil {
+		return "", nil, false
+	}
+	subtype, _ := svcCfg["type"].(string)
+	if subtype == "" {
+		return "", nil, false
+	}
+	return subtype, svcCfg, true
+}
+
+// taskExecutionIDOf reads the execution id off the state row (the suspend
+// path has no Task in hand).
+func taskExecutionIDOf(state *ExecutionState) string {
+	return state.ExecutionID
+}
+
+// pushPendingServiceTask performs the §5.2 RPUSH + credential clear under a
+// held lease (the initial dispatch right after the suspended row lands; the
+// same core dispatchPendingService uses for compensation).
+func (w *Worker) pushPendingServiceTask(ctx context.Context, tenant, executionID string, state *ExecutionState, fenceGen int64) error {
+	marker := pendingSuspendDispatch(state)
+	if marker == nil {
+		return nil
+	}
+	svcCfg, _ := marker["service_config"].(map[string]any)
+	subtype, _ := marker["service_type"].(string)
+	if subtype == "" && svcCfg != nil {
+		subtype, _ = svcCfg["type"].(string)
+	}
+	if subtype == "" {
+		w.logger.Warn("suspend dispatch credential has no service type; clearing it",
+			"execution_id", executionID)
+	} else if err := w.rpushServiceTask(ctx, w.cfg.KeyPrefix, tenant, executionID, subtype, svcCfg); err != nil {
+		// Must NOT ack upstream: the message is the only carrier that can
+		// retry the dispatch (ServiceDispatchError semantics, §5.2). The
+		// credential stays pending for the compensation paths.
+		return err
+	}
+	// Credential and "dispatched" marker share one write (§5.2).
+	state.DispatchPending = nil
+	if err := w.store.SaveExecutionState(ctx, tenant, state, fenceGen); err != nil {
+		w.logger.Error("suspend dispatch succeeded but clearing the credential failed; a later carrier will re-dispatch",
+			"execution_id", executionID, "error", err)
+		return err
+	}
+	return nil
+}
+
+// rpushServiceTask builds the service task body (service_config + execution_id
+// + tenant_id) and RPUSHes it to `{prefix}:{subtype}:queue`. 空租户归一
+// default（Python `tenant_id or DEFAULT_TENANT_ID` 同口径）——服务侧据此路由
+// resume。
+func (w *Worker) rpushServiceTask(ctx context.Context, keyPrefix, tenant, executionID, subtype string, svcCfg map[string]any) error {
+	if tenant == "" {
+		tenant = w.cfg.DefaultTenantID
+	}
+	body := make(map[string]any, len(svcCfg)+2)
+	for k, v := range svcCfg {
+		body[k] = v
+	}
+	if _, ok := body["execution_id"]; !ok {
+		body["execution_id"] = executionID
+	}
+	if _, ok := body["tenant_id"]; !ok {
+		body["tenant_id"] = tenant
+	}
+	blob, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("suspend dispatch marshal: %w", err)
+	}
+	queueKey := keyPrefix + ":" + subtype + ":queue"
+	if err := w.rdb.RPush(ctx, queueKey, string(blob)).Err(); err != nil {
+		w.logger.Error("suspend service dispatch failed; message will be left pending",
+			"execution_id", executionID, "queue", queueKey, "error", err)
+		return fmt.Errorf("suspend dispatch rpush: %w", err)
+	}
+	w.logger.Info("suspend service task dispatched",
+		"execution_id", executionID, "queue", queueKey)
+	return nil
 }
 
 // deleteCheckpoint removes the execution's checkpoint after a terminal write.
@@ -1871,48 +1987,7 @@ func (w *Worker) dispatchPendingService(ctx context.Context, task *Task, state *
 	if marker == nil {
 		return false, nil
 	}
-	serviceConfig, _ := marker["service_config"].(map[string]any)
-	if serviceConfig == nil {
-		serviceConfig = map[string]any{}
-	}
-	subtype, _ := marker["service_type"].(string)
-	if subtype == "" {
-		subtype, _ = serviceConfig["type"].(string)
-	}
-	if subtype == "" {
-		w.logger.Warn("suspend dispatch credential has no service type; clearing it",
-			"execution_id", task.ExecutionID)
-	} else {
-		body := make(map[string]any, len(serviceConfig)+2)
-		for k, v := range serviceConfig {
-			body[k] = v
-		}
-		if _, ok := body["execution_id"]; !ok {
-			body["execution_id"] = task.ExecutionID
-		}
-		if _, ok := body["tenant_id"]; !ok {
-			body["tenant_id"] = task.TenantID
-		}
-		blob, err := json.Marshal(body)
-		if err != nil {
-			return false, fmt.Errorf("suspend dispatch marshal: %w", err)
-		}
-		queueKey := w.cfg.KeyPrefix + ":" + subtype + ":queue"
-		if err := w.rdb.RPush(ctx, queueKey, string(blob)).Err(); err != nil {
-			// Must NOT ack: the message is the only carrier that can retry
-			// the dispatch (ServiceDispatchError semantics, §5.2).
-			w.logger.Error("suspend service dispatch failed; message will be left pending",
-				"execution_id", task.ExecutionID, "queue", queueKey, "error", err)
-			return false, fmt.Errorf("suspend dispatch rpush: %w", err)
-		}
-		w.logger.Warn("suspend service task re-dispatched",
-			"execution_id", task.ExecutionID, "queue", queueKey, "node", marker["node_id"])
-	}
-	// Credential and "dispatched" marker share one write (§5.2).
-	state.DispatchPending = nil
-	if err := w.store.SaveExecutionState(ctx, task.TenantID, state, fenceGen); err != nil {
-		w.logger.Error("suspend dispatch succeeded but clearing the credential failed; message stays pending",
-			"execution_id", task.ExecutionID, "error", err)
+	if err := w.pushPendingServiceTask(ctx, task.TenantID, task.ExecutionID, state, fenceGen); err != nil {
 		return false, err
 	}
 	return true, nil

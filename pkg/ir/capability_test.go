@@ -46,11 +46,11 @@ func TestSupportedTypesAreRegistered(t *testing.T) {
 	}
 }
 
-// #80 负控：phase 1 集合/循环五节点与 phase 2 的 case/mock/reference 都必须
-// 在 supported 清单里、且不在 unsupported 里（pre-fix 基线它们在
-// knownUnsupported，此处红）。calculate/ignore 不是 plaita 注册节点类型
-// （r78 实测：Flow.model_validate 报 unRecognized node type）——capability
-// 如实标注 python 侧同样拒载，留痕见 issue #80。
+// #80 负控：phase 1 集合/循环五节点、phase 2 的 case/mock/reference、phase 3
+// 的 server 扩展节点五类都必须在 supported 清单里、且不在 unsupported 里
+// （pre-fix 基线它们不在 accept-list，此处红）。calculate/ignore 不是 plaita
+// 注册节点类型（r78 实测：Flow.model_validate 报 unRecognized node type）——
+// capability 如实标注 python 侧同样拒载，留痕见 issue #80。
 func TestCapabilityIncludesCollectionNodes(t *testing.T) {
 	cap := CapabilityManifest()
 	supported := map[string]bool{}
@@ -61,7 +61,8 @@ func TestCapabilityIncludesCollectionNodes(t *testing.T) {
 	for _, t2 := range cap.UnsupportedNodeTypes {
 		unsupported[t2] = true
 	}
-	for _, t2 := range []string{"map", "filter", "find", "reduce", "while", "case", "mock", "reference"} {
+	for _, t2 := range []string{"map", "filter", "find", "reduce", "while", "case", "mock", "reference",
+		"delay", "approval", "redis_queue", "kafka_queue", "http_callback"} {
 		assert.True(t, supported[t2], "%q must be in supported_node_types", t2)
 		assert.False(t, unsupported[t2], "%q must not be in unsupported_node_types", t2)
 	}
@@ -71,8 +72,33 @@ func TestCapabilityIncludesCollectionNodes(t *testing.T) {
 	}
 }
 
+// phase 3：server 扩展节点的部署依赖标注——挂起型节点挂起后由外部 service
+// 消费 {prefix}:{subtype}:queue 并发布恢复事件；无消费者则执行停留 suspended。
+// 只有这五类入表，纯计算/动作节点不得出现。
+func TestCapabilityNodeDependencies(t *testing.T) {
+	deps := NodeDependencies()
+	assert.ElementsMatch(t,
+		[]string{"delay", "approval", "redis_queue", "kafka_queue", "http_callback"},
+		mapKeys(deps))
+	for _, dep := range deps {
+		assert.NotEmpty(t, dep)
+	}
+	cap := CapabilityManifest()
+	assert.Equal(t, deps, cap.NodeDependencies)
+}
+
+func mapKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
 // manifest JSON 形状按 plaita#300：engine / ir_contract_version /
-// supported_node_types / unsupported_node_types / features。
+// supported_node_types / unsupported_node_types / features；#80 phase 3 起
+// 增设第六键 node_dependencies（部署依赖标注，additive——只读前五键的
+// consumer 不受影响，ContractVersion 已随 bump）。
 func TestCapabilityManifestJSONShape(t *testing.T) {
 	data, err := json.Marshal(CapabilityManifest())
 	require.NoError(t, err)
@@ -86,15 +112,16 @@ func TestCapabilityManifestJSONShape(t *testing.T) {
 		assert.IsType(t, []any{}, m[key], key)
 	}
 	assert.Len(t, m["features"], 3)
+	require.Contains(t, m, "node_dependencies")
+	assert.IsType(t, map[string]any{}, m["node_dependencies"])
 
-	// 与 #300 issue 文本的结构对拍：仅这五个键
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
 	}
 	assert.ElementsMatch(t, []string{
 		"engine", "ir_contract_version", "supported_node_types",
-		"unsupported_node_types", "features",
+		"unsupported_node_types", "features", "node_dependencies",
 	}, keys)
 }
 

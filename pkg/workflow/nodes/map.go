@@ -99,6 +99,11 @@ func (m *Map) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
 // parallel.branchFlowView: field-by-field copy (atomic.Bool and the Context's
 // RWMutex must not be copied), Nodes shared — node instances are read-only
 // during execution, per-run state lives in runtime.Context.
+//
+// Timeout is copied verbatim (#81): the sequential path executes the original
+// pointer, so its flow-level budget is f.Timeout alone — a parallel-style
+// fallback to the map node's timeout here would make the concurrent path
+// diverge from the sequential one in the opposite direction.
 func childFlowView(f *workflow.Workflow) *workflow.Workflow {
 	return &workflow.Workflow{
 		ID:                  f.ID,
@@ -107,6 +112,7 @@ func childFlowView(f *workflow.Workflow) *workflow.Workflow {
 		Runtime:             f.Runtime,
 		Version:             f.Version,
 		Author:              f.Author,
+		Timeout:             f.Timeout,
 		Nodes:               f.Nodes,
 		InputType:           f.InputType,
 		OutputType:          f.OutputType,
