@@ -45,7 +45,7 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
 
 **校验子集**（pkg/ir/validate.go，对应 ir_validate DEFAULT_RULES）：唯一 start + 全图可达（R1）、next/分支引用存在（R3）、嵌入流程可达 end（R2）、`joinBranches ⊆ branches[].name`（R4 语义）。表达式级校验（R5）随表达式对齐工作流补。
 
-**fail-closed 拒载清单**：calculate / ignore（**r78 结论：两者都不是 plaita 注册节点类型**——`Flow.model_validate` 对它们报 `unRecognized node type`，calculate.py 模块存在但未注册是遗留物、ignore 只是 Node 基类的 node_type 占位 ClassVar；Go 保持拒载对齐的是运行时行为，错误信息保留同款子串逐字对拍）/ code 非 javascript / end `nop` / http 的 `allowedHosts`/`deniedHosts`/`blockPrivateNetworks`（SSRF 护栏未移植，靠它保护的 flow 不许静默降级）/ parallel 分支 input 非 dict / reference 携带 inline childFlow（plaita 运行时把它丢掉并在执行期炸，见「节点对齐 phase 2」节）。**M6 起 event / hitl_await 已转正**。**#80 phase 1（2026-10-22）起 map / filter / find / reduce / while 已转正**。**#80 phase 2（2026-10-22，r78）起 case / mock / reference 已转正**（见「节点对齐 phase 2」节）。
+**fail-closed 拒载清单**：calculate / ignore（**r78 结论：两者都不是 plaita 注册节点类型**——`Flow.model_validate` 对它们报 `unRecognized node type`，calculate.py 模块存在但未注册是遗留物、ignore 只是 Node 基类的 node_type 占位 ClassVar；Go 保持拒载对齐的是运行时行为，错误信息保留同款子串逐字对拍）/ code 非 javascript / end `nop` / http 的 `allowedHosts`/`deniedHosts`/`blockPrivateNetworks`（SSRF 护栏未移植，靠它保护的 flow 不许静默降级）/ parallel 分支 input 非 dict / reference 携带 inline childFlow（plaita 运行时把它丢掉并在执行期炸，见「节点对齐 phase 2」节）。**M6 起 event / hitl_await 已转正**。**#80 phase 1（2026-10-22）起 map / filter / find / reduce / while 已转正**。**#80 phase 2（2026-10-22，r78）起 case / mock / reference 已转正**（见「节点对齐 phase 2」节）。**#80 phase 3（2026-10-22，r79）起 delay / approval / redis_queue / kafka_queue / http_callback 已转正**（见「节点对齐 phase 3」节）。
 
 **随 ir 对齐落地的引擎语义修正**（plaita 语义为基准）：
 - loop：`$NODE.<loop>` = 末次子结果（前身引擎为 nil）
@@ -149,6 +149,18 @@ plaita 侧权威语义：`plaita/core/deadline.py` + `core/strategies.py`（#267
 - **capability contract 收口（#300 五键定稿）**：manifest 五键 `{engine, ir_contract_version, supported_node_types, unsupported_node_types, features}` 不变；supported += case/mock/reference（白名单自动生成纪律不变），unsupported = calculate/ignore/sleep/trpc/mdb/readmdb/writemdb（calculate/ignore 的提示含逐字对拍子串）；`ContractVersion` bump 到 **"2026-10-22.2"**（同日 phase 1 为初始 "2026-10-22"——同版本字符串对应不同清单会让消费者缓存失真，必须 bump）。`ignore` 确认结论：**不是部署 IR 节点**（无注册、无前端产出、plaita 自身拒载），永远留在 unsupported。worker registry 写 manifest 归 #300 后续单。
 - **负控（先红后绿，stash 基线实测）**：capability_test（phase 2 类型必须在 supported）基线红（Should be true，实测）；child input 继承单测基线红（got nil, want map[z:42]，实测）；golden 22 个行为用例基线全红（ir.Load 拒载，neg-red 逐例实测）；mock/reference 单测与 golden provider 路径在基线为编译级红（新 API/新符号，新接受面固有）。
 
+## 节点对齐 phase 3（#80，2026-10-22，r79，分支 feat/node-parity-3）
+
+权威 = `plaita/server/nodes/*_node.py`（BaseExtendedNode(EventNode) 家族）+ 对应 service 层。golden 30 例真跑对拍（`scripts/export_server_nodes_golden.py` → `pkg/ir/testdata/server_nodes_golden.json`，`server_nodes_golden_test.go` 逐例对拍），其中 delay/approval/http_callback 的恢复载荷由**真实 service** 驱动发布（DelayService.handle_task / ApprovalService.submit_approval_decision 的 any/all/majority 真策略 / HttpCallbackService.handle_callback_request 的真认证+两阶段认领），redis_queue/kafka_queue 依赖真实 broker，载荷按 service 源码的事件构造分支手建。本轮同修 #81（map childFlowView 漏 Timeout）。
+
+- **架构口径（五节点同构）**：挂起型节点——Execute 产出 `{event_type, event_filter, is_async, event_id, status:"pending", service_config, node_subtype}`（Python 实测形状），引擎注册订阅后挂起；**等待/监听/决策在进程外**：worker 挂起时把 service_config 派发到 `{prefix}:{subtype}:queue`，外部 service（plaita Python ServiceManager 同族/控制面）消费后发布恢复事件，worker eventbus 唤醒。节点自身不连 Redis/Kafka、不监听端口、不睡眠（无占死消费者的盲区，#48 矩阵口径：挂起驻留型 Execute 即时返回）。
+- **恢复状态形状（Python 实测钉死）**：`_handle_resume` → on_event 从持久化节点状态重建——**service_config/node_subtype/event_id/subscription_id 全量保留**，仅 status 翻转 + `event_data`（绑定键 `__plaita_subscription_id` 准入后剥离，两侧同款）；Go 的 `extendedResume` 从 `$NODE` 结果表回填同款。**对拍口径**：plaita 的分布式 resume 只处理被恢复节点本身（返回 lazy output 即止，不续跑后继图），Go 的 `Workflow.Resume` 恢复+续跑一步到位——两侧共有面 = 恢复后节点状态，golden 用 end 输出 `$NODE.<server>` 取同物。
+- **加载期对齐（translate_server.go）**：pydantic 模型层语义前置到 ir.Load——必填字段（delay_seconds/approval_title+content+approvers/queue_name/bootstrap_servers+topic+group_id）、Literal 枚举（大小写归一后校验：delay_unit/approval_type+strategy/queue_type/message_format/security_protocol/sasl_mechanism/auto_offset_reset/callback_method/auth_type）、pydantic 缺省值填充（未写字段补 default，console 编译器只透传 @flow 源码写的字段）、固定事件契约覆盖（approval→approval_decision、redis_queue→redis_message、kafka_queue→kafka_message、http_callback→http_callback，用户 event_type 不参与；**delay 例外**：event_type 可配，缺省 delay_trigger）、EventNode 家族 camel 别名折叠（eventType/eventFilter/subscriptionTimeout）、approval 显式 `subscription_timeout:null` → -1 哨兵（无限等待）vs 缺省 24h（gt=0 校验）。
+- **节点语义要点**：delay 时长 = 数值+单位枚举换算 ms（`$` 表达式解析失败/非数值**静默回退 60 秒**；非 $ 数值串 float 解析，Python ValueError 文案逐字对拍）；approval 审批人列表逐元素 `$` 解析、list 结果摊平；kafka bootstrap_servers 串按逗号切分+trim（list/None 原样透传）；http_callback 的 callback_path/auth_token 按 Python 真值判伪（nil/**空串**都走自动生成——自动路径 `/callback/{flow_id}/{node_id}/{execution_id}`、凭据 uuid hex）、full_url 硬编码 `http://localhost:8080` 前缀照搬、Q5 统一失败响应属 service 层（Go 侧无 callback service，`httpcb_wrong_token` 用例钉「凭据错→无事件→保持挂起」的节点面）。
+- **worker 首派（§5.2 写侧补齐）**：persistSuspended 把挂起节点 service_config 写成 `dispatch_pending` 凭据（与 suspended 行同次落盘，#233）→ RPUSH `{prefix}:{subtype}:queue`（体 = service_config+execution_id+tenant_id，空租户归一 default）→ 成功清凭据（再落一次盘）；RPUSH 失败不 ack——凭据在，补派路径（start 幂等门 / suspended+continue 短路，二期既有）负责重派；派发 at-least-once（清凭据落盘失败→下一条载体重派→队列可重复），同 Python 消费端幂等假设。event/hitl_await 无 service_config 不派发。负控先红后绿（stash 写侧实测：队列空 redis:nil 红 → post 绿）。
+- **capability contract（#300 形状演进）**：supported += 五类（白名单自动生成不变）；manifest 增第六键 `node_dependencies`（部署依赖标注：五节点的恢复都依赖外部 service 消费队列+发布事件，无消费者则停留 suspended——订阅超时兜底除外；additive 键，只读 #300 五键的 consumer 不受影响）；ContractVersion bump **"2026-10-22.3"**。
+- **已知残差（记录不修）**：①delay/approval/redis_queue/kafka_queue/http_callback 的 **service 层 Go 实装不存在**（队列消费者/延迟排程/审批记录/回调 ingress 都是部署侧设施——Python plaita worker 或控制面承担；capability node_dependencies 如实标注）；②`$NODE.<id>.event_data` 里 service 发布的易变时间戳在 golden 规范化层剔键（两侧同款 denylist+32hex/13位ms 打码）；③Python plain-run 分布式 resume 不续跑后继图（worker 下一跳载体驱动），Go 一步到位——runtime 编排差异，节点状态面无分歧。
+
 ## 常用命令
 
 ```bash
@@ -190,6 +202,11 @@ make lint   # gofmt 检查 + vet（golangci-lint 配置存在但未接线）
 | case（SwitchLegacy） | switch（IR 脱糖，工厂别名注册） | ✅ #80 phase 2（r78）：等值匹配方言按 Python 模型校验期脱糖语义实装（golden 过） |
 | mock | mock | ✅ #80 phase 2（r78）：value 原样透传（不求值）、output 忽略（golden 过） |
 | reference | reference | ✅ #80 phase 2（r78）：加载期 provider 注入（ir.FlowProvider）+ $PARENT 隔离/$GLOBAL 继承/input 继承；inline childFlow 拒载（plaita 运行时同炸，golden 过） |
+| delay | delay | ✅ #80 phase 3（r79）：挂起型+service_config 派发；时长换算/$回退 60s golden 钉；等待在外部 delay service（部署依赖见 capability） |
+| approval | approval | ✅ #80 phase 3（r79）：挂起型；24h 订阅超时缺省/显式 null 无限等待；any/all/majority 在外部 approval service（真服务 golden 驱动） |
+| redis_queue | redis_queue | ✅ #80 phase 3（r79）：监听型挂起节点（与动作型 redis 两回事）；连接/队列/监听三组配置 golden 钉；消费在外部 service |
+| kafka_queue | kafka_queue | ✅ #80 phase 3（r79）：监听型挂起节点；SASL/消费者组配置；消费在外部 service（broker 部署依赖） |
+| http_callback | http_callback | ✅ #80 phase 3（r79）：挂起型；自动路径/token·basic·signature 认证生成 golden 钉；ingress 在外部部署面 |
 | calculate / ignore | — | 拒载（r78 结论：plaita 运行时未注册，unRecognized node type；清单见上） |
 | —（plaita-nodes 仓余量） | agent/gate/rate_limit/report/notify 族等 | ✅ 已对齐（见上）|
 | trpc / mdb（前身引擎特有） | 已删 | 不移植（公司内网设施） |
