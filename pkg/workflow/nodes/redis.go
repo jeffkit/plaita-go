@@ -2,7 +2,9 @@ package nodes
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -214,13 +216,62 @@ func (r *RedisNode) Execute(ctx context.Context) (*workflow.ExecuteResult, error
 	for _, arg := range argList {
 		args = append(args, arg)
 	}
-	response := client.Do(ctx, args...).Val()
+	cmd := client.Do(ctx, args...)
+	// #73: go-redis' Val() yields the zero value whenever Err() is set, so the
+	// old `.Do(...).Val()` turned connection/auth/command failures into
+	// "success with nil result" — no error event, no retry, no DLQ. Python's
+	// execute_command raises on all of them (plaita/node/redis.py). redis.Nil
+	// (empty bulk reply, e.g. GET on a missing key) is NOT a failure: Python
+	// returns None there, so Go keeps Result=nil with err=nil.
+	if err := cmd.Err(); err != nil && !errors.Is(err, redis.Nil) {
+		// checked before OutputType.ValidateValue: a command failure must not
+		// be misattributed as "value is required but not provided".
+		return nil, r.commandError(command, err)
+	}
+	response := cmd.Val()
 
 	if err := r.OutputType.ValidateValue(response); err != nil {
 		return nil, fmt.Errorf("Redis node: output type validation: %w", err)
 	}
 
 	return &workflow.ExecuteResult{Result: response, NextNode: r.NextNode()}, nil
+}
+
+// commandError classifies a go-redis command error into the engine's retry
+// taxonomy (#73): transport-level failures — dial refused/reset, timeouts,
+// pool exhaustion, a client closed under LRU eviction — are retryable, a
+// second attempt can genuinely succeed. Server reply errors (NOAUTH/WRONGPASS,
+// WRONGTYPE/READONLY/OOM command not allowed, cluster MOVED/TRYAGAIN) and
+// anything unrecognized are deterministic: the same arguments hit the same
+// server state and fail again, so they must not burn the node's retry budget.
+// The message carries the node ID and command name but never the target —
+// redis URLs carry the password in userinfo (same redaction rule as
+// clientFor).
+func (r *RedisNode) commandError(command string, err error) error {
+	label := "Redis node"
+	if id := strings.TrimSpace(string(r.ID)); id != "" {
+		label += " " + id
+	}
+	wrapped := fmt.Errorf("%s: command %q: %w", label, command, err)
+	if redisTransientError(err) {
+		return workflow.RetryableError(wrapped)
+	}
+	return workflow.NonRetryable(wrapped)
+}
+
+// redisTransientError reports whether err belongs to the transport family.
+// The pool-timeout sentinel lives in go-redis v8's internal/pool (not
+// re-exported), so it is matched by its stable text; everything else goes
+// through errors.Is/errors.As on the exported surface.
+func redisTransientError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, redis.ErrClosed) {
+		return true
+	}
+	if strings.Contains(err.Error(), "redis: connection pool timeout") {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
 }
 
 // clientFor returns the client for an evaluated target URL: an injected
