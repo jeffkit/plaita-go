@@ -45,7 +45,7 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
 
 **校验子集**（pkg/ir/validate.go，对应 ir_validate DEFAULT_RULES）：唯一 start + 全图可达（R1）、next/分支引用存在（R3）、嵌入流程可达 end（R2）、`joinBranches ⊆ branches[].name`（R4 语义）。表达式级校验（R5）随表达式对齐工作流补。
 
-**fail-closed 拒载清单**：calculate / ignore（**r78 结论：两者都不是 plaita 注册节点类型**——`Flow.model_validate` 对它们报 `unRecognized node type`，calculate.py 模块存在但未注册是遗留物、ignore 只是 Node 基类的 node_type 占位 ClassVar；Go 保持拒载对齐的是运行时行为，错误信息保留同款子串逐字对拍）/ code 非 javascript / end `nop` / http 的 `allowedHosts`/`deniedHosts`/`blockPrivateNetworks`（SSRF 护栏未移植，靠它保护的 flow 不许静默降级）/ parallel 分支 input 非 dict / reference 携带 inline childFlow（plaita 运行时把它丢掉并在执行期炸，见「节点对齐 phase 2」节）。**M6 起 event / hitl_await 已转正**。**#80 phase 1（2026-10-22）起 map / filter / find / reduce / while 已转正**。**#80 phase 2（2026-10-22，r78）起 case / mock / reference 已转正**（见「节点对齐 phase 2」节）。**#80 phase 3（2026-10-22，r79）起 delay / approval / redis_queue / kafka_queue / http_callback 已转正**（见「节点对齐 phase 3」节）。
+**fail-closed 拒载清单**：calculate / ignore（**r78 结论：两者都不是 plaita 注册节点类型**——`Flow.model_validate` 对它们报 `unRecognized node type`，calculate.py 模块存在但未注册是遗留物、ignore 只是 Node 基类的 node_type 占位 ClassVar；Go 保持拒载对齐的是运行时行为，错误信息保留同款子串逐字对拍）/ code 非 javascript / end `nop` / http 的 `allowedHosts`/`deniedHosts`/`blockPrivateNetworks`（SSRF 护栏未移植，靠它保护的 flow 不许静默降级）/ parallel 分支 input 非 dict / reference 携带 inline childFlow（plaita 运行时把它丢掉并在执行期炸，见「节点对齐 phase 2」节）。**M6 起 event / hitl_await 已转正**。**#80 phase 1（2026-10-22）起 map / filter / find / reduce / while 已转正**。**#80 phase 2（2026-10-22，r78）起 case / mock / reference 已转正**（见「节点对齐 phase 2」节）。**#80 phase 3（2026-10-22，r79）起 delay / approval / redis_queue / kafka_queue / http_callback 已转正**（见「节点对齐 phase 3」节）。**#84（2026-10-22，r84）起 sql_query 已转正**（见「sql_query 节点」节；node-parity 例外表同步摘条，python-only 差集清零）。
 
 **随 ir 对齐落地的引擎语义修正**（plaita 语义为基准）：
 - loop：`$NODE.<loop>` = 末次子结果（前身引擎为 nil）
@@ -185,9 +185,23 @@ plaita 侧权威语义：`plaita/core/deadline.py` + `core/strategies.py`（#267
 防单侧新增漂移的活体门（#80 需求 4）：`make node-parity`（ci.yml 同步含此步）先用 `scripts/extract_python_node_types.py` 从 **plaita NodeRegistry 现场提取**权威节点类型清单（core 内建 + `plaita.nodes` entry points 插件——plaita 自带 server 五类 + plaita-nodes 发行版 22 类；须 `pip install` 两个 checkout，entry points 来自 dist-info，sys.path 替代不了），再由 `pkg/ir/node_parity_test.go` 把它与 `ir.SupportedNodeTypes()` 对拍。
 
 - **判据**：双向差集必须与 `node_parity_test.go` 内的显式例外表完全一致，任何单侧新增/删除不改表即红；**过期例外条目同样红**（差集已不含它=表格漂移，通常是 Go 补齐了该类型，必须摘条）。
-- **当前例外（2026-10-22 实测差集 = 恰好这三条）**：python-only `sql_query` → 移交 #84（驱动选型/凭据面/plaita#205 上限语义前置）；go-only `code`（Python 刻意不进默认 registry，register_code_node 显式 opt-in；Go 为受限 JS 语言白名单 fail-closed）与 `redis`（Python 的 RedisNode 未自动注册；Go 为历史 33 类内建常驻）。
+- **当前例外（#84 落地后，2026-10-22 实测差集 = 恰好这两条，全为 go-only）**：`code`（Python 刻意不进默认 registry，register_code_node 显式 opt-in；Go 为受限 JS 语言白名单 fail-closed）与 `redis`（Python 的 RedisNode 未自动注册；Go 为历史 33 类内建常驻）。python-only 例外已清零——`sql_query` 原列为「移交 #84」，#84 落地当日摘条，双向差集归零（`make node-parity` 绿，实测）。
 - **skip 语义**：`PLAITA_NODE_TYPES_JSON` 未设时测试 skip——普通 `go test ./...` 无 plaita checkout 不该红；只有 `make node-parity` / CI 的 parity 步骤设置该 env。提取器遇「entry points 不可见 / 插件加载失败」硬失败（exit 2），**绝不输出缩水清单**（残缺权威=假绿）。
 - **CI 侧权威 checkout 按 `ref: main` 活体跟踪**（非 SHA pin）——门的用途就是任一侧单方面新增立刻红，pin 死权威源等于废掉它；`uses:` 动作的 SHA-pin 审计规则不覆盖数据输入。
+
+## sql_query 节点（#84，2026-10-22，r84，分支 feat/issue84-sql-query）
+
+权威 = plaita-nodes `src/plaita_nodes/database.py`（SqlQueryNode）+ plaita#205 上限语义，逐行对拍。实现 = `pkg/workflow/nodes/sql_query.go`（+ sql_dsn / sql_params / sql_errors / sql_credentials / sql_drivers 五件）。plaita-go A 线（#80 移交族）至此全清，node-parity 双向差集归零。
+
+- **驱动选型（拍板）**：`database/sql` + 三驱动全纯 Go、**无 cgo**（worker 免 C 工具链、可交叉编译）——postgres=`github.com/jackc/pgx/v5`（v5.7.6，stdlib 注册名 `pgx`）/ mysql=`github.com/go-sql-driver/mysql`（v1.9.3）/ sqlite=`modernc.org/sqlite`（v1.38.0）。版本刻意钉在 **go 1.24 线**：pgx v5.8+/modernc v1.39+ 要求 go 1.25/1.26，会把全仓工具链顶穿（go.mod 保持 `go 1.24.0`）。Python 侧 sqlalchemy 是 optional extra（懒加载）；Go 无可选导入，驱动编译期内建，scheme→驱动映射只活在 `sqlSchemeFamilies` 一处。SQLAlchemy URL 拼写（含 `postgresql+psycopg2://` 加号方言）原样接受。
+- **凭据面**：`get_credential` 的 Go 对应物 = `SetSQLCredentialResolver` 进程钩子 + `PLAITA_CREDENTIALS_FILE` 明文 JSON 文件钩子（`{"名": {payload}}`，0600 fail-loud 权限检查同 A62-05 providers.json 纪律；**Python 的 Fernet console store 本仓不读**——与 webhook 凭据仓同为宿主装配接口口径）。两钩子皆缺 → 具名指路错误，绝不空 DSN 起拨。payload 两形（url / host-port-user-password-database 全集，driver 缺省 postgresql+psycopg2）与 Python 同。文件每执行现读（console 重导出免重启）。
+- **上限（plaita#205 fail-closed）**：max_rows/max_bytes 缺省 1000 / 4 MiB；正整数校验先于任何凭据工作，0/负/非整 pydantic-lax 同款拒（字符串整数收、分数拒）且在引擎 Validate（构建期）即拒。SELECT 分批读取**先判限再入列**，超限抛具名 `*SQLResultLimitError`（max_rows/max_bytes/observed 三对字段可断言），NonRetryable（= Python DeterministicError，重试只会重复执行 SQL）。Python 的自适应 fetchmany 批是为 DBAPI 物化上限设的；Go `rows.Next()` 流式逐行，字节预算逐行先判，超限行外零物化——同保证，不同机制。
+- **参数化**：flow 保持 sqlalchemy `text()` 方言（`:name` + params dict），节点内改写为驱动占位（postgres `$n` 按首现编号、同名复号；mysql/sqlite `?` 逐出现展开）。扫描器跳过串字面量/引号标识符/行注释/块注释/`$$…$$` dollar-quoted；`::` cast 不吞、`\:` 转义为字面冒号；缺值 `:name` 具名错误先于执行。
+- **错误分类（刻意收窄，redis #73 先例）**：transport 族（net 错误/拨号拒/ErrBadConn/语句 deadline）→ `RetryableError`；pg SQLSTATE 白名单（08 连接类/53 资源类/40 事务回滚类/57P01-03 停机类）与 mysql errno 白名单（1040/1205/1213/2002/2003/2006/2013）→ 可重试；**服务器拒绝面（语法/权限/未知）一律 NonRetryable**——Python 引擎按异常形状会把 RuntimeError 全族按 retryTimes 放大（语法错误也重跑 SQL），Go 侧按「同语句+同状态必再败」收窄，已知分歧入档。`context.Canceled` 不可重试（是取消不是失败）。
+- **运行时对应物**：取消 = ctx 贯传（A2R7-07 看门狗被 QueryContext/ExecContext 的驱动级取消吸收；引擎节点预算落地为 ctx deadline）；`_engine_cache` = 每 DSN 连接池的 8 上限 LRU（redis client 同款；database/sql 对陈旧池连接透明重拨，covers pool_pre_ping=True）；dry-run 短路在一切之前（不碰凭据面，params 敏感值不看）。
+- **租户闸**：非 default 租户在凭据 resolver 之前拒（`refuseNonDefaultTenantReasoned`，ErrTenantIsolationUnavailable 族）——v1 凭据面无租户旁文件，租户级数据库须独立 worker 承载（code 节点 docker 后端指引的反向）。dry-run 先于闸（无任何副作用，同 capture 家族）。
+- **形状**：SELECT → `{"rows": [...], "rowcount": len(rows)}`；写操作（INSERT/UPDATE/…按前导关键字分类走 ExecContext）→ `{"rowcount": affected}`。**已知残差（记录不修）**：①单元格 JSON 编码 Go 与 Python 的 dict 序/转义细节不同——上限字节预算是记账口径非跨语言逐字节契约；②time 列 Go 走 RFC3339（Python default=str 走自身格式）；③「读分类但零结果集」语句（如无 RETURNING 的可写 CTE）Go 报 rowcount 0，Python 报驱动 rowcount（常为 -1）；④语句分类按前导关键字（DBAPI returns_rows 的替代），WITH 恒走 rows 路径。
+- **测试**：四条负控（基本查询/参数化/行上限具名/连接失败分类）走**公开 API**（ir.Load + wf.Execute + `PLAITA_CREDENTIALS_FILE` 钩子），基线（stash ir 白名单三件）逐条实测红、签名同上一行 `node type "sql_query" is not supported by this engine`，post 绿；细粒度单测（上限字段/脱敏红线/分类表/改写器/凭据文件钩子/租户闸/池 LRU）在 nodes 包（新 API 编译级红先例形态）。`make node-parity` 摘条后绿（实测）。shadow 对账不适用（shadow 样本纯计算纪律本就把 sql_query 列禁入）。
 
 ## 常用命令
 
@@ -253,7 +267,7 @@ make lint   # gofmt 检查 + vet（golangci-lint 配置存在但未接线）
 | notify / feishu_webhook / dingtalk_webhook / slack_webhook / wecom_webhook / generic_webhook / email_send | ✅ 已落地（2026-10-19） | payload/加签（钉钉 HMAC）/业务码分类（feishu code/wecom·dingtalk errcode/slack ok）对齐；凭据经 `NotifyCredentialStore` 接口（宿主装配，缺省 fail-closed）；URL 打码按 _redact |
 | api_request / parse_json | ✅ 已落地（2026-10-19） | api_request：手动重定向（跨源剥头/303 规则/10 hop）、凭据经 resolver 接口 fail-closed、URL 打码；parse_json：候选提取（末行胜出，绝不用首个 `{`——#43）、verdict 白名单、join_fields |
 | capture | ✅ 已落地（2026-10-19） | 本地命令捕获（命令失败非节点失败）；与 gate 同族复用 env 白名单/进程组/裁剪 |
-| sql_query | ❌ 未做（22 节点清点外补充：database.py，SQLAlchemy 多驱动） | Go 侧需驱动选型（新依赖）+ 凭据仓，按生产需要立项 |
+| sql_query | ✅ 已落地（2026-10-22，#84，r84） | database/sql + 纯 Go 驱动矩阵（pgx/mysql/modernc sqlite，无 cgo）；凭据面 resolver 钩子 + `PLAITA_CREDENTIALS_FILE` 明文 JSON；上限 fail-closed（plaita#205）；详见「sql_query 节点」节 |
 | git_publish / github_comment / writefile | ❌ 拒载 | 文件系统/远端写操作，需沙箱/宿主工作区约定，**Wave 2-3** |
 
 **已知接线缺口（Wave 2 遗留）**：①引擎 `workflow.executeNode` 对节点错误统一按 retryTimes 重试——notify/api_request 已把「确定性 vs 瞬态」分类落在错误值上，引擎按错误类型分流的接线待做；②webhook/邮件凭据仓（Python 侧 Fernet console 存储）Go 侧为宿主装配接口，worker 主线接。

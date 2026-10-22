@@ -64,12 +64,9 @@ func TestNodeParityWithPython(t *testing.T) {
 	slices.Sort(goOnly)
 
 	// python-only 例外：Python 有、Go 有意不实现，条目写明去向/理由。
-	pythonOnlyExceptions := map[string]string{
-		// sql_query 需要先拍板 Go 驱动矩阵 + 凭据面 + plaita#205 行/字节上限
-		// 语义对拍，自 #80 验收清单移交独立单（见该单验收草案）。
-		"sql_query": "deferred to #84: Go driver selection + credential surface + " +
-			"plaita#205 row/byte caps must be decided first",
-	}
+	// sql_query 曾在此（deferred to #84）——#84 已落地（2026-10-22，r84，
+	// database/sql + 纯 Go 驱动矩阵），例外同步摘除，双向差集应自然为零。
+	pythonOnlyExceptions := map[string]string{}
 	// go-only 例外：Go 有意实装、Python 默认 registry 不暴露的类型。两者都是
 	// Python 侧「模块在、注册表外」的 opt-in 形态（plaita/node/__init__.py）。
 	goOnlyExceptions := map[string]string{
