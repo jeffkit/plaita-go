@@ -220,6 +220,21 @@ func TestLoadRejects(t *testing.T) {
 			doc:  `{"flow_id":"probe","nodes":[{"id":"s","type":"start","next":123},{"id":"e","type":"end"}]}`,
 			want: "not reachable from start",
 		},
+		{
+			// A1 r132 card G-1: a lone surrogate escape is outside the UTF-8
+			// hash domain (Python compute_flow_definition_hash refuses the
+			// definition at .encode); the decoder would fold it to U+FFFD and
+			// let the pool run what Python can never hash. Same pin lives on
+			// the worker fingerprint path (flow_hash golden goerr_lone_*).
+			name: "lone surrogate escape high",
+			doc:  `{"flow_id":"probe","nodes":[{"id":"s","type":"start","next":"e","name":"a\ud800b"},{"id":"e","type":"end"}]}`,
+			want: "lone surrogate",
+		},
+		{
+			name: "lone surrogate escape low",
+			doc:  `{"flow_id":"probe","nodes":[{"id":"s","type":"start","next":"e","name":"a\udc00b"},{"id":"e","type":"end"}]}`,
+			want: "lone surrogate",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

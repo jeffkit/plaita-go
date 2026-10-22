@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/jeffkit/plaita-go/pkg/ir"
 )
 
 // Canonical JSON for flow-definition fingerprints (#60): the byte-exact Go
@@ -32,7 +34,11 @@ import (
 // canonicalFlowDefinitionJSON decodes one strict JSON document (json.Number
 // preserved) and renders it in the Python canonical form. Like Python's
 // json.loads it accepts exactly one document: trailing data is an error, and
-// so are the RFC-8259-invalid NaN/Infinity literals.
+// so are the RFC-8259-invalid NaN/Infinity literals. Lone surrogate escapes
+// are rejected by name (A129-01): Python's json.loads accepts them into a
+// str but its hash chain refuses the definition at .encode("utf-8") —
+// decoding them here would fold both sides to U+FFFD and happily hash a
+// definition the Python pool can never hash (A1 r132 card G-1).
 func canonicalFlowDefinitionJSON(raw []byte) ([]byte, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
@@ -46,6 +52,9 @@ func canonicalFlowDefinitionJSON(raw []byte) ([]byte, error) {
 		if err == nil {
 			return nil, errors.New("trailing data after flow definition JSON")
 		}
+		return nil, err
+	}
+	if err := ir.RejectLoneSurrogateEscapes(raw); err != nil {
 		return nil, err
 	}
 	var buf []byte

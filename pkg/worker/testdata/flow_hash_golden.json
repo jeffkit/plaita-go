@@ -333,6 +333,34 @@
       "go_rejects": true
     },
     {
+      "name": "goerr_lone_surrogate_high",
+      "raw": "{\"flow_id\":\"probe\",\"nodes\":[{\"id\":\"s\",\"type\":\"start\",\"next\":\"e\",\"name\":\"a\\ud800b\"},{\"id\":\"e\",\"type\":\"end\"}]}",
+      "python_canonical": "",
+      "python_hash": "",
+      "go_rejects": true
+    },
+    {
+      "name": "goerr_lone_surrogate_low",
+      "raw": "{\"flow_id\":\"probe\",\"nodes\":[{\"id\":\"s\",\"type\":\"start\",\"next\":\"e\",\"name\":\"a\\udc00b\"},{\"id\":\"e\",\"type\":\"end\"}]}",
+      "python_canonical": "",
+      "python_hash": "",
+      "go_rejects": true
+    },
+    {
+      "name": "struct_paired_surrogate_escape",
+      "raw": "{\"flow_id\":\"probe\",\"nodes\":[{\"id\":\"s\",\"type\":\"start\",\"next\":\"e\",\"name\":\"a\\ud83d\\ude00b\"},{\"id\":\"e\",\"type\":\"end\"}]}",
+      "python_canonical": "{\"flow_id\":\"probe\",\"nodes\":[{\"id\":\"s\",\"name\":\"a\ud83d\ude00b\",\"next\":\"e\",\"type\":\"start\"},{\"id\":\"e\",\"type\":\"end\"}]}",
+      "python_hash": "a62de38d6bbafebdf44692a5ca68381f19e1d94b05a04f72f608c49ee59c4386",
+      "go_rejects": false
+    },
+    {
+      "name": "u_fffd_escape",
+      "raw": "{\"flow_id\":\"demo\",\"u\":\"a\\ufffdb\"}",
+      "python_canonical": "{\"flow_id\":\"demo\",\"u\":\"a\ufffdb\"}",
+      "python_hash": "d209b4688a5106aa4609c09787746e2938cf5fa8fdd3df330df79d16d5894158",
+      "go_rejects": false
+    },
+    {
       "name": "e2e_mixed_fleet_flow",
       "raw": "{\n      \"flow_id\": \"mixed_fleet_flow\",\n      \"version\": \"1\",\n      \"description\": \"wait & see <prod> webhook?a=1&b=2\",\n      \"retry_hint\": 1e3,\n      \"nodes\": [\n        {\"id\": \"start\", \"type\": \"start\", \"next\": \"wait\"},\n        {\"id\": \"wait\", \"type\": \"event\", \"event_type\": \"approval\", \"next\": \"end\"},\n        {\"id\": \"end\", \"type\": \"end\", \"resultType\": \"success\", \"output\": \"$NODE.wait.status\"}\n      ]\n    }",
       "python_canonical": "{\"description\":\"wait & see <prod> webhook?a=1&b=2\",\"flow_id\":\"mixed_fleet_flow\",\"nodes\":[{\"id\":\"start\",\"next\":\"wait\",\"type\":\"start\"},{\"event_type\":\"approval\",\"id\":\"wait\",\"next\":\"end\",\"type\":\"event\"},{\"id\":\"end\",\"output\":\"$NODE.wait.status\",\"resultType\":\"success\",\"type\":\"end\"}],\"retry_hint\":1000.0,\"version\":\"1\"}",

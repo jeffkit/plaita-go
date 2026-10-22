@@ -85,6 +85,7 @@ def cases() -> list[dict]:
         expect_error: bool = False,
         go_rejects: bool = False,
         export_when_py_rejects: bool = False,
+        py_hash_rejects: bool = False,
     ) -> None:
         out.append(
             {
@@ -93,6 +94,7 @@ def cases() -> list[dict]:
                 "expect_error": expect_error,
                 "go_rejects": go_rejects,
                 "export_when_py_rejects": export_when_py_rejects,
+                "py_hash_rejects": py_hash_rejects,
             }
         )
 
@@ -219,6 +221,41 @@ def cases() -> list[dict]:
         export_when_py_rejects=True,
     )
 
+    # ---- A1 r132 card G-1: lone-surrogate decode rejection (mixed-fleet
+    # tear, Go half; pairs with plaita card A-1's publish gate) ------------
+    # Python json.loads accepts \udXXX escapes into a str holding lone
+    # surrogates, but compute_flow_definition_hash refuses the definition at
+    # .encode("utf-8") (flow_worker.py:941-945 — A129-01 poison pill,
+    # A129-03 fingerprint collapse). Go's decoder folds them to U+FFFD and
+    # would hash a definition Python can never hash. These pins demand Go
+    # reject at the decode layer; red until the G-1 fix, green after.
+    add(
+        "goerr_lone_surrogate_high",
+        '{"flow_id":"probe","nodes":[{"id":"s","type":"start","next":"e",'
+        '"name":"a\\ud800b"},{"id":"e","type":"end"}]}',
+        go_rejects=True,
+        py_hash_rejects=True,
+    )
+    add(
+        "goerr_lone_surrogate_low",
+        '{"flow_id":"probe","nodes":[{"id":"s","type":"start","next":"e",'
+        '"name":"a\\udc00b"},{"id":"e","type":"end"}]}',
+        go_rejects=True,
+        py_hash_rejects=True,
+    )
+    # Positive controls for the same gate: paired escapes are real non-BMP
+    # characters (canonical emits raw UTF-8) and a literal U+FFFD escape is
+    # an ordinary code point — both must stay accepted on both engines.
+    add(
+        "struct_paired_surrogate_escape",
+        '{"flow_id":"probe","nodes":[{"id":"s","type":"start","next":"e",'
+        '"name":"a\\ud83d\\ude00b"},{"id":"e","type":"end"}]}',
+    )
+    add(
+        "u_fffd_escape",
+        '{"flow_id":"demo","u":"a\\ufffdb"}',
+    )
+
     # ---- e2e mixed-fleet definition (must stay loadable by ir.Load) -------
     # The definition deliberately carries #60 divergence content: '&' and
     # '<>' in a string plus an exponent-form numeric literal — exactly the
@@ -294,6 +331,31 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
+        if case["py_hash_rejects"]:
+            # loads accepts (lone surrogates are valid str content) but the
+            # hash chain refuses at .encode("utf-8") — no canonical/hash
+            # exists; record the case as a Go-side rejection pin only.
+            try:
+                compute_flow_definition_hash(doc)
+            except Exception:
+                pass
+            else:
+                print(
+                    f"FAIL: {case['name']}: expected hash-chain rejection "
+                    f"(unencodable lone surrogate) but Python hashed it",
+                    file=sys.stderr,
+                )
+                return 2
+            exported.append(
+                {
+                    "name": case["name"],
+                    "raw": raw,
+                    "python_canonical": "",
+                    "python_hash": "",
+                    "go_rejects": True,
+                }
+            )
+            continue
         canonical = canonical_flow_definition_json(doc)
         digest = compute_flow_definition_hash(doc)
         anchor = ISSUE_ANCHOR_HASHES.get(case["name"])
