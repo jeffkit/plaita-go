@@ -311,8 +311,14 @@ func apiRequestPerform(ctx context.Context, client *http.Client, method, rawURL 
 
 func apiRequestReadResponse(resp *http.Response) (*apiRequestResponse, error) {
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := readCappedBody(resp.Body, maxResponseBytes())
 	if err != nil {
+		if errors.As(err, &errResponseTooLarge{}) {
+			// Over-limit is deterministic (the same body re-read exceeds
+			// again): same family as http's ResponseTooLargeError, never
+			// burned against retryTimes.
+			return nil, workflow.NonRetryable(err)
+		}
 		return nil, workflow.RetryableError(fmt.Errorf("read response body: %w", err))
 	}
 	return &apiRequestResponse{statusCode: resp.StatusCode, body: body}, nil

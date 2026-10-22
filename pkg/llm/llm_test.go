@@ -405,3 +405,40 @@ func TestResolveEndpointEnvVarInterpolation(t *testing.T) {
 		t.Errorf("missing interpolated var: %v", err)
 	}
 }
+
+// TestClientResponseSizeCap pins the outbound read ceiling (plaita-go#72):
+// a 64KiB completion body behind a 4096-byte cap fails named with the
+// ceiling in the message and classifies deterministic — pre-fix, Chat
+// swallowed the whole body and returned it as the text.
+func TestClientResponseSizeCap(t *testing.T) {
+	t.Setenv("PLAITA_HTTP_MAX_RESPONSE_BYTES", "4096")
+	bigBody := `{"choices":[{"message":{"role":"assistant","content":"` +
+		strings.Repeat("x", 64<<10) + `"}}],"usage":{"total_tokens":7}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(bigBody))
+	}))
+	defer srv.Close()
+
+	_, err := NewClient().Chat(context.Background(), &ChatRequest{
+		APIBase: srv.URL, APIKey: "k-1", Model: "m-1", Messages: sampleMessages()})
+	if err == nil {
+		t.Fatalf("64KiB body behind a 4096 cap: Chat succeeded (pre-fix swallow)")
+	}
+	if !strings.Contains(err.Error(), "maxResponseBytes=4096") {
+		t.Errorf("message = %q, want the ceiling value", err)
+	}
+	if Retryable(err) {
+		t.Errorf("over-limit is deterministic (retry re-downloads the same body), got retryable")
+	}
+
+	small := `{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"total_tokens":1}}`
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(small))
+	}))
+	defer srv2.Close()
+	resp, err := NewClient().Chat(context.Background(), &ChatRequest{
+		APIBase: srv2.URL, APIKey: "k-1", Model: "m-1", Messages: sampleMessages()})
+	if err != nil || resp.Text != "ok" {
+		t.Errorf("small body: resp=%v err=%v, want untouched success", resp, err)
+	}
+}

@@ -452,8 +452,13 @@ func notifyPostJSON(ctx context.Context, rawURL string, payload map[string]any, 
 		return nil, &NotifyTransientError{Msg: notifyScrubText(err.Error())}
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := readCappedBody(resp.Body, maxResponseBytes())
 	if err != nil {
+		if errors.As(err, &errResponseTooLarge{}) {
+			// Over-limit is deterministic: a retry re-downloads the same
+			// oversized body. Same class as non-retryable HTTP 4xx.
+			return nil, &NotifyDeterministicError{Msg: notifyScrubText(err.Error())}
+		}
 		return nil, &NotifyTransientError{Msg: notifyScrubText(err.Error())}
 	}
 	var body any

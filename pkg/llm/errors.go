@@ -61,6 +61,10 @@ func IsRetryableStatus(status int) bool {
 //     RequestException and the engine retries them (A2R7-04).
 func Retryable(err error) bool {
 	for err != nil {
+		var tooLarge *ResponseTooLargeError
+		if errors.As(err, &tooLarge) {
+			return false
+		}
 		var det *DeterministicError
 		if errors.As(err, &det) {
 			return false
