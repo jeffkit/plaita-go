@@ -2,8 +2,12 @@ package plaitaexpr
 
 // strftime.go formats times with Python's strftime directive subset
 // (semantic authority: datetime.strftime defaults used by $F.now/$F.today,
-// expression.py _fn_now/_fn_today). Unknown directives pass through
-// literally, matching the platform strftime behaviour Python delegates to.
+// expression.py _fn_now/_fn_today; values cross-checked against platform
+// Python on darwin C locale, issue #76). The implemented subset is
+// intentional; directives outside it are NOT parity — Python renders them
+// via the platform strftime while this implementation passes them through
+// literally (a known divergence, only pinned for truly unknown specs like
+// %Q in tests).
 
 import (
 	"fmt"
@@ -42,7 +46,40 @@ func pyStrftime(t time.Time, layout string) string {
 		case 'H':
 			b.WriteString(padNum2(t.Hour(), pad))
 		case 'I':
-			b.WriteString(padNum2(hour12(t), true))
+			b.WriteString(padNum2(hour12(t), pad))
+		case 'V':
+			_, wk := t.ISOWeek()
+			b.WriteString(padNum2(wk, pad))
+		case 'G':
+			isoYear, _ := t.ISOWeek()
+			if pad {
+				b.WriteString(fmt.Sprintf("%04d", isoYear))
+			} else {
+				b.WriteString(fmt.Sprintf("%d", isoYear))
+			}
+		case 'U':
+			// Week of year, Sunday-first; the Sunday itself starts a new
+			// week (Python/platform strftime semantics).
+			yday := t.YearDay() - 1
+			b.WriteString(padNum2((yday+7-int(t.Weekday()))/7, pad))
+		case 'W':
+			// Week of year, Monday-first.
+			yday := t.YearDay() - 1
+			b.WriteString(padNum2((yday+7-(int(t.Weekday())+6)%7)/7, pad))
+		case 'u':
+			// ISO weekday: Monday=1 … Sunday=7 (never padded, single digit).
+			iso := int(t.Weekday())
+			if iso == 0 {
+				iso = 7
+			}
+			b.WriteString(fmt.Sprintf("%d", iso))
+		case 'c':
+			// C locale composite; other locales are out of parity scope.
+			b.WriteString(t.Format("Mon Jan _2 15:04:05 2006"))
+		case 'x':
+			b.WriteString(t.Format("01/02/06"))
+		case 'X':
+			b.WriteString(t.Format("15:04:05"))
 		case 'M':
 			b.WriteString(padNum2(t.Minute(), pad))
 		case 'S':
@@ -80,8 +117,10 @@ func pyStrftime(t time.Time, layout string) string {
 		case '%':
 			b.WriteByte('%')
 		default:
-			// Unknown directive: pass through verbatim (platform strftime
-			// behaviour that Python inherits).
+			// Unknown directive: pass through verbatim. This is a divergence
+			// from Python, whose platform strftime renders many of these
+			// (issue #76) — kept so malformed layouts stay visible instead
+			// of silently vanishing.
 			b.WriteByte('%')
 			if !pad {
 				b.WriteByte('-')
