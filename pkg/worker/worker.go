@@ -2124,7 +2124,7 @@ func (w *Worker) handleForeignTarget(ctx context.Context, delivery *Delivery) (b
 	}
 	if count > AffinityHandoverMax {
 		w.recordHandoverLedger(ctx, task, DecisionTargeted, ReasonHandoverExhausted, "")
-		w.logger.Error("handover budget exhausted; execution terminalized, message left pending",
+		w.logger.Error("handover budget exhausted",
 			"execution_id", task.ExecutionID, "count", count, "max", AffinityHandoverMax)
 		return w.terminalizeHandoverExhausted(ctx, task, count)
 	}
@@ -2178,6 +2178,18 @@ func (w *Worker) handoverKey(task *Task, delivery *Delivery) string {
 // otherwise the run is terminalized and the message left pending — the 7-day
 // counter keeps every later reclaim from producing another copy, so the loop
 // is bounded even though this worker does not ack.
+//
+// #53: the terminal write never goes out as a fenceGen=0 plain write — that
+// would bypass §3.4 and clobber a running row another worker holds (and via
+// the terminal-save choke point release a quota slot the live execution
+// still occupies). The guard order mirrors deadLetterGuard:
+//   - a live lease holder owns the row → no write, message stays pending
+//     (the real holder finalizes; a later copy hits the terminal branch);
+//   - a suspended execution waits for an external decision and is never
+//     terminalized here (a bouncing decision carrier must stay deliverable);
+//   - otherwise the write goes out under a freshly claimed fence generation
+//     (Acquire → fenced save → release), so a holder that acquires in
+//     between turns our write into a CAS loss instead of a clobber.
 func (w *Worker) terminalizeHandoverExhausted(ctx context.Context, task *Task, count int) (bool, error) {
 	if task.ExecutionID == "" {
 		return true, ErrHandoverCounterUnavailable
@@ -2197,6 +2209,37 @@ func (w *Worker) terminalizeHandoverExhausted(ctx context.Context, task *Task, c
 			"execution_id", task.ExecutionID)
 		return true, nil
 	}
+	if state.Status == StatusSuspended {
+		w.logger.Warn("handover exhausted on a suspended execution: never terminalized, message left pending for the decision carrier",
+			"execution_id", task.ExecutionID)
+		return false, nil
+	}
+	holder, err := w.lease.GetHolder(ctx, task.TenantID, task.ExecutionID)
+	if err != nil {
+		// Fail-closed: without a probe answer this worker never blind-writes.
+		w.logger.Warn("handover exhausted: lease probe failed, message left pending",
+			"execution_id", task.ExecutionID, "error", err)
+		return false, nil
+	}
+	if holder != "" {
+		w.recordHandoverLedger(ctx, task, DecisionTargeted, ReasonHandoverLiveHolder, "")
+		w.logger.Warn("handover exhausted on a live-leased execution: terminal write refused, message left pending",
+			"execution_id", task.ExecutionID, "holder_count", count)
+		return false, nil
+	}
+	// No live holder: claim the execution with a fresh fence generation so
+	// the terminal write is fenced (a fenceGen=0 write here would race any
+	// worker acquiring between the probe and the save).
+	handle, err := w.lease.Acquire(ctx, task.TenantID, task.ExecutionID,
+		NewHolderToken("handover", w.cfg.InstanceID), w.cfg.LeaseTTLSeconds)
+	if err != nil {
+		// Someone took over between the probe and the claim — not ours to
+		// kill; the copy stays pending for the new holder's lifetime.
+		w.recordHandoverLedger(ctx, task, DecisionTargeted, ReasonHandoverLiveHolder, "")
+		w.logger.Warn("handover exhausted: execution claimed concurrently, terminal write abandoned",
+			"execution_id", task.ExecutionID, "error", err)
+		return false, nil
+	}
 	state.Status = StatusError
 	state.EndTime = nowISO()
 	state.LastUpdateTime = state.EndTime
@@ -2207,9 +2250,11 @@ func (w *Worker) terminalizeHandoverExhausted(ctx context.Context, task *Task, c
 		"affinity_handovers": count,
 		"affinity_reason":    fmt.Sprintf("target %s never consumed the carrier", task.TargetInstanceID),
 	}
-	if err := w.store.SaveExecutionState(ctx, task.TenantID, state, 0); err != nil {
+	if err := w.store.SaveExecutionState(ctx, task.TenantID, state, handle.FenceToken); err != nil {
+		_ = w.lease.Release(ctx, handle)
 		return true, err
 	}
+	_ = w.lease.Release(ctx, handle)
 	return true, nil
 }
 

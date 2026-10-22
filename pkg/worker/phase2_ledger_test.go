@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // TestDispatchLedgerEnqueueWithLedger (§6.3): the message body and the ledger
@@ -200,5 +202,93 @@ func TestHandoverBudgetExhausted(t *testing.T) {
 	}
 	if n := streamLen(t, rdb, cfg.DLQKey); n != 0 {
 		t.Fatalf("DLQ XLEN = %d, want 0 (handover never dead-letters)", n)
+	}
+}
+
+// TestHandoverExhaustedDoesNotClobberLiveHolder (#53): the exhaustion
+// terminal write must never go out as a fenceGen=0 plain write over a
+// running row another worker holds — that bypasses §3.4 and (via the
+// terminal-save choke point) releases a quota slot the live execution still
+// occupies. With a live holder the write is refused and the message stays
+// pending for the real holder to finalize.
+func TestHandoverExhaustedDoesNotClobberLiveHolder(t *testing.T) {
+	w, rdb, _, cfg := newTestWorker(t)
+	ctx := context.Background()
+	executionID := newExecutionID()
+	rdb.Set(ctx, cfg.KeyPrefix+":registry:flow_worker:worker-b",
+		`{"instance_id":"worker-b","status":"running"}`, time.Minute)
+	// running row + live lease + fence, all owned by worker-b's generation.
+	rdb.Set(ctx, stateKeyOf(cfg, executionID),
+		fmt.Sprintf(`{"execution_id":%q,"flow_id":"f9","status":"running"}`, executionID), 0)
+	rdb.Set(ctx, cfg.KeyPrefix+":execution:lease:"+executionID,
+		"start:worker-b:0123456789abcdef", time.Minute)
+	rdb.Set(ctx, cfg.KeyPrefix+":execution:fence:"+executionID, "7", 7*24*time.Hour)
+	rdb.Set(ctx, cfg.KeyPrefix+":execution:fencegen:"+executionID, "7", 0)
+	// The live execution occupies its tenant start-quota slot (#30).
+	rdb.ZAdd(ctx, cfg.KeyPrefix+":tenant_running:"+cfg.DefaultTenantID,
+		redis.Z{Score: float64(time.Now().Add(time.Hour).Unix()), Member: executionID})
+	// The next INCR exceeds the ceiling.
+	rdb.Set(ctx, cfg.KeyPrefix+":execution:affinityhandover:"+executionID,
+		fmt.Sprintf("%d", AffinityHandoverMax), 7*24*time.Hour)
+
+	payload := baseStartPayload(executionID)
+	payload["target_instance_id"] = "worker-b"
+	enqueueTask(t, rdb, cfg, payload, "")
+
+	if _, err := w.ProcessOne(ctx); err != nil {
+		t.Fatalf("ProcessOne: %v", err)
+	}
+	state := loadStateRow(t, rdb, cfg, executionID)
+	if state.Status != StatusRunning {
+		t.Fatalf("status = %q, want running (terminal write refused)", state.Status)
+	}
+	if h := rdb.Get(ctx, cfg.KeyPrefix+":execution:lease:"+executionID).Val(); h != "start:worker-b:0123456789abcdef" {
+		t.Fatalf("lease = %q, want the live holder untouched", h)
+	}
+	if n := rdb.ZCard(ctx, cfg.KeyPrefix+":tenant_running:"+cfg.DefaultTenantID).Val(); n != 1 {
+		t.Fatalf("tenant_running ZCARD = %d, want 1 (quota slot kept)", n)
+	}
+	if n := pendingCount(t, rdb, cfg); n != 1 {
+		t.Fatalf("PEL = %d, want 1 (left pending for the holder)", n)
+	}
+}
+
+// TestHandoverExhaustedTerminalizesUnownedRowFenced (#53 green side): with no
+// live holder the terminal write goes out under a freshly claimed fence
+// generation (§3.4) instead of a fenceGen=0 plain write, and the claim lease
+// is released right after.
+func TestHandoverExhaustedTerminalizesUnownedRowFenced(t *testing.T) {
+	w, rdb, _, cfg := newTestWorker(t)
+	ctx := context.Background()
+	executionID := newExecutionID()
+	rdb.Set(ctx, cfg.KeyPrefix+":registry:flow_worker:worker-b",
+		`{"instance_id":"worker-b","status":"running"}`, time.Minute)
+	rdb.Set(ctx, stateKeyOf(cfg, executionID),
+		fmt.Sprintf(`{"execution_id":%q,"flow_id":"f9","status":"running"}`, executionID), 0)
+	// Dead generation trail, no live lease (§3.1: fence outlives the lease).
+	rdb.Set(ctx, cfg.KeyPrefix+":execution:fence:"+executionID, "2", 7*24*time.Hour)
+	rdb.Set(ctx, cfg.KeyPrefix+":execution:fencegen:"+executionID, "2", 0)
+	rdb.Set(ctx, cfg.KeyPrefix+":execution:affinityhandover:"+executionID,
+		fmt.Sprintf("%d", AffinityHandoverMax), 7*24*time.Hour)
+
+	payload := baseStartPayload(executionID)
+	payload["target_instance_id"] = "worker-b"
+	enqueueTask(t, rdb, cfg, payload, "")
+
+	if _, err := w.ProcessOne(ctx); err != nil {
+		t.Fatalf("ProcessOne: %v", err)
+	}
+	state := loadStateRow(t, rdb, cfg, executionID)
+	if state.Status != StatusError || state.Error["type"] != "AffinityHandoverExhausted" {
+		t.Fatalf("status = %q error = %v, want AffinityHandoverExhausted", state.Status, state.Error)
+	}
+	if gen := rdb.Get(ctx, cfg.KeyPrefix+":execution:fencegen:"+executionID).Val(); gen == "" || gen == "2" {
+		t.Fatalf("fencegen = %q, want a freshly claimed generation past 2", gen)
+	}
+	if h := rdb.Get(ctx, cfg.KeyPrefix+":execution:lease:"+executionID).Val(); h != "" {
+		t.Fatalf("claim lease not released: %q", h)
+	}
+	if n := pendingCount(t, rdb, cfg); n != 1 {
+		t.Fatalf("PEL = %d, want 1 (terminalized row leaves the message pending)", n)
 	}
 }

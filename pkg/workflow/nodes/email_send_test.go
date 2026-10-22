@@ -628,3 +628,80 @@ func TestEmailSendJSONRoundTrip(t *testing.T) {
 		t.Errorf("fields = %#v", node)
 	}
 }
+
+// TestEmailSendSubjectHeaderInjectionRefused (#71): CR/LF in an externally
+// supplied header value must be a named deterministic rejection before any
+// wire bytes are built — Python's EmailMessage raises ValueError at the same
+// point (email/policy.py header_store_parse). Bare LF is the same injection
+// class; a tab stays legal (Python parity).
+func TestEmailSendSubjectHeaderInjectionRefused(t *testing.T) {
+	called := false
+	sender := func(_ context.Context, _ *notifySMTPConfig, _ string, _ []string, _ []byte) error {
+		called = true
+		return nil
+	}
+	cred := notifyTestCredentialStore{"smtp": {
+		"host": "smtp.test", "port": 587, "username": "bot@test",
+		"password": "pw", "use_tls": true,
+	}}
+	node := &EmailSend{
+		BaseNode: BaseNode{ID: "n"}, Credential: "smtp",
+		To: "a@x.com", Subject: "alert\r\nBcc: victim@example.com", Body: "hi",
+		smtpSender: sender, Credentials: cred,
+	}
+	if _, err := node.Execute(notifyTestContext(t, nil, nil)); err == nil {
+		t.Fatal("subject with CRLF injection accepted")
+	}
+	if called {
+		t.Fatal("sender invoked despite header injection")
+	}
+
+	node.Subject = "alert\nBcc: victim@example.com"
+	_, err := node.Execute(notifyTestContext(t, nil, nil))
+	var de *NotifyDeterministicError
+	if !errors.As(err, &de) {
+		t.Fatalf("bare-LF subject error = %v, want NotifyDeterministicError", err)
+	}
+	if !strings.Contains(err.Error(), "Subject") {
+		t.Fatalf("error should name the offending header: %v", err)
+	}
+
+	node.Subject = "release\tx\r\nBcc: victim@example.com"
+	if _, err := node.Execute(notifyTestContext(t, nil, nil)); err == nil {
+		t.Fatal("CRLF after a legal tab still accepted")
+	}
+
+	// Tab alone stays legal (Python str.splitlines does not split on it).
+	node.Subject = "disk\tusage 90%"
+	if _, err := node.Execute(notifyTestContext(t, nil, nil)); err != nil {
+		t.Fatalf("tab in subject must stay legal (Python parity): %v", err)
+	}
+}
+
+// TestEmailSendRecipientHeaderInjectionRefused (#71): the To header is
+// externally supplied the same way — a recipient carrying CR/LF is rejected
+// before the SMTP envelope (MAIL FROM/RCPT TO would be command-injectable).
+func TestEmailSendRecipientHeaderInjectionRefused(t *testing.T) {
+	called := false
+	sender := func(_ context.Context, _ *notifySMTPConfig, _ string, _ []string, _ []byte) error {
+		called = true
+		return nil
+	}
+	node := &EmailSend{
+		BaseNode: BaseNode{ID: "n"}, Credential: "smtp",
+		To: "a@x.com, b@x.com\r\nRCPT-INJECT", Subject: "hi", Body: "hi",
+		smtpSender: sender,
+		Credentials: notifyTestCredentialStore{"smtp": {
+			"host": "smtp.test", "port": 587, "username": "bot@test",
+			"password": "pw", "use_tls": true,
+		}},
+	}
+	_, err := node.Execute(notifyTestContext(t, nil, nil))
+	var de *NotifyDeterministicError
+	if !errors.As(err, &de) || !strings.Contains(err.Error(), "To") {
+		t.Fatalf("error = %v, want NotifyDeterministicError naming the To header", err)
+	}
+	if called {
+		t.Fatal("sender invoked despite recipient header injection")
+	}
+}

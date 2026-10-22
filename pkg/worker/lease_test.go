@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -211,6 +212,52 @@ func TestFencedStateSave(t *testing.T) {
 	// Missing row → (nil, nil).
 	if st, err := store.LoadExecutionState(ctx, "", newExecutionID()); err != nil || st != nil {
 		t.Fatalf("missing load = (%v,%v), want (nil,nil)", st, err)
+	}
+}
+
+// TestFencedStateSaveRefusesStaleGenerationAfterPartialRestore (#54,
+// A2R25-05): a partial restore brings back an old state+fence pair while the
+// never-cleared fencegen counter stays at the newer generation. The stale
+// token must NOT re-hit the CAS: the save is refused with the named
+// fencegen-mismatch error (Python returns -1 → ExecutionLeaseError).
+func TestFencedStateSaveRefusesStaleGenerationAfterPartialRestore(t *testing.T) {
+	_, rdb, _, cfg := newTestWorker(t)
+	ctx := context.Background()
+	store := NewExecutionStore(rdb, cfg)
+	executionID := newExecutionID()
+
+	state := &ExecutionState{
+		ExecutionID: executionID, Status: StatusRunning,
+		StartTime: nowISO(), LastUpdateTime: nowISO(),
+		Context: map[string]any{},
+	}
+	// Post-restore shape: fence=3 came back, fencegen stayed at 5.
+	rdb.Set(ctx, cfg.KeyPrefix+":execution:fence:"+executionID, "3", 0)
+	rdb.Set(ctx, cfg.KeyPrefix+":execution:fencegen:"+executionID, "5", 0)
+	rdb.Set(ctx, stateKeyOf(cfg, executionID),
+		fmt.Sprintf(`{"execution_id":%q,"status":"running"}`, executionID), 0)
+
+	err := store.SaveExecutionState(ctx, "", state, 3)
+	if !errors.Is(err, ErrFenceGenerationInconsistent) {
+		t.Fatalf("stale-token save after partial restore = %v, want ErrFenceGenerationInconsistent", err)
+	}
+	if !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("fencegen mismatch must keep the lost-write-authority semantics, got %v", err)
+	}
+	if got, _ := store.LoadExecutionState(ctx, "", executionID); got == nil || got.Status != StatusRunning {
+		t.Fatalf("row was modified by the refused save: %+v", got)
+	}
+
+	// A missing fencegen key is the same divergence (Python: -1 as well).
+	rdb.Del(ctx, cfg.KeyPrefix+":execution:fencegen:"+executionID)
+	if err := store.SaveExecutionState(ctx, "", state, 3); !errors.Is(err, ErrFenceGenerationInconsistent) {
+		t.Fatalf("save with missing fencegen = %v, want ErrFenceGenerationInconsistent", err)
+	}
+
+	// Consistent fence/fencegen pair → the write goes through.
+	rdb.Set(ctx, cfg.KeyPrefix+":execution:fencegen:"+executionID, "3", 0)
+	if err := store.SaveExecutionState(ctx, "", state, 3); err != nil {
+		t.Fatalf("consistent fence/fencegen save: %v", err)
 	}
 }
 

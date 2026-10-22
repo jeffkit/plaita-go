@@ -91,6 +91,12 @@ func (s *ExecutionStore) fenceKey(tenantID, executionID string) string {
 	return s.cfg.Namespace(tenantID) + ":execution:fence:" + executionID
 }
 
+// fenceGenKey is the never-cleared generation counter (§3.1 ABA anchor);
+// the fenced CAS compares it alongside the fence key (#54, A2R25-05).
+func (s *ExecutionStore) fenceGenKey(tenantID, executionID string) string {
+	return s.cfg.Namespace(tenantID) + ":execution:fencegen:" + executionID
+}
+
 // CancelKey is the cancel intent flag (§4.1): value = ISO cancel time,
 // TTL 7 days. Written by the console; the worker only reads it (the flag is
 // never deleted by the worker, it expires naturally).
@@ -112,12 +118,16 @@ func (s *ExecutionStore) IsCancelRequested(ctx context.Context, tenantID, execut
 }
 
 // luaFencedStateSave is the fenced CAS write (protocol §3.4 write-side
-// defense, storage/fenced.py:56-69): the state row is written only while the
-// fence key still equals the holder's generation; the index ZADD rides in the
-// same atomic script. KEYS[1]=state key, KEYS[2]=fence key, KEYS[3]=index
-// ZSET; ARGV[1]=state JSON, ARGV[2]=generation, ARGV[3]=TTL seconds (0 = no
-// expiry), ARGV[4]=index score (start_time epoch). Returns 1 on write, 0 on
-// generation mismatch.
+// defense, storage/fenced.py:56-79): the state row is written only while the
+// fence key still equals the holder's generation AND the never-cleared
+// fencegen counter agrees (A2R25-05: a partial restore that brings back an
+// old state+fence pair leaves fencegen at the newer generation — the stale
+// token must not re-hit the CAS); the index ZADD rides in the same atomic
+// script. KEYS[1]=state key, KEYS[2]=fence key, KEYS[3]=index ZSET,
+// KEYS[4]=fencegen counter; ARGV[1]=state JSON, ARGV[2]=generation,
+// ARGV[3]=TTL seconds (0 = no expiry), ARGV[4]=index score (start_time
+// epoch). Returns 1 on write, 0 on fence mismatch (key missing counts), -1
+// on fence/fencegen divergence (partial restore / counter rollback).
 //
 // NOTE: the Python script text is not quoted in the protocol document — this
 // is a semantic reconstruction from §3.4's description; keep the CAS + index
@@ -125,6 +135,9 @@ func (s *ExecutionStore) IsCancelRequested(ctx context.Context, tenantID, execut
 var luaFencedStateSave = redis.NewScript(`
 if redis.call('get', KEYS[2]) ~= ARGV[2] then
   return 0
+end
+if redis.call('get', KEYS[4]) ~= ARGV[2] then
+  return -1
 end
 if tonumber(ARGV[3]) > 0 then
   redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[3])
@@ -139,7 +152,9 @@ return 1
 // SET + terminal TTL + ZADD index; fenced path = Lua CAS). fenceGen > 0
 // routes through the fenced CAS; a 0 generation (start without lease /
 // rollback mode) falls back to the plain write (§3.4). A CAS mismatch is
-// ErrLeaseLost; callers translate it into "do not ack".
+// ErrLeaseLost; a fence/fencegen divergence is the named
+// ErrFenceGenerationInconsistent (both in the ErrLeaseLost family) — callers
+// translate them into "do not ack".
 func (s *ExecutionStore) SaveExecutionState(ctx context.Context, tenantID string, state *ExecutionState, fenceGen int64) error {
 	blob, err := json.Marshal(state)
 	if err != nil {
@@ -159,12 +174,18 @@ func (s *ExecutionStore) SaveExecutionState(ctx context.Context, tenantID string
 	}
 	if fenceGen > 0 {
 		n, err := luaFencedStateSave.Run(ctx, s.client,
-			[]string{stateKey, s.fenceKey(tenantID, state.ExecutionID), indexKey},
+			[]string{stateKey, s.fenceKey(tenantID, state.ExecutionID), indexKey, s.fenceGenKey(tenantID, state.ExecutionID)},
 			string(blob), strconv.FormatInt(fenceGen, 10),
 			int64(terminalTTL/time.Second), score,
 		).Int64()
 		if err != nil {
 			return fmt.Errorf("%w: %v", ErrStatePersist, err)
+		}
+		if n == -1 {
+			// Fence matched but fencegen disagrees (#54): the write is
+			// refused the same way Python refuses it (ExecutionLeaseError) —
+			// a refused save never reaches notifyTerminal.
+			return fmt.Errorf("%w (gen=%d); state write refused — partial restore suspected", ErrFenceGenerationInconsistent, fenceGen)
 		}
 		if n == 0 {
 			return fmt.Errorf("%w: fence generation mismatch (gen=%d)", ErrLeaseLost, fenceGen)
