@@ -93,6 +93,64 @@ func TestRecursiveDirectRawFallback(t *testing.T) {
 	}
 }
 
+// issue #78 负控：stdout 里任何平衡 JSON 对象都可能带 raw 标记进入
+// readPlain，result 的形状不受约束——raw:true + 非字符串/缺失/null result
+// 一律不得 panic（修复前是无保护 .(string) 断言，接口转换直接炸）；文本化
+// 语义与沙箱孪生实现/Python 对齐（fmt.Sprint），缺失与 null 退化为空串。
+func TestRecursiveDirectRawNonStringResult(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+		want string
+	}{
+		{"raw dict result", `{"raw": true, "result": {"text": "x"}}`, "map[text:x]"},
+		{"raw list result", `{"raw": true, "result": [1,2]}`, "[1 2]"},
+		{"raw missing result", `{"raw": true}`, ""},
+		{"raw null result", `{"raw": true, "result": null}`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bin, _ := fakeBin(t, tc.json)
+			env := map[string]string{"RECURSIVE_BIN": bin}
+			res, err := Run(context.Background(), recursiveDirectSpec(env), RunOptions{Message: "m", Timeout: 30 * time.Second})
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if res.Text != tc.want {
+				t.Errorf("text = %q, want %q", res.Text, tc.want)
+			}
+		})
+	}
+}
+
+// issue #78 守恒：raw:true + 字符串 result 的 TrimSpace 行为不变。
+func TestRecursiveDirectRawStringTrimmed(t *testing.T) {
+	bin, _ := fakeBin(t, `{"raw": true, "result": "  ok  "}`)
+	env := map[string]string{"RECURSIVE_BIN": bin}
+	res, err := Run(context.Background(), recursiveDirectSpec(env), RunOptions{Message: "m", Timeout: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Text != "ok" {
+		t.Errorf("text = %q, want %q", res.Text, "ok")
+	}
+}
+
+// issue #78 口径变化（issue 建议第 1 条明示、PR 须写明）：非 raw 且 result
+// 非字符串时由「丢值退空串」改为 fmt.Sprint 文本（向 agentrun 孪生实现 /
+// Python str(parsed.get("result") or "") 对齐）。
+func TestRecursiveDirectNonRawNonStringResult(t *testing.T) {
+	bin, _ := fakeBin(t, `{"is_error": false, "result": {"k": "v"}}`)
+	env := map[string]string{"RECURSIVE_BIN": bin}
+	res, err := Run(context.Background(), recursiveDirectSpec(env), RunOptions{Message: "m", Timeout: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Text != "map[k:v]" {
+		t.Errorf("text = %q, want %q", res.Text, "map[k:v]")
+	}
+}
+
 func TestExtractRecursiveResultBraceScan(t *testing.T) {
 	// production shape: the result object is the last LINE-START `{`
 	// (scanned last-first), nested braces inside strings are honoured

@@ -665,14 +665,7 @@ func interpretRecursiveOutput(stdout string, details bool) (string, map[string]a
 		return "", nil, "", nil, fmt.Errorf("recursive is_error: %s",
 			truncate(fmt.Sprint(obj["result"]), 300))
 	}
-	text := ""
-	if value, present := obj["result"]; present && value != nil {
-		if str, ok := value.(string); ok {
-			text = str
-		} else {
-			text = fmt.Sprint(value)
-		}
-	}
+	text := agentproc.ResultText(obj)
 	if raw, _ := obj["raw"].(bool); raw {
 		text = strings.TrimSpace(text)
 	}

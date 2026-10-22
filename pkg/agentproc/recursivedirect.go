@@ -2,6 +2,7 @@ package agentproc
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -77,6 +78,20 @@ func extractRecursiveResult(stdout string) map[string]any {
 		}
 	}
 	return map[string]any{"result": stdout, "is_error": false, "raw": true}
+}
+
+// ResultText extracts the reply body from a recursive result object: a
+// string passes through, any other non-nil value is fmt.Sprint'ed, and a
+// missing/null result degrades to "" — the sandbox twin's safe semantics
+// (Python str(parsed.get("result") or "")). Exported so the workflow-nodes
+// sandbox path shares one implementation (issue #78: the two sites drifted
+// once already — one panicked on non-string results, one did not).
+func ResultText(obj map[string]any) string {
+	v, ok := obj["result"].(string)
+	if !ok && obj["result"] != nil {
+		v = fmt.Sprint(obj["result"])
+	}
+	return v
 }
 
 // balancedJSONAt decodes the JSON object whose `{` sits exactly at start

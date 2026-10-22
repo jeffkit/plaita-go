@@ -183,10 +183,9 @@ func readPlain(ctx context.Context, cmd *exec.Cmd, stdout interface{ Read([]byte
 		msg := fmt.Sprint(obj["result"])
 		return res, fmt.Errorf("agentproc: error: %s", msg)
 	}
+	res.Text = ResultText(obj)
 	if raw, _ := obj["raw"].(bool); raw {
-		res.Text = strings.TrimSpace(obj["result"].(string))
-	} else {
-		res.Text, _ = obj["result"].(string)
+		res.Text = strings.TrimSpace(res.Text)
 	}
 	if waitErr != nil {
 		if exitErr, ok := waitErr.(*exec.ExitError); ok && res.Text == "" {
