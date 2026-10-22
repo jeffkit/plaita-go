@@ -23,6 +23,13 @@ var (
 	// ErrLeaseLost means the lease was lost mid-execution (renew/CAS
 	// compare failed, §3.4 watchdog semantics).
 	ErrLeaseLost = errors.New("execution lease lost")
+	// ErrFenceGenerationInconsistent (#54, A2R25-05): the fence key matched
+	// but the never-cleared fencegen counter disagrees — a partial restore
+	// brought back an old state+fence pair while fencegen stayed at the
+	// newer generation. The stale token must not re-hit the CAS. Derived
+	// from ErrLeaseLost so every consumer keeps the lost-write-authority
+	// semantics (Python raises ExecutionLeaseError for both branches).
+	ErrFenceGenerationInconsistent = fmt.Errorf("%w: fence/fencegen generation inconsistent", ErrLeaseLost)
 	// ErrStatePersist is the StatePersistError analogue: the state row could
 	// not be saved — the message must NOT be acked (§5.2).
 	ErrStatePersist = errors.New("execution state persist failed")

@@ -32,6 +32,9 @@ const (
 	ReasonHandoverExhausted    = "TaskNotForThisWorker: handover budget exhausted"
 	ReasonHandoverUnbounded    = "TaskNotForThisWorker: handover counter unavailable"
 	ReasonHandoverProbeFailure = "TaskNotForThisWorker: target probe failed"
+	// ReasonHandoverLiveHolder (#53): the exhaustion terminal write was
+	// refused because another worker's live lease owns the execution.
+	ReasonHandoverLiveHolder = "TaskNotForThisWorker: live lease holder owns the execution, terminal write refused"
 )
 
 // LedgerEntry is the §6.3 entry schema.

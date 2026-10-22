@@ -163,7 +163,10 @@ func notifyEmailBackend(ctx context.Context, store NotifyCredentialStore, credNa
 	if from == "" {
 		from = "plaita"
 	}
-	msg := notifyBuildEmailMessage(from, recipients, subject, text, bodyIsHTML)
+	msg, err := notifyBuildEmailMessage(from, recipients, subject, text, bodyIsHTML)
+	if err != nil {
+		return nil, err
+	}
 	if sender == nil {
 		sender = notifySMTPSendReal
 	}
@@ -207,8 +210,22 @@ func notifySMTPConfigFromCred(cred map[string]any, credName string) (*notifySMTP
 // headers plus a text/plain body; with bodyIsHTML a multipart/alternative
 // whose plain part is the tag-stripped readable fallback (#12). Lines use
 // CRLF; non-ASCII bodies travel quoted-printable, non-ASCII headers get
-// RFC2047 B-encoding.
-func notifyBuildEmailMessage(from string, recipients []string, subject, text string, bodyIsHTML bool) []byte {
+// RFC2047 B-encoding. Header values carrying a line boundary are a named
+// rejection before any wire bytes exist (#71) — Python's EmailMessage
+// raises ValueError on the same assignment (email/policy.py
+// header_store_parse); notifyEncodeHeaderText alone cannot be the guard
+// because it is an identity function for pure-ASCII values.
+func notifyBuildEmailMessage(from string, recipients []string, subject, text string, bodyIsHTML bool) ([]byte, error) {
+	for _, h := range []struct{ name, value string }{
+		{"From", from},
+		{"To", strings.Join(recipients, ", ")},
+		{"Subject", subject},
+	} {
+		if notifyHeaderHasLineBreak(h.value) {
+			return nil, &NotifyDeterministicError{Msg: fmt.Sprintf(
+				"%s 头值包含 CR/LF 等换行控制字符，拒绝注入邮件头（Header values may not contain linefeed or carriage return characters）", h.name)}
+		}
+	}
 	var b bytes.Buffer
 	line := func(s string) {
 		b.WriteString(s)
@@ -239,7 +256,21 @@ func notifyBuildEmailMessage(from string, recipients []string, subject, text str
 		b.WriteString(notifyQuotedPrintable(text))
 		b.WriteString("\r\n")
 	}
-	return b.Bytes()
+	return b.Bytes(), nil
+}
+
+// notifyHeaderHasLineBreak reports whether v contains any character Python's
+// str.splitlines treats as a line boundary — the exact set CPython's
+// header_store_parse rejects (CR/LF plus VT/FF/line/page separators and the
+// Unicode NEL/LS/PS). A tab is not a boundary and stays legal.
+func notifyHeaderHasLineBreak(v string) bool {
+	for _, r := range v {
+		switch r {
+		case '\n', '\r', '\v', '\f', 0x1c, 0x1d, 0x1e, 0x85, 0x2028, 0x2029:
+			return true
+		}
+	}
+	return false
 }
 
 // notifyWriteMIMEBody writes one alternative part (headers + QP body).
