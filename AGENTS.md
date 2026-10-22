@@ -45,7 +45,7 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
 
 **校验子集**（pkg/ir/validate.go，对应 ir_validate DEFAULT_RULES）：唯一 start + 全图可达（R1）、next/分支引用存在（R3）、嵌入流程可达 end（R2）、`joinBranches ⊆ branches[].name`（R4 语义）。表达式级校验（R5）随表达式对齐工作流补。
 
-**fail-closed 拒载清单**：map/filter/find/reduce/while / if / case / calculate / mock / reference（需 provider）/ code 非 javascript / end `nop` / http 的 `allowedHosts`/`deniedHosts`/`blockPrivateNetworks`（SSRF 护栏未移植，靠它保护的 flow 不许静默降级）/ parallel 分支 input 非 dict。**M6 起 event / hitl_await 已转正**（挂起节点；仅有根流程挂起语义）。
+**fail-closed 拒载清单**：if / case / calculate / mock / reference（需 provider）/ code 非 javascript / end `nop` / http 的 `allowedHosts`/`deniedHosts`/`blockPrivateNetworks`（SSRF 护栏未移植，靠它保护的 flow 不许静默降级）/ parallel 分支 input 非 dict。**M6 起 event / hitl_await 已转正**（挂起节点；仅有根流程挂起语义）。**#80 phase 1（2026-10-22）起 map / filter / find / reduce / while 已转正**（Python 语义实装，见「集合/循环节点对齐」节；while 畸形 condition 与 map 负 maxConcurrent 在加载期拒绝）。
 
 **随 ir 对齐落地的引擎语义修正**（plaita 语义为基准）：
 - loop：`$NODE.<loop>` = 末次子结果（前身引擎为 nil）
@@ -126,6 +126,16 @@ plaita 侧权威语义：`plaita/core/deadline.py` + `core/strategies.py`（#267
 
 **负控（先红后绿，#48）**：`internal/interpreter/goja_test.go` cancel/deadline 两子测试 pre-fix 双红（实测）；`pkg/workflow/ctx_rebound_test.go` sleep 87600h + WithCancel pre-fix 红（实测）；`pkg/worker/ctx_rebound_test.go` js 死循环 worker 层——pre-fix 30s 仍独占（红，实测），post-fix 预算内（2s）具名终态 + follower 恢复 + 队列零污染。
 
+## 集合/循环节点对齐（#80 phase 1，2026-10-22，分支 feat/node-parity-1）
+
+权威 = `plaita/node/loop.py` 的 BaseCollectionNode 家族 + While。全部落在 `pkg/workflow/nodes/`（collection.go 共享件 + map/filter/find/reduce/while.go）。phase 2 = case/calculate/mock/reference + manifest 导出；phase 3 = server 节点。
+
+- **语义速查**（Python 逐条对齐）：五节点循环体是独立子流程，`$INPUT` 只含注入键（map/filter/find/loop = `{item,index}`；reduce 无 index，object 形态 `{first,second}`、子流程 `inputType.dataType=="array"` 时位置形态 `[acc,item]`——@flow 编译器固定产 array 形态），另有 `$PARENT`。**map**：结果 list 按集合顺序，空→`[]`；`concurrent`（历史别名 `async`）+ `maxConcurrent`（缺省/0=不设限，Python `or None`）。**filter**：裸 Python 真值判定（`if result:`），返回原子元素子集。**find**：首个真值短路返回**元素**，未找到/空→`None`。**reduce**：initial 缺省→首元素作初值从第二个起；空集合无 initial→`IndexError`（具名 + `NonRetryable`，确定性不烧重试预算）；空集合有 initial→返回 initial。**while**：先判断后执行；条件可见 `$LOOP-ITEM`（上一轮结果，首轮 None）+`$LOOP-INDEX`（不注入 `$LOOP-RESULT`——Loop 专属）；condition 缺省/null=只执行一轮（Python `condition is None → index==0`）；`max_iterations` 缺省 1000（snake/camel 双拼写），触顶仅告警。错误传播：五节点内部零 try/except，子流程错误直接冒泡（loop.go 既有同款）。
+- **golden**：`scripts/export_collection_golden.py` 从 plaita 真跑导出（deployment IR → `Flow.model_validate` → `flow.run`），`pkg/ir/testdata/collection_golden.json` 39 例（每节点 5-8 例，含空集合/错误传播/嵌套 loop-in-loop、map→while、map→reduce、短路实证），`collection_golden_test.go` 逐例对拍（canonical JSON；reduce IndexError 钉两侧共有子串 `IndexError: list index out of range`）。负控：golden 全套在基线 c224d1e 精确红（`ir.Load` 拒载实测），post 绿。
+- **并发 map（Go 面）**：每元素 goroutine + `runtime.CloneContext` 隔离 + `maxConcurrent` 信号量；childFlow 每元素一份 `childFlowView` 逐字段浅拷（`Workflow.running` 是实例级重入守卫，共享指针并发 Execute 会互斥失败；Context 含 RWMutex 不可整拷，照 `parallel.branchFlowView` 先例）；节点实例共享（执行面只读）。错误取最小失败下标（Python ThreadPoolExecutor.map 按序产出口径）。负控 `map_test.go`：并发峰值探针钉 `peak>1 且 ≤maxConcurrent` + 结果按集合顺序落位 + 缺省不设限峰值==元素数。
+- **capability contract 起步（plaita#300 数据源）**：`pkg/ir/capability.go` 导出 `SupportedNodeTypes()`/`UnsupportedNodeTypes()`/`ContractVersion`（"2026-10-22"）/`CapabilityManifest()`——`{engine, ir_contract_version, supported_node_types, unsupported_node_types, features}`，supported/unsupported 一律由白名单自动生成（#300 硬性要求：不许手写第二份）；`capability_test.go` 钉清单与白名单逐项相等、支持类型必有注册工厂、五新类型在 supported 不在 unsupported、JSON 形状与 #300 issue 文本逐键对拍。features = `["checkpoint","hitl_await","suspend"]`。worker registry 写 manifest 归 #300 后续单。
+- **已知残差（记录不修）**：① collection 求值为 dict 时取键（Python list(dict) 插入序 vs Go map 无序）——loop.go 既有分歧，author 端不该依赖，golden 规避；② Python Map 忽略 camel `maxConcurrent`（落 extra，真字段 `max_concurrent`），Go 收两者并集（fold `max_concurrent`→`maxConcurrent`）；③ Python While 触顶告警不报错的口径照搬（`max_iterations=0` 零轮且无告警）。
+
 ## 常用命令
 
 ```bash
@@ -154,7 +164,7 @@ make lint   # gofmt 检查 + vet（golangci-lint 配置存在但未接线）
 | assignment | assignment | ✅ ir 对齐（golden 过） |
 | decide（switch） | switch | ✅ ir 对齐 + 条件算子补齐（golden 过） |
 | concurrent（parallel） | parallel | ✅ ir 对齐 + 分支输入继承（golden 过） |
-| loop（基础 for-in） | loop | ✅ ir 对齐 + 末次结果语义（golden 过）；map/filter/find/reduce/while 拒载 |
+| loop（基础 for-in） | loop | ✅ ir 对齐 + 末次结果语义（golden 过）；map/filter/find/reduce/while 已随 #80 phase 1 转正（见「集合/循环节点对齐」节） |
 | child（inline） | child | ✅ ir 对齐（golden 过）；reference 拒载 |
 | http | http | ✅ ir 收录；SSRF 护栏字段拒载；golden 待补（执行面已有 nodes 测试） |
 | redis | redis | ✅ ir 收录，字段同形 |

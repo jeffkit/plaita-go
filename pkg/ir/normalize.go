@@ -128,7 +128,7 @@ func normalizeEmbedded(flowID string, n map[string]any) error {
 		return nil
 	}
 	switch n["type"] {
-	case "loop", "child":
+	case "loop", "child", "map", "filter", "find", "reduce", "while":
 		if cf, ok := n["childFlow"].(map[string]any); ok {
 			return embed(cf, "childFlow")
 		}
@@ -215,6 +215,10 @@ func normalizeNode(n map[string]any) error {
 		return translateParallel(n)
 	case "loop":
 		return translateLoop(n)
+	case "map", "filter", "find", "reduce":
+		return translateCollection(n)
+	case "while":
+		return translateWhile(n)
 	case "child":
 		return translateChild(n)
 	case "http":
@@ -542,6 +546,101 @@ func translateLoop(n map[string]any) error {
 		}
 	}
 	foldKey(n, "item_type", "itemType")
+	return nil
+}
+
+// translateCollection 校验 map/filter/find/reduce 四个集合节点的部署形状
+// （权威 = plaita codeflow 编译器 _compile_for 的产物，#80 phase 1）：
+//
+//		{"type":"map|filter|find|reduce","id":…,"collection":"<expr>","childFlow":{…}}
+//
+//	  - collection：表达式字符串 / 数组字面量 / null（空集合）；缺省同 null，
+//	    与 Python evaluate(None) → _coerce_collection → [] 一致，形状以外的
+//	    求值期错误（不可迭代标量）留在执行期（同 loop）。
+//	  - itemType / typeDefs：别名折叠 + normalizeProperty（同 loop；typeDefs
+//	    是 BaseCollectionNode 的遗留别名）。
+//	  - map：concurrent 的历史别名 async 折叠（Python _normalize_concurrent）；
+//	    maxConcurrent 缺省/0 = 不设限（Python `or None`），负数加载期拒绝
+//	    （Python 到线程池构造期才 ValueError，这里前置到 Load）。
+//	  - reduce：initial 为表达式，不做形状约束（R5/R6 引用扫描照常覆盖）。
+//	  - childFlow 必须内联存在（plaita FlowNode.setup_child_flow 的
+//	    "child_flow is required" 前置到加载期，nil ChildFlow 不给执行期炸点）。
+func translateCollection(n map[string]any) error {
+	t, _ := n["type"].(string)
+	if v, ok := n["itemType"].(map[string]any); ok {
+		if err := normalizeProperty(v); err != nil {
+			return fmt.Errorf("itemType: %v", err)
+		}
+	}
+	foldKey(n, "item_type", "itemType")
+	foldKey(n, "typeDefs", "itemType")
+	if t == "map" {
+		foldKey(n, "async", "concurrent")
+		// Python 模型字段是 max_concurrent（camel maxConcurrent 落 extra 被忽略
+		// ——plaita 侧实测）；Go 引擎 tag 是 maxConcurrent。两边收拼写的并集。
+		foldKey(n, "max_concurrent", "maxConcurrent")
+		if v, ok := n["maxConcurrent"]; ok && v != nil {
+			f, err := asFloat(v)
+			if err != nil {
+				return fmt.Errorf("maxConcurrent must be an integer, got %v", v)
+			}
+			if f < 0 {
+				return fmt.Errorf("maxConcurrent must be >= 0 (0 = unbounded), got %v", v)
+			}
+		}
+	}
+	if _, ok := n["childFlow"].(map[string]any); !ok {
+		return fmt.Errorf("%s node requires an inline childFlow document", t)
+	}
+	return nil
+}
+
+// translateWhile 转正 while 条件循环节点（plaita/node/loop.py While；#80
+// phase 1）。部署 IR 双拼写都收：编译器 _compile_while 产 snake 的
+// child_flow/max_iterations，console 正典产 camel（plaita#89 dual-read）。
+//
+//		{"type":"while","id":…,"condition":{…},"child_flow"|"childFlow":{…},
+//		 "max_iterations"|"maxIterations":N}
+//
+//	  - condition 形状 fail-closed 同 if：畸形 condition 在 Python 里解析失败
+//	    后永不命中、零轮静默 None（decide.py 自认的缺陷形态），这里加载期拒绝；
+//	    缺省/null 合法（Python condition=None：只执行一轮）。
+//	  - max_iterations 必须是整数；缺省 1000，触顶仅告警（执行期语义），
+//	    ≤0 合法 = 零轮（Python `index < max_iterations` 直接不进循环）。
+func translateWhile(n map[string]any) error {
+	foldKey(n, "child_flow", "childFlow")
+	foldKey(n, "maxIterations", "max_iterations")
+	if v, ok := n["max_iterations"]; ok && v != nil {
+		f, err := asFloat(v)
+		if err != nil || f != math.Trunc(f) {
+			return fmt.Errorf("max_iterations must be an integer, got %v", v)
+		}
+	}
+	if v, ok := n["condition"]; ok && v != nil {
+		c, isMap := v.(map[string]any)
+		if !isMap {
+			return fmt.Errorf("while condition must be an object ({field,operator,value} or {relation,conditions}), got %T", v)
+		}
+		_, hasField := c["field"]
+		_, hasOperator := c["operator"]
+		_, hasValue := c["value"]
+		conditions, _ := c["conditions"].([]any)
+		_, hasRelation := c["relation"]
+		switch {
+		case hasField && hasOperator && hasValue:
+			// 单条件（value 允许 null：eq/null 比较是合法形状）。
+		case hasRelation && len(conditions) > 0:
+			if err := normalizeCondition(c); err != nil {
+				return fmt.Errorf("while condition: %v", err)
+			}
+		default:
+			return fmt.Errorf("while condition is malformed: needs {field,operator,value} or " +
+				"{relation,conditions[>0]}; a malformed condition would silently run zero rounds")
+		}
+	}
+	if _, ok := n["childFlow"].(map[string]any); !ok {
+		return fmt.Errorf("while node requires an inline childFlow document")
+	}
 	return nil
 }
 
