@@ -255,6 +255,18 @@ func (w *Worker) Run(ctx context.Context) error {
 	w.runCtx, w.runCtxCancel = context.WithCancel(ctx)
 	ctx = w.runCtx
 
+	// Registered before any startup step can fail (#75): EnsureGroup errors
+	// used to skip this cleanup entirely (cancel/Wait/SetStatus/Unregister),
+	// leaving the worker half-initialised. Safe to register early — wg.Wait
+	// returns immediately while no goroutines have been started.
+	defer func() {
+		w.runCtxCancel()
+		w.wg.Wait()
+		w.stopDrainTimer()
+		w.registry.SetStatus(context.Background(), RegStatusStopping)
+		w.registry.Unregister(context.Background())
+	}()
+
 	w.registry.Start(w.cfg.RedisURL)
 	if err := w.queue.EnsureGroup(ctx); err != nil {
 		return fmt.Errorf("ensure consumer group: %w", err)
@@ -284,13 +296,6 @@ func (w *Worker) Run(ctx context.Context) error {
 	go func() {
 		defer w.wg.Done()
 		w.eventTimeoutLoop(ctx)
-	}()
-	defer func() {
-		w.runCtxCancel()
-		w.wg.Wait()
-		w.stopDrainTimer()
-		w.registry.SetStatus(context.Background(), RegStatusStopping)
-		w.registry.Unregister(context.Background())
 	}()
 
 	backoff := time.Duration(0)

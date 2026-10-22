@@ -85,8 +85,20 @@ func Test_strftime_directives(t *testing.T) {
 		{"%B", "October"},
 		{"%Y-%m-%d %H:%M:%S", "2026-10-19 18:30:45"},
 		{"100%%", "100%"},
-		{"%Q", "%Q"}, // unknown directives pass through (platform strftime)
+		{"%Q", "%Q"}, // truly unknown directives pass through (a divergence from Python, see strftime.go)
 		{"%-d", "19"},
+		// issue #76: week/ISO directives Python renders on this platform —
+		// values cross-checked against datetime.strftime (darwin, C locale)
+		{"%V", "43"},
+		{"%G", "2026"},
+		{"%U", "42"},
+		{"%W", "42"},
+		{"%u", "1"},
+		{"%c", "Mon Oct 19 18:30:45 2026"},
+		{"%x", "10/19/26"},
+		{"%X", "18:30:45"},
+		// %- must reach hour12 like it does for H/m/d/M/S
+		{"%-I", "6"},
 	}
 	for _, c := range cases {
 		t.Run(c.layout, func(t *testing.T) {
@@ -102,4 +114,34 @@ func Test_now_strftime_acceptance(t *testing.T) {
 	ts := time.Date(2026, 10, 19, 18, 30, 45, 0, time.Local)
 	assert.Equal(t, "2026", pyStrftime(ts, "%Y"))
 	assert.Equal(t, "18", pyStrftime(ts, "%H"))
+}
+
+func Test_strftime_iso_week_directives(t *testing.T) {
+	// Issue #76: ISO week/year and Sunday/Monday-first week numbers must
+	// match platform Python (datetime.strftime, darwin C locale). The ISO
+	// boundary row pins %G against the calendar year: 2021-01-01 belongs to
+	// ISO week 53 of ISO year 2020.
+	boundary := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
+	assert.Equal(t, "53", pyStrftime(boundary, "%V"))
+	assert.Equal(t, "2020", pyStrftime(boundary, "%G"))
+	assert.Equal(t, "00", pyStrftime(boundary, "%U"))
+	assert.Equal(t, "00", pyStrftime(boundary, "%W"))
+	assert.Equal(t, "5", pyStrftime(boundary, "%u"))
+	assert.Equal(t, "Fri Jan  1 00:00:00 2021", pyStrftime(boundary, "%c"))
+
+	// Single-digit weeks keep zero padding; %- strips it (same semantics as
+	// %-H/%-d). 2026-02-02 is the Monday of ISO week 6.
+	week6 := time.Date(2026, 2, 2, 2, 5, 0, 0, time.UTC)
+	assert.Equal(t, "06", pyStrftime(week6, "%V"))
+	assert.Equal(t, "6", pyStrftime(week6, "%-V"))
+	assert.Equal(t, "05", pyStrftime(week6, "%U"))
+	assert.Equal(t, "5", pyStrftime(week6, "%-U"))
+	assert.Equal(t, "05", pyStrftime(week6, "%W"))
+	assert.Equal(t, "5", pyStrftime(week6, "%-W"))
+
+	// %U (Sunday-first) counts the Sunday itself into the new week:
+	// 2026-10-25 (Sunday) gives %U=43 while Monday-first %W stays 42.
+	sunday := time.Date(2026, 10, 25, 0, 0, 0, 0, time.UTC)
+	assert.Equal(t, "43", pyStrftime(sunday, "%U"))
+	assert.Equal(t, "42", pyStrftime(sunday, "%W"))
 }
