@@ -64,8 +64,8 @@ func (c *Child) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
 		return nil, fmt.Errorf("failed to exec children workflow (%q) : %w", c.ChildFlow.ID, err)
 	}
 
-	if c.OutputType.ValidateValue(childFlowResult) != nil {
-		return nil, fmt.Errorf("validate output error for children workflow (%q): %w", c.ChildFlow.ID, err)
+	if verr := c.OutputType.ValidateValue(childFlowResult); verr != nil {
+		return nil, fmt.Errorf("validate output error for children workflow (%q): %w", c.ChildFlow.ID, verr)
 	}
 
 	return &workflow.ExecuteResult{
