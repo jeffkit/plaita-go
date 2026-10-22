@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/jeffkit/plaita-go/pkg/ir"
 )
 
 // Worker-side heartbeats (protocol §8.1). Three layers:
@@ -102,6 +104,7 @@ func (r *Registry) Start(redisURL string) {
 		"sampled_at":        nowISO(),
 	}
 	meta["worker_capacity"] = r.capacity
+	r.appendCapabilityManifest(meta)
 
 	r.mu.Lock()
 	r.info = ServiceInfo{
@@ -113,6 +116,34 @@ func (r *Registry) Start(redisURL string) {
 		Metadata:    meta,
 	}
 	r.mu.Unlock()
+}
+
+// appendCapabilityManifest advertises the #300 capability manifest in the
+// registry metadata: console's capability gate (plaita server/capability.py
+// manifest_from_metadata) collects pool manifests from registry entries and
+// fails open for any pool that has none — pre-#82 the go pool had none, so
+// publish/start gates never fired for it. The manifest rides as a nested
+// object (its json tags match console MANIFEST_KEYS verbatim, engine maps to
+// the "go" runtime pool); Flush rewrites the whole ServiceInfo every
+// heartbeat, so no separate renewal is needed.
+//
+// Degradation stance: manifest construction is a pure function over the
+// in-memory accept-list and serialization cannot fail in practice; if it
+// ever does, the entry omits capability_manifest entirely (console treats it
+// as no-manifest and the gate fails open) and the omission is named here —
+// WARNING marker PLAITA_CAPABILITY_MANIFEST_UNAVAILABLE — rather than
+// silently shipping an empty list. An empty-but-present manifest is never
+// written: that shape would still fail the console five-key gate while
+// looking healthy to casual readers.
+func (r *Registry) appendCapabilityManifest(meta map[string]any) {
+	manifest := ir.CapabilityManifest()
+	if _, err := json.Marshal(manifest); err != nil {
+		r.logger.Warn("capability manifest unavailable; registry entry will omit capability_manifest (console capability gate fails open for this pool)",
+			"marker", "PLAITA_CAPABILITY_MANIFEST_UNAVAILABLE", "error", err)
+		return
+	}
+	meta["engine"] = ir.EngineName
+	meta["capability_manifest"] = manifest
 }
 
 // maskURL rebuilds the URL with the password replaced (flow_worker.py:416-449

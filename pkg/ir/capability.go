@@ -28,6 +28,11 @@ import "sort"
 // 转正、calculate/ignore 确认拒载；同日 phase 1 为初始 "2026-10-22"）。
 const ContractVersion = "2026-10-22.3"
 
+// EngineName is the manifest engine identifier（console ENGINE_TO_RUNTIME 把
+// 它映射到 go runtime 池；写错/漂移会让清单被 console 判为无效条目、能力门
+// 退回 fail-open——单一来源，registry metadata 的 engine 键同用本常量）。
+const EngineName = "plaita-go"
+
 // supportedFeatures names the engine-level capabilities the manifest
 // advertises (plaita#300 example set). Sorted.
 var supportedFeatures = []string{"checkpoint", "hitl_await", "suspend"}
@@ -92,7 +97,7 @@ type Capability struct {
 // registry wiring) must observe the current state.
 func CapabilityManifest() Capability {
 	return Capability{
-		Engine:               "plaita-go",
+		Engine:               EngineName,
 		IRContractVersion:    ContractVersion,
 		SupportedNodeTypes:   SupportedNodeTypes(),
 		UnsupportedNodeTypes: UnsupportedNodeTypes(),
