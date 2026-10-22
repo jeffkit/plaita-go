@@ -215,6 +215,36 @@ type Config struct {
 	// An engine-level flow timeout (flow.timeout) composes as the stricter of
 	// the two: whichever deadline fires first ends the execution.
 	ExecutionDeadline time.Duration
+
+	// ConsoleFlowSourceURL: PLAITA_CONSOLE_FLOW_SOURCE_URL (e.g.
+	// http://console.internal:8080) — enables the #299 §2 read-through: a
+	// Redis flow-definition miss is fetched from the console admin API
+	// (GET /api/flows/{flow_id}/versions/{version}) before failing
+	// ErrFlowNotFound. Empty (default) = feature off, miss semantics unchanged.
+	ConsoleFlowSourceURL string
+	// ConsoleFlowSourceAPIKey: PLAITA_CONSOLE_FLOW_SOURCE_API_KEY — sent as
+	// X-Admin-API-Key (console PLAITA_CONSOLE_ADMIN_API_KEY). Empty means no
+	// auth header (only viable against a local dev console with
+	// PLAITA_CONSOLE_ALLOW_INSECURE_ADMIN).
+	ConsoleFlowSourceAPIKey string
+	// ConsoleFlowSourceTimeout: per-request cap
+	// (PLAITA_CONSOLE_FLOW_SOURCE_TIMEOUT_SECONDS, default 5s).
+	ConsoleFlowSourceTimeout time.Duration
+	// ConsoleFlowSourceNegativeTTL: negative-cache window for a deterministic
+	// console miss (PLAITA_CONSOLE_FLOW_SOURCE_NEGATIVE_TTL_SECONDS, default
+	// 30s) — repeated misses inside the window fail without re-hitting the
+	// console. Transient failures are never negative-cached.
+	ConsoleFlowSourceNegativeTTL time.Duration
+	// ConsoleFlowSourceAttempts: read-through attempt cap for TRANSIENT
+	// failures (PLAITA_CONSOLE_FLOW_SOURCE_ATTEMPTS, default 2; 1 = no retry),
+	// with a fixed 250ms pause between attempts.
+	ConsoleFlowSourceAttempts int
+	// ConsoleFlowSourceWriteBack: PLAITA_CONSOLE_FLOW_SOURCE_WRITEBACK=1 —
+	// write a pulled definition back into the engine storage shape so peers
+	// stop missing too. OFF by default: the pull-through stays read-only with
+	// respect to #303's「删除后目标侧不复活」 purge semantics; enabling it is
+	// an explicit deployment decision.
+	ConsoleFlowSourceWriteBack bool
 }
 
 // DefaultConfig returns the protocol-default configuration for the current
@@ -257,6 +287,13 @@ func configFromEnv(getenv func(string) string) *Config {
 		DisableTenantQuota:      getenv("PLAITA_DISABLE_TENANT_QUOTA") == "1",
 
 		ExecutionDeadline: envSecondsDuration(getenv, ExecutionDeadlineEnv, DefaultExecutionDeadline),
+
+		ConsoleFlowSourceURL:         getenv("PLAITA_CONSOLE_FLOW_SOURCE_URL"),
+		ConsoleFlowSourceAPIKey:      getenv("PLAITA_CONSOLE_FLOW_SOURCE_API_KEY"),
+		ConsoleFlowSourceTimeout:     time.Duration(envInt(getenv, "PLAITA_CONSOLE_FLOW_SOURCE_TIMEOUT_SECONDS", 5)) * time.Second,
+		ConsoleFlowSourceNegativeTTL: time.Duration(envInt(getenv, "PLAITA_CONSOLE_FLOW_SOURCE_NEGATIVE_TTL_SECONDS", 30)) * time.Second,
+		ConsoleFlowSourceAttempts:    envInt(getenv, "PLAITA_CONSOLE_FLOW_SOURCE_ATTEMPTS", 2),
+		ConsoleFlowSourceWriteBack:   getenv("PLAITA_CONSOLE_FLOW_SOURCE_WRITEBACK") == "1",
 	}
 	cfg.normalize()
 	return cfg
@@ -367,6 +404,18 @@ func (c *Config) normalize() {
 	// unlimited").
 	if c.ExecutionDeadline == 0 {
 		c.ExecutionDeadline = DefaultExecutionDeadline
+	}
+	// Console read-through (#299 §2): URL empty keeps the whole feature off —
+	// the remaining knobs only normalize their floors so a partial config
+	// cannot produce a zero timeout / non-retrying client by accident.
+	if c.ConsoleFlowSourceTimeout <= 0 {
+		c.ConsoleFlowSourceTimeout = 5 * time.Second
+	}
+	if c.ConsoleFlowSourceNegativeTTL <= 0 {
+		c.ConsoleFlowSourceNegativeTTL = 30 * time.Second
+	}
+	if c.ConsoleFlowSourceAttempts <= 0 {
+		c.ConsoleFlowSourceAttempts = 2
 	}
 }
 
