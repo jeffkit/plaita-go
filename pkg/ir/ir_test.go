@@ -202,6 +202,24 @@ func TestLoadRejects(t *testing.T) {
 			doc:  `{"nodes":[{"type":"start","id":"s","next":"c"},{"type":"child","id":"c","childFlow":{"nodes":[{"type":"start","id":"start","next":"a"},{"type":"assignment","id":"a"}]}}]}`,
 			want: "never reaches an end",
 		},
+		{
+			// A1 r132 card G-3: Python's loader takes a mistyped branches
+			// (pydantic lax + #128 warnings only); the typed unmarshal into
+			// []*nodes.Branch refuses here. Mirrored on the go-vs-rust axis
+			// by the plaita-rs diffcheck load/branches-str case.
+			name: "switch branches mistyped string",
+			doc:  `{"flow_id":"probe","nodes":[{"id":"s","type":"start","next":"sw"},{"id":"sw","type":"switch","next":"e","branches":"oops"},{"id":"e","type":"end"}]}`,
+			want: "cannot unmarshal string into Go struct field Workflow.nodes.branches",
+		},
+		{
+			// A1 r132 card G-3: a non-string next slips past unmarshal but
+			// forms no edge, so the reachability gate refuses — Python loads
+			// the same shape and fails at run with a named NodeNotFoundError.
+			// Mirrored by the plaita-rs diffcheck load/next-int case.
+			name: "next mistyped int",
+			doc:  `{"flow_id":"probe","nodes":[{"id":"s","type":"start","next":123},{"id":"e","type":"end"}]}`,
+			want: "not reachable from start",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
