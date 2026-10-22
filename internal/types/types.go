@@ -17,6 +17,8 @@ const (
 	NodeTypeLoop       NodeType = "loop"
 	NodeTypeParallel   NodeType = "parallel"
 	NodeTypeSwitch     NodeType = "switch"
+	NodeTypeCase       NodeType = "case"
+	NodeTypeMock       NodeType = "mock"
 	NodeTypeReference  NodeType = "reference"
 	NodeTypeHTTP       NodeType = "http"
 	NodeTypeCode       NodeType = "code"

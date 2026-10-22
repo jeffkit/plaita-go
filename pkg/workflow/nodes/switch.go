@@ -16,6 +16,14 @@ func init() {
 		types.NodeTypeSwitch,
 		func(ctx context.Context) workflow.Node { return new(Switch) },
 	)
+	// "case"（plaita SwitchLegacy 等值匹配方言）与 switch 同一执行面：IR 归一化
+	// 层把 case 脱糖成本类型（pkg/ir translateCase，Python 在模型校验期做同一
+	// 件事）；这里按同工厂注册，保持 capability manifest「支持类型必有注册工厂」
+	// 的不变量。
+	workflow.RegisterNodeType(
+		types.NodeTypeCase,
+		func(ctx context.Context) workflow.Node { return new(Switch) },
+	)
 }
 
 // Switch node is used to route the execution of the flow based on the condition.

@@ -143,9 +143,11 @@ func TestLoadRejects(t *testing.T) {
 		want string
 	}{
 		{
+			// mock 随 #80 phase 2 转正；未注册类型负控换 calculate（r78 实测
+			// plaita 运行时同样拒载：unRecognized node type）。
 			name: "unsupported known type",
-			doc:  `{"nodes":[{"type":"start","id":"s","next":"d"},{"type":"mock","id":"d"}]}`,
-			want: "mock",
+			doc:  `{"nodes":[{"type":"start","id":"s","next":"d"},{"type":"calculate","id":"d","expression":{}}]}`,
+			want: "calculate",
 		},
 		{
 			name: "unknown type",

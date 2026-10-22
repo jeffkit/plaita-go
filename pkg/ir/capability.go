@@ -23,7 +23,9 @@ import "sort"
 // ContractVersion is the IR capability contract version carried in the
 // manifest (plaita#300: ir_contract_version). Bump when the accept-list or
 // normalization semantics change shape in a way consumers must notice.
-const ContractVersion = "2026-10-22"
+// 2026-10-22.2 = #80 phase 2（r78）：case/mock/reference 转正、calculate/
+// ignore 确认拒载（同日 phase 1 为 .1 的初始 "2026-10-22"）。
+const ContractVersion = "2026-10-22.2"
 
 // supportedFeatures names the engine-level capabilities the manifest
 // advertises (plaita#300 example set). Sorted.

@@ -46,8 +46,11 @@ func TestSupportedTypesAreRegistered(t *testing.T) {
 	}
 }
 
-// #80 phase 1 负控：五个集合/循环节点必须在 supported 清单里、且不在
-// unsupported 里（pre-fix 基线它们在 knownUnsupported，此处双红）。
+// #80 负控：phase 1 集合/循环五节点与 phase 2 的 case/mock/reference 都必须
+// 在 supported 清单里、且不在 unsupported 里（pre-fix 基线它们在
+// knownUnsupported，此处红）。calculate/ignore 不是 plaita 注册节点类型
+// （r78 实测：Flow.model_validate 报 unRecognized node type）——capability
+// 如实标注 python 侧同样拒载，留痕见 issue #80。
 func TestCapabilityIncludesCollectionNodes(t *testing.T) {
 	cap := CapabilityManifest()
 	supported := map[string]bool{}
@@ -58,12 +61,12 @@ func TestCapabilityIncludesCollectionNodes(t *testing.T) {
 	for _, t2 := range cap.UnsupportedNodeTypes {
 		unsupported[t2] = true
 	}
-	for _, t2 := range []string{"map", "filter", "find", "reduce", "while"} {
+	for _, t2 := range []string{"map", "filter", "find", "reduce", "while", "case", "mock", "reference"} {
 		assert.True(t, supported[t2], "%q must be in supported_node_types", t2)
 		assert.False(t, unsupported[t2], "%q must not be in unsupported_node_types", t2)
 	}
-	// phase 2 余量仍在 unsupported（拒绝提示不丢）
-	for _, t2 := range []string{"case", "calculate", "mock", "reference"} {
+	// 未注册类型与前身引擎遗产留在 unsupported（拒绝提示不丢）。
+	for _, t2 := range []string{"calculate", "ignore", "sleep", "trpc"} {
 		assert.Contains(t, cap.UnsupportedNodeTypes, t2)
 	}
 }

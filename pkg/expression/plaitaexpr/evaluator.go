@@ -324,6 +324,31 @@ func isBuiltinStatementSource(source parser.ValueSource) bool {
 	return false
 }
 
+// isKnownRootSource reports whether source names one of the expression
+// grammar's root identifiers (the evalVariable switch). A bare identifier is
+// not one — it addresses the variable/parameter context.
+func isKnownRootSource(source parser.ValueSource) bool {
+	switch source {
+	case parser.ValueSourceInput, parser.ValueSourceNode, parser.ValueSourceParent,
+		parser.ValueSourceERROR, parser.ValueSourceENV, parser.ValueSourceGlobal,
+		parser.ValueSourceBranch, parser.ValueSourceFlowID, parser.ValueSourceFlow,
+		parser.ValueSourceLastNode, parser.ValueSourceExecutionID,
+		parser.ValueNULL, parser.ValueEmptyString:
+		return true
+	}
+	return false
+}
+
+// firstVariableSource returns the source of the expression's first variable
+// (empty when the expression names no variable).
+func firstVariableSource(expr parser.Expr) parser.ValueSource {
+	vars := expr.Variables()
+	if len(vars) == 0 {
+		return ""
+	}
+	return vars[0].Source
+}
+
 // replaceStatementVariable replaces every boundary-safe occurrence of the
 // dotted variable path with the synthetic identifier.
 func replaceStatementVariable(statement, from, to string) string {
@@ -375,9 +400,28 @@ func (e *Evaluator) evalVariable(
 		}
 		return model.NewValue(val), nil
 	case parser.ValueSourceParent:
-		newExpr, err := parser.NewVariableExpr(variable.WithoutSourceVariable)
+		rest := variable.WithoutSourceVariable
+		newExpr, err := parser.NewVariableExpr(rest)
 		if err != nil {
 			return model.Value{}, fmt.Errorf("failed to create new variable expression: %w", err)
+		}
+		// $PARENT.<bare-path> is a field read on the parent snapshot object:
+		// plaita's _get_attr yields None for a missing mapping key (r78
+		// probes: sub-flows read $PARENT.<x> as null, never KeyError), so the
+		// bare-field form resolves against the parent's variable context with
+		// field-miss→nil semantics instead of the rewrite's root-miss error.
+		// $-rooted remainders ($PARENT.$INPUT.x) keep the rewrite — their own
+		// root already implements nil-on-field-miss.
+		if rest != "" && !isKnownRootSource(firstVariableSource(newExpr)) {
+			parentRC := runtime.WorkflowRuntimeContext(runtimeCtx.ParentWorkflowContext)
+			execArgs := make(map[string]any)
+			deepCopy(parentRC.GetCurrentNodeContexts(), &execArgs)
+			deepCopy(parameters, &execArgs)
+			val, err := lookupPathPlaita(execArgs, rest, false)
+			if err != nil {
+				return model.Value{}, fmt.Errorf("failed to lookup parent var %q: %w", variable.Variable, err)
+			}
+			return model.NewValue(val), nil
 		}
 		return e.evalVariable(runtimeCtx.ParentWorkflowContext, newExpr, parameters)
 	case parser.ValueSourceERROR:
