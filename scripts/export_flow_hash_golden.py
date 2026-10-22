@@ -78,13 +78,23 @@ ISSUE_ANCHOR_HASHES = {
 def cases() -> list[dict]:
     out = []
 
-    def add(name: str, raw: str, *, expect_error: bool = False, go_rejects: bool = False) -> None:
+    def add(
+        name: str,
+        raw: str,
+        *,
+        expect_error: bool = False,
+        go_rejects: bool = False,
+        export_when_py_rejects: bool = False,
+        py_hash_rejects: bool = False,
+    ) -> None:
         out.append(
             {
                 "name": name,
                 "raw": raw,
                 "expect_error": expect_error,
                 "go_rejects": go_rejects,
+                "export_when_py_rejects": export_when_py_rejects,
+                "py_hash_rejects": py_hash_rejects,
             }
         )
 
@@ -175,6 +185,77 @@ def cases() -> list[dict]:
     add("goerr_nan_literal", '{"flow_id":"demo","n":NaN}', go_rejects=True)
     add("goerr_infinity_literal", '{"flow_id":"demo","n":Infinity}', go_rejects=True)
 
+    # ---- A1 r132 card G-3: cross-engine load/execute expansion (green) ----
+    # Corpus mirrors the plaita-rs tools/diffcheck load/* cases (card R-3);
+    # probes from A1 r130-r131 (/tmp/a1r130/flows). neg-infinity completes
+    # card G-2 (T8).
+    #
+    # LAYER NOTE: branches-str / next-int are NOT here — the hash layer
+    # legitimately accepts any valid JSON document; Go refuses those two at
+    # the ir.Load layer (typed unmarshal / reachability gate), pinned by
+    # TestLoadRejects in pkg/ir/ir_test.go. diffcheck (card R-3) pins the
+    # same two facts on the go-vs-rust axis.
+    add(
+        "goerr_neg_infinity_literal",
+        '{"flow_id":"probe","nodes":[{"id":"s","type":"start","next":"e",'
+        '"output":{"a":-Infinity}},{"id":"e","type":"end"}]}',
+        go_rejects=True,
+    )
+    add(
+        "struct_depth_100_nested",
+        '{"flow_id":"probe","nodes":[{"id":"s","type":"start","next":"e","output":'
+        + "[" * 100 + "]" * 100 + '},{"id":"e","type":"end"}]}',
+    )
+    # depth 10000: Python's json.loads itself dies with RecursionError at this
+    # depth (its ~9998 boundary is environment-sensitive — A1 owner-call O3),
+    # so no canonical/hash exists to record. export_when_py_rejects still
+    # writes the case as a Go-side rejection pin. The 150-deep variant stays
+    # OUT of the golden on purpose: Go accepts / Rust rejects at 128 — a
+    # permanent cross-engine divergence (plaita-rs AGENTS.md), never a case.
+    add(
+        "err_depth_10000",
+        '{"flow_id":"probe","nodes":[{"id":"s","type":"start","next":"e","output":'
+        + "[" * 10000 + "]" * 10000 + '},{"id":"e","type":"end"}]}',
+        expect_error=True,
+        go_rejects=True,
+        export_when_py_rejects=True,
+    )
+
+    # ---- A1 r132 card G-1: lone-surrogate decode rejection (mixed-fleet
+    # tear, Go half; pairs with plaita card A-1's publish gate) ------------
+    # Python json.loads accepts \udXXX escapes into a str holding lone
+    # surrogates, but compute_flow_definition_hash refuses the definition at
+    # .encode("utf-8") (flow_worker.py:941-945 — A129-01 poison pill,
+    # A129-03 fingerprint collapse). Go's decoder folds them to U+FFFD and
+    # would hash a definition Python can never hash. These pins demand Go
+    # reject at the decode layer; red until the G-1 fix, green after.
+    add(
+        "goerr_lone_surrogate_high",
+        '{"flow_id":"probe","nodes":[{"id":"s","type":"start","next":"e",'
+        '"name":"a\\ud800b"},{"id":"e","type":"end"}]}',
+        go_rejects=True,
+        py_hash_rejects=True,
+    )
+    add(
+        "goerr_lone_surrogate_low",
+        '{"flow_id":"probe","nodes":[{"id":"s","type":"start","next":"e",'
+        '"name":"a\\udc00b"},{"id":"e","type":"end"}]}',
+        go_rejects=True,
+        py_hash_rejects=True,
+    )
+    # Positive controls for the same gate: paired escapes are real non-BMP
+    # characters (canonical emits raw UTF-8) and a literal U+FFFD escape is
+    # an ordinary code point — both must stay accepted on both engines.
+    add(
+        "struct_paired_surrogate_escape",
+        '{"flow_id":"probe","nodes":[{"id":"s","type":"start","next":"e",'
+        '"name":"a\\ud83d\\ude00b"},{"id":"e","type":"end"}]}',
+    )
+    add(
+        "u_fffd_escape",
+        '{"flow_id":"demo","u":"a\\ufffdb"}',
+    )
+
     # ---- e2e mixed-fleet definition (must stay loadable by ir.Load) -------
     # The definition deliberately carries #60 divergence content: '&' and
     # '<>' in a string plus an exponent-form numeric literal — exactly the
@@ -228,6 +309,19 @@ def main() -> int:
             doc = json.loads(raw)
         except Exception:
             if case["expect_error"]:
+                if case["export_when_py_rejects"]:
+                    # Python's own loader refuses the document (no
+                    # canonical/hash exists) — still record the case as a
+                    # Go-side rejection pin.
+                    exported.append(
+                        {
+                            "name": case["name"],
+                            "raw": raw,
+                            "python_canonical": "",
+                            "python_hash": "",
+                            "go_rejects": True,
+                        }
+                    )
                 continue
             print(f"FAIL: {case['name']}: raw does not parse: {raw!r}", file=sys.stderr)
             return 2
@@ -237,6 +331,31 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
+        if case["py_hash_rejects"]:
+            # loads accepts (lone surrogates are valid str content) but the
+            # hash chain refuses at .encode("utf-8") — no canonical/hash
+            # exists; record the case as a Go-side rejection pin only.
+            try:
+                compute_flow_definition_hash(doc)
+            except Exception:
+                pass
+            else:
+                print(
+                    f"FAIL: {case['name']}: expected hash-chain rejection "
+                    f"(unencodable lone surrogate) but Python hashed it",
+                    file=sys.stderr,
+                )
+                return 2
+            exported.append(
+                {
+                    "name": case["name"],
+                    "raw": raw,
+                    "python_canonical": "",
+                    "python_hash": "",
+                    "go_rejects": True,
+                }
+            )
+            continue
         canonical = canonical_flow_definition_json(doc)
         digest = compute_flow_definition_hash(doc)
         anchor = ISSUE_ANCHOR_HASHES.get(case["name"])

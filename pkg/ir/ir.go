@@ -174,6 +174,12 @@ func load(data []byte, res *flowResolver) (*workflow.Workflow, error) {
 	if err := dec.Decode(&doc); err != nil {
 		return nil, fmt.Errorf("ir: parse flow json: %w", err)
 	}
+	// The decoder folds lone surrogate escapes to U+FFFD; the Python
+	// authority refuses such definitions at its hash's .encode("utf-8").
+	// Reject by name so no pool runs what the fleet cannot fingerprint.
+	if err := RejectLoneSurrogateEscapes(data); err != nil {
+		return nil, fmt.Errorf("ir: parse flow json: %w", err)
+	}
 	if err := normalizeDoc(doc, scopeRoot, res); err != nil {
 		return nil, err
 	}
