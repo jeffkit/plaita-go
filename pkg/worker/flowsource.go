@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -43,17 +44,34 @@ type FlowDefinition struct {
 // TTL cache (§1.2: 100 entries / 300s) and the v2 fingerprint algorithm
 // (§7: sha256 over the ORIGINAL definition JSON, sorted keys, compact
 // separators, before model_validate).
+//
+// #299 §2: with a console flow source configured (Config.ConsoleFlowSourceURL)
+// a Redis miss reads through to the console admin API before declaring
+// ErrFlowNotFound — cross-Redis deployments ride out the outbox delivery
+// window instead of failing (console_flowsource.go). A deterministic console
+// miss is negative-cached for Config.ConsoleFlowSourceNegativeTTL.
 type FlowSource struct {
-	client *redis.Client
-	cfg    *Config
-	logger Logger
+	client  *redis.Client
+	cfg     *Config
+	logger  Logger
+	console *consoleFlowSource
 
-	mu    sync.Mutex
-	cache map[string]FlowDefinition
+	mu       sync.Mutex
+	cache    map[string]FlowDefinition
+	negative map[string]time.Time
 }
 
+// latestVersion is the empty-version sentinel: engine storage tracks it as a
+// literal member of the versions set (storage/redis.py:764-782). On the
+// console side the sentinel resolves to the newest published version (#299).
+const latestVersion = "latest"
+
 func NewFlowSource(client *redis.Client, cfg *Config, logger Logger) *FlowSource {
-	return &FlowSource{client: client, cfg: cfg, logger: logger, cache: make(map[string]FlowDefinition)}
+	fs := &FlowSource{client: client, cfg: cfg, logger: logger, cache: make(map[string]FlowDefinition)}
+	if cfg.ConsoleFlowSourceURL != "" {
+		fs.console = newConsoleFlowSource(cfg)
+	}
+	return fs
 }
 
 func (s *FlowSource) flowKey(tenantID, flowID, version string) string {
@@ -65,8 +83,9 @@ func (s *FlowSource) versionsKey(tenantID, flowID string) string {
 }
 
 // GetFlowDefinition resolves flow_id(+version?) to a loaded workflow.
-// ErrFlowNotFound (deterministic) when the definition key does not exist;
-// ErrFlowLoad (transient) on read or IR-load failure.
+// ErrFlowNotFound (deterministic) when the definition does not exist in engine
+// storage nor on the console (or no console flow source is configured);
+// ErrFlowLoad (transient) on read, console-outage or IR-load failure.
 func (s *FlowSource) GetFlowDefinition(ctx context.Context, tenantID, flowID, version string) (*FlowDefinition, error) {
 	cacheKey := s.cfg.Namespace(tenantID) + ":" + flowID + ":" + version
 	if def, ok := s.cacheGet(cacheKey); ok {
@@ -79,7 +98,9 @@ func (s *FlowSource) GetFlowDefinition(ctx context.Context, tenantID, flowID, ve
 	}
 	raw, err := s.client.Get(ctx, s.flowKey(tenantID, flowID, resolvedVersion)).Bytes()
 	if err == redis.Nil {
-		return nil, fmt.Errorf("%w: flow %s version %s", ErrFlowNotFound, flowID, resolvedVersion)
+		// #299 §2: before declaring not-found, read through to the console
+		// (a no-op when no console flow source is configured).
+		return s.pullThrough(ctx, tenantID, flowID, resolvedVersion, cacheKey)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrFlowLoad, err)
@@ -120,10 +141,10 @@ func (s *FlowSource) resolveVersion(ctx context.Context, tenantID, flowID, versi
 		return "", fmt.Errorf("%w: versions set: %v", ErrFlowLoad, err)
 	}
 	if len(versions) == 0 {
-		return "latest", nil
+		return latestVersion, nil
 	}
-	if contains(versions, "latest") {
-		return "latest", nil
+	if contains(versions, latestVersion) {
+		return latestVersion, nil
 	}
 	sort.Slice(versions, func(i, j int) bool {
 		return numericVersionLess(versions[i], versions[j])
@@ -212,4 +233,127 @@ func (s *FlowSource) PresetFlowDefinition(ctx context.Context, tenantID, flowID,
 	pipe.SAdd(ctx, s.versionsKey(tenantID, flowID), version)
 	_, err := pipe.Exec(ctx)
 	return err
+}
+
+// pullThrough is the #299 §2 read-through: the engine storage key is missing,
+// so fetch the published definition from the console admin API. With no
+// console flow source configured this is exactly the pre-#299 miss behavior
+// (deterministic ErrFlowNotFound).
+func (s *FlowSource) pullThrough(ctx context.Context, tenantID, flowID, version, cacheKey string) (*FlowDefinition, error) {
+	if s.console == nil {
+		return nil, fmt.Errorf("%w: flow %s version %s", ErrFlowNotFound, flowID, version)
+	}
+	if s.negativeGet(cacheKey) {
+		return nil, fmt.Errorf("%w: flow %s version %s (console lookup negative-cached)", ErrFlowNotFound, flowID, version)
+	}
+
+	tenant := s.consoleTenant(tenantID)
+	concrete := version
+	if concrete == latestVersion {
+		lv, err := s.console.latestPublished(ctx, tenant, flowID)
+		if err != nil {
+			return nil, s.pullThroughErr(cacheKey, flowID, version, err)
+		}
+		concrete = lv
+	}
+
+	detail, err := s.console.versionDetail(ctx, tenant, flowID, concrete)
+	if err != nil {
+		return nil, s.pullThroughErr(cacheKey, flowID, concrete, err)
+	}
+	if detail.Status != "published" {
+		s.negativePut(cacheKey)
+		return nil, fmt.Errorf("%w: flow %s version %s not published on console (status %q)",
+			ErrFlowNotFound, flowID, concrete, detail.Status)
+	}
+
+	raw, err := engineFlowPayload(flowID, concrete, detail.Definition)
+	if err != nil {
+		// Deterministic (#304 口径): a published-but-corrupt definition can
+		// never succeed on redelivery — terminalize instead of burning the
+		// delivery budget.
+		s.negativePut(cacheKey)
+		return nil, fmt.Errorf("%w: console flow %s:%s definition unparsable: %v", ErrFlowNotFound, flowID, concrete, err)
+	}
+	hash, err := FlowDefinitionHash(raw)
+	if err != nil {
+		s.negativePut(cacheKey)
+		return nil, fmt.Errorf("%w: console flow %s:%s fingerprint: %v", ErrFlowNotFound, flowID, concrete, err)
+	}
+	wf, err := ir.Load(raw)
+	if err != nil {
+		// The IR loader is fail-closed: an unloadable flow is a permanent,
+		// deterministic failure for this engine build (same as the Redis path).
+		s.negativePut(cacheKey)
+		return nil, fmt.Errorf("%w: flow %s:%s not loadable: %v", ErrFlowNotFound, flowID, concrete, err)
+	}
+
+	def := &FlowDefinition{
+		FlowID:   flowID,
+		Version:  concrete,
+		Raw:      raw,
+		Hash:     hash,
+		HashAlgo: FlowHashAlgoV2,
+		Workflow: wf,
+	}
+	if s.cfg.ConsoleFlowSourceWriteBack {
+		// Optional self-heal (#299 §2 可选回写): write the pulled definition
+		// into the engine storage shape so peers in the same Redis stop
+		// missing too. Best-effort — the run is already resolved; a failed
+		// write-back must not fail it. Off by default: an explicit opt-in
+		// keeps the pull-through read-only with respect to #303's
+		// 「删除后目标侧不复活」 purge semantics.
+		if err := s.PresetFlowDefinition(ctx, tenantID, flowID, concrete, raw); err != nil {
+			s.logger.Warn("console flow source: write-back failed",
+				"flow_id", flowID, "version", concrete, "error", err)
+		}
+	}
+	s.cachePut(cacheKey, *def)
+	return def, nil
+}
+
+// pullThroughErr maps a console client error onto the worker error taxonomy:
+// not-found → deterministic ErrFlowNotFound (+ negative cache); anything
+// transient → ErrFlowLoad with NO negative cache (the outbox may deliver the
+// definition any moment).
+func (s *FlowSource) pullThroughErr(cacheKey, flowID, version string, err error) error {
+	if errors.Is(err, errConsoleNotFound) {
+		s.negativePut(cacheKey)
+		return fmt.Errorf("%w: flow %s version %s (console: does not exist)", ErrFlowNotFound, flowID, version)
+	}
+	return fmt.Errorf("%w: console flow source: %v", ErrFlowLoad, err)
+}
+
+// consoleTenant maps the task tenant onto the X-Tenant-ID header value: the
+// unpartitioned/default tenant is spelled explicitly for the console (its
+// X-Tenant-ID must reference a real tenant row), mirroring cfg.Namespace's
+// default routing.
+func (s *FlowSource) consoleTenant(tenantID string) string {
+	if tenantID == "" || tenantID == s.cfg.DefaultTenantID {
+		return s.cfg.DefaultTenantID
+	}
+	return tenantID
+}
+
+func (s *FlowSource) negativeGet(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ts, ok := s.negative[key]
+	if !ok {
+		return false
+	}
+	if time.Since(ts) > s.cfg.ConsoleFlowSourceNegativeTTL {
+		delete(s.negative, key)
+		return false
+	}
+	return true
+}
+
+func (s *FlowSource) negativePut(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.negative == nil {
+		s.negative = make(map[string]time.Time)
+	}
+	s.negative[key] = time.Now()
 }

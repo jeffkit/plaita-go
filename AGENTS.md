@@ -170,6 +170,16 @@ plaita 侧权威语义：`plaita/core/deadline.py` + `core/strategies.py`（#267
 - **算法标记改名**：`FlowHashAlgoV2` = `flow-definition-json-sortkeys-v2-go`（Go 戳记）。语义与 Python 逐字节等价后共享标记本可成立，但「同名不同实现」正是 `upgrade_suspected` 恒 false 的根因（r120 增量②）；改名后：旧 Go 行（旧标记+错 hash）→ `upgrade_suspected=true` 可解释分支（运维放行 = 载体 `allow_flow_hash_change=true`）；Python 行（v2 标记+同 hash）→ hash 相等直接过门，下次落盘自然 refresh 标记。**ir_contract_version 不参与判定**（manifest 演进漂移、Python 无同形字段、算法身份已由标记承载——结论入 `docs/WORKER_PROTOCOL.md` §7 与 config.go 注释）。resume 硬门判据本身未动（issue 边界）。
 - **混编端到端负控（先红后绿，stash 基线实测）**：`flow_hash_e2e_test.go` 三件——`TestMixedFleetResumeWithPythonHash`（Python 指纹写入共享 state 行 → Go resume 照跑；pre-fix 红，签名与 issue 实测一致：stored≠current、同标签、upgrade_suspected:false、`flow_hash_mismatch`）+ `TestMixedFleetResumeStillRejectsRealChange`（真变更仍拒，门未放宽）+ `TestMixedFleetLegacyGoRowExplainsUpgrade`（旧 Go 行升级嫌疑置真）。e2e 流定义内嵌分歧内容（`&`/`<>` 字符串 + 指数字面量），ir.Load 可载。
 
+## FlowSource console 读穿透（#299 §2，2026-10-22，分支 fix/issue299-readthrough）
+
+跨 Redis 部署（console 的 durable publish outbox 已在 plaita 2f1be94 落地）的最终一致窗口里，engine storage 缺 `{ns}:flow:{fid}:{ver}` 键。配置 `PLAITA_CONSOLE_FLOW_SOURCE_URL` 后，FlowSource 在 Redis miss 时回源 console 管理面 `GET /api/flows/{flow_id}/versions/{version}`（`console_flowsource.go`），失败才回到 `ErrFlowNotFound`。
+
+- **鉴权/租户**：`X-Admin-API-Key`（= console `PLAITA_CONSOLE_ADMIN_API_KEY`，env `PLAITA_CONSOLE_FLOW_SOURCE_API_KEY`）+ `X-Tenant-ID`（API-key 是平台身份、console 按头选租户；空/default 租户显式拼 default）。不走 HMAC 契约端点——`/api/flowVersion/semver/detail` 的租户归属由密钥决定、无租户头，不适合 worker 按消息租户回源。
+- **载荷口径**：拉到的定义经 `engineFlowPayload` 注入 `flow_id`/`version`（= outbox `engine_payload` / `sync_flow_to_engine` 的落盘工件形态），canonical 字节喂 `FlowDefinitionHash` 与 `ir.Load`——指纹与 outbox 登记的 `definition_hash` 同口径。空 version 的 `latest` 哨兵在 console 侧解析为**最新 published 版本**（`GET /api/flows/{id}` versions 清单，draft 跳过）。
+- **错误分类（对齐 #304 + errors.go 二分）**：console 404 / 无 published / 版本未发布 / 定义损坏 / ir.Load 拒载 → `ErrFlowNotFound`（确定性：终态错误 + 负缓存 `PLAITA_CONSOLE_FLOW_SOURCE_NEGATIVE_TTL_SECONDS` 默认 30s）；网络/超时/5xx/其余 4xx → `ErrFlowLoad`（瞬态：**绝不负缓存**、不 ack 等重投，经 MaxDeliveries→DLQ 收敛——不可达不得伪造成不存在，也不炸消费循环）。每请求超时 `PLAITA_CONSOLE_FLOW_SOURCE_TIMEOUT_SECONDS` 默认 5s；瞬态重试 `PLAITA_CONSOLE_FLOW_SOURCE_ATTEMPTS` 默认 2（间隔 250ms）。
+- **回写**：`PLAITA_CONSOLE_FLOW_SOURCE_WRITEBACK=1` 才把拉到的定义按 Preset 形态回写引擎 Redis（fleet 自愈）；**默认关**——保持对 #303「删除后目标侧不复活」purge 语义只读。
+- **负控**：`console_flowsource_test.go` 八件（miss→拉取成功+回写自洽/404 具名+负缓存/不可达瞬态非 NotFound/瞬态重试后成功/既有命中零回归〔console 零调用〕/latest 解析+租户头透传/draft 拒载/payload 注入与数字字面量保真）。pre 基线编译级红（新符号无接受面）。
+
 ## 常用命令
 
 ```bash
