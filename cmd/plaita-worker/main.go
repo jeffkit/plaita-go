@@ -98,12 +98,21 @@ func main() {
 		return
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	os.Exit(runWorker(context.Background(), cfg, w, logger))
+}
+
+// runWorker drives the consume loop until Run returns or a signal arrives,
+// and returns the process exit code (#75): non-zero when Run itself failed
+// (a startup failure must not masquerade as a clean shutdown), 0 on clean
+// drain / cancellation.
+func runWorker(ctx context.Context, cfg *worker.Config, w *worker.Worker, logger *slog.Logger) int {
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	done := make(chan struct{})
+	// D3: the signal handler only *requests* drain — in-flight work is never
+	// severed at an arbitrary instruction boundary.
+	runDone := make(chan error, 1)
 	go func() {
-		defer close(done)
 		logger.Info("plaita-worker running",
 			"queue", cfg.QueueName,
 			"group", cfg.ConsumerGroup,
@@ -111,19 +120,22 @@ func main() {
 			"key_prefix", cfg.KeyPrefix,
 			"drain_timeout", cfg.DrainTimeout,
 		)
-		if err := w.Run(ctx); err != nil {
-			logger.Error("worker exited with error", "error", err)
-		}
+		runDone <- w.Run(ctx)
 	}()
 
-	// D3: the signal handler only *requests* drain — in-flight work is never
-	// severed at an arbitrary instruction boundary.
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	sig := <-sigCh
-	logger.Info("shutdown signal received, entering drain (stop taking new tasks)",
-		"signal", sig.String(), "drain_timeout", cfg.DrainTimeout)
-	w.RequestDrain("signal:" + sig.String())
+	select {
+	case err := <-runDone:
+		// Run only returns nil on ctx cancellation or drain completion; a
+		// non-nil return (e.g. EnsureGroup failure) must exit non-zero even
+		// before any signal arrives.
+		return exitOnRunResult(err, logger)
+	case sig := <-sigCh:
+		logger.Info("shutdown signal received, entering drain (stop taking new tasks)",
+			"signal", sig.String(), "drain_timeout", cfg.DrainTimeout)
+		w.RequestDrain("signal:" + sig.String())
+	}
 
 	go func() {
 		<-sigCh
@@ -135,20 +147,32 @@ func main() {
 
 	deadline := cfg.DrainTimeout + 5*time.Second
 	select {
-	case <-done:
-		logger.Info("worker stopped cleanly")
+	case err := <-runDone:
+		return exitOnRunResult(err, logger)
 	case <-time.After(deadline):
 		logger.Warn("drain deadline exceeded, force-stopping in-flight work",
 			"deadline", deadline)
 		w.ForceStop("shutdown deadline")
 		cancel()
 		select {
-		case <-done:
+		case err := <-runDone:
+			return exitOnRunResult(err, logger)
 		case <-time.After(5 * time.Second):
 			logger.Error("worker did not stop after force-stop")
-			os.Exit(1)
+			return 1
 		}
 	}
+}
+
+// exitOnRunResult maps a Run return to the exit code and the conclusive log
+// line: error → non-zero with the cause on stderr, nil → "stopped cleanly".
+func exitOnRunResult(err error, logger *slog.Logger) int {
+	if err != nil {
+		logger.Error("worker exited with error", "error", err)
+		return 1
+	}
+	logger.Info("worker stopped cleanly")
+	return 0
 }
 
 // runReplay executes the one-shot DLQ replay mode and prints the result JSON.
