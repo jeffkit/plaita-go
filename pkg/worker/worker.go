@@ -470,7 +470,9 @@ func (w *Worker) handleStart(ctx context.Context, task *Task) error {
 	// is converted into a continue carrier via the §9.1 machinery instead of
 	// being acked into a zombie; a SUSPENDED hit acks only after compensating
 	// a pending suspend dispatch (plaita#233, the handleResume short-circuit);
-	// terminal rows stay the plain idempotent ack.
+	// a QUEUED hit is the console's placeholder (#83, plaita#273) and
+	// continues into the normal start; terminal rows stay the plain
+	// idempotent ack.
 	if prev, perr := w.store.LoadExecutionState(ctx, tenant, executionID); perr != nil {
 		_ = w.lease.Release(ctx, handle)
 		return fmt.Errorf("state probe: %w", perr)
@@ -483,6 +485,16 @@ func (w *Worker) handleStart(ctx context.Context, task *Task) error {
 			return nil
 		}
 		switch {
+		case prev.Status == StatusQueued:
+			// #83: the console writes this row BEFORE the carrier is even
+			// enqueued (plaita#273) — acceptance evidence, not processing
+			// evidence. Python's _existing_start_checkpoint returns None for
+			// it (non-terminal + empty checkpoint = first delivery); fall
+			// through into the normal start below. The takeover is safe: the
+			// running row over the placeholder is written under the lease we
+			// already hold (fenced CAS), so a simultaneous duplicate still
+			// cannot double-run; and this worker never writes queued rows, so
+			// a queued hit is by construction the console's placeholder.
 		case prev.Status == StatusRunning:
 			return w.routeStartRedeliveryOnRunning(ctx, task, prev, handle)
 		case prev.Status == StatusSuspended:
@@ -515,10 +527,13 @@ func (w *Worker) handleStart(ctx context.Context, task *Task) error {
 	w.deleteCheckpoint(ctx, tenant, executionID)
 
 	// Entry checkpoint (§4.2 #1): cancel intent before the running row exists.
-	// (Reached only for brand-new executions — the #29 gate above consumed the
-	// existing-row cases, so a duplicate start can no longer overwrite a row
-	// via the cancel path; a live run sees the flag through its poller and a
-	// suspended one through its cancel resume carrier.)
+	// (Reached only for brand-new executions and console queued placeholders
+	// — the #29 gate above consumed the other existing-row cases, so a
+	// duplicate start can no longer overwrite a row via the cancel path; a
+	// live run sees the flag through its poller and a suspended one through
+	// its cancel resume carrier. For a placeholder this IS the plaita#273
+	// direct-cancel contract: the console writes the flag before its CAS, so
+	// a carrier consumed in that window terminalizes here instead of running.)
 	if hit, _, err := w.store.IsCancelRequested(ctx, tenant, executionID); err != nil {
 		_ = w.lease.Release(ctx, handle)
 		return fmt.Errorf("cancel probe: %w", err)
