@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -123,8 +124,13 @@ func notifyGenericPost(ctx context.Context, rawURL string, body any, timeout tim
 		return nil, &NotifyTransientError{Msg: notifyScrubText(err.Error())}
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := readCappedBody(resp.Body, maxResponseBytes())
 	if err != nil {
+		if errors.As(err, &errResponseTooLarge{}) {
+			// Over-limit is deterministic: a retry re-downloads the same
+			// oversized body. Same class as non-retryable HTTP 4xx.
+			return nil, &NotifyDeterministicError{Msg: notifyScrubText(err.Error())}
+		}
 		return nil, &NotifyTransientError{Msg: notifyScrubText(err.Error())}
 	}
 	if resp.StatusCode >= 400 {

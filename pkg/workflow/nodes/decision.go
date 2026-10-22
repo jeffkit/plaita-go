@@ -745,8 +745,10 @@ func (decisionJevProvider) Decide(ctx context.Context, req *DecisionRequest) (*D
 		return nil, fmt.Errorf("systemone 传输异常: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := readCappedBody(resp.Body, maxResponseBytes())
 	if err != nil {
+		// errResponseTooLarge rides the chain: the message carries the
+		// ceiling (maxResponseBytes=N) instead of a silently truncated body.
 		return nil, fmt.Errorf("读取 systemone 响应失败: %w", err)
 	}
 	if resp.StatusCode >= 400 {

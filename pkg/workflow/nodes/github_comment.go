@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -293,8 +294,13 @@ func githubCommentDo(ctx context.Context, method, path, token string, payload []
 		return 0, nil, workflow.RetryableError(fmt.Errorf("GitHub 请求失败: %w", err))
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := readCappedBody(resp.Body, maxResponseBytes())
 	if err != nil {
+		if errors.As(err, &errResponseTooLarge{}) {
+			// Over-limit: deterministic — a retry re-downloads the same body
+			// and exceeds again; don't burn the retryTimes budget on it.
+			return resp.StatusCode, nil, workflow.NonRetryable(err)
+		}
 		return resp.StatusCode, nil, workflow.RetryableError(fmt.Errorf("读取响应失败: %w", err))
 	}
 	return resp.StatusCode, data, nil

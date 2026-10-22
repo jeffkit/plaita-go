@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -203,6 +205,56 @@ func (c *Client) chatAnthropic(ctx context.Context, req *ChatRequest) (*ChatResp
 	}, nil
 }
 
+// llmMaxResponseBytesEnv is shared with the http node's ceiling: one
+// operator knob governs every outbound response-body read (plaita-go#72).
+const llmMaxResponseBytesEnv = "PLAITA_HTTP_MAX_RESPONSE_BYTES"
+
+// defaultLLMMaxResponseBytes mirrors the http node's 10MiB default.
+const defaultLLMMaxResponseBytes = 10 * 1024 * 1024
+
+// maxResponseBytes parses llmMaxResponseBytesEnv; unset/invalid/non-positive
+// falls back to the 10MiB default (same tolerance as the http node).
+func maxResponseBytes() int {
+	raw := strings.TrimSpace(os.Getenv(llmMaxResponseBytesEnv))
+	if raw == "" {
+		return defaultLLMMaxResponseBytes
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return defaultLLMMaxResponseBytes
+	}
+	return v
+}
+
+// ResponseTooLargeError marks an over-limit completions response
+// (plaita-go#72): the read stops at max+1 bytes so a degraded or hostile
+// provider cannot balloon worker memory. Deterministic — retrying
+// re-downloads the same body and exceeds again.
+type ResponseTooLargeError struct{ Max int }
+
+// Error renders the ceiling and the escape hatch.
+func (e *ResponseTooLargeError) Error() string {
+	return fmt.Sprintf("LLM 响应体超过上限 maxResponseBytes=%d；可用 %s 放宽", e.Max, llmMaxResponseBytesEnv)
+}
+
+// Retryable pins the deterministic class for the engine's retryClassifier
+// bridge and llm.Retryable.
+func (e *ResponseTooLargeError) Retryable() bool { return false }
+
+// readCapped reads at most max bytes; one byte more → *ResponseTooLargeError.
+// The +1 read is deliberate: a single Read(max) can mistake a big body for
+// EOF and silently truncate.
+func readCapped(r io.Reader, max int) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, int64(max)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > max {
+		return nil, &ResponseTooLargeError{Max: max}
+	}
+	return data, nil
+}
+
 // post marshals the body, issues the request and classifies the response.
 func (c *Client) post(ctx context.Context, req *ChatRequest, path string, body map[string]any, header http.Header) ([]byte, error) {
 	payload, err := json.Marshal(body)
@@ -230,7 +282,7 @@ func (c *Client) post(ctx context.Context, req *ChatRequest, path string, body m
 		return nil, fmt.Errorf("LLM 传输异常 (%s): %w", scrubText(endpoint), err)
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := readCapped(resp.Body, maxResponseBytes())
 	if err != nil {
 		return nil, fmt.Errorf("读取 LLM 响应失败: %w", err)
 	}
