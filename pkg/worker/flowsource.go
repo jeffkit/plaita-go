@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -150,18 +149,20 @@ func numericVersionLess(a, b string) bool {
 	return ai < bi
 }
 
-// FlowDefinitionHash is the Go port of compute_flow_definition_hash
-// (§7: json.dumps(sort_keys=True, ensure_ascii=False, separators=(",",":")) →
-// sha256). The JSON is canonicalized through a parsed form with json.Number
-// preserved so number literals survive round-tripping.
+// FlowDefinitionHash is the byte-exact Go counterpart of Python
+// compute_flow_definition_hash (§7: json.dumps(sort_keys=True,
+// ensure_ascii=False, separators=(",",":")) over the json.loads-parsed
+// stored definition → sha256). Canonicalization goes through
+// canonicalFlowDefinitionJSON (canonicaljson.go) — NOT json.Marshal, whose
+// HTML escaping, U+2028 escaping and json.Number passthrough each flip the
+// fingerprint against Python's (#60). Byte equality with the Python engine
+// is pinned by flow_hash_golden_test.go against testdata/flow_hash_golden.json.
+// Re-export the fixture with:
+//
+//	cd ~/projects/infra4agent/plaita && python3 \
+//	  ~/projects/infra4agent/plaita-go/scripts/export_flow_hash_golden.py
 func FlowDefinitionHash(raw []byte) (string, error) {
-	var doc any
-	dec := json.NewDecoder(strings.NewReader(string(raw)))
-	dec.UseNumber()
-	if err := dec.Decode(&doc); err != nil {
-		return "", err
-	}
-	canonical, err := json.Marshal(doc)
+	canonical, err := canonicalFlowDefinitionJSON(raw)
 	if err != nil {
 		return "", err
 	}

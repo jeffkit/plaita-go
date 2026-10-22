@@ -259,7 +259,7 @@ end
 |---|---|
 | `execution_id` | str，必填 |
 | `flow_id` / `flow_name` / `flow_version` | str? |
-| `flow_hash` / `flow_hash_algo` | 定义指纹 sha256 + 算法标记（v2=`flow-definition-json-sortkeys-v2`，`flow_worker.py:724-727`） |
+| `flow_hash` / `flow_hash_algo` | 定义指纹 sha256 + 算法标记（Python v2=`flow-definition-json-sortkeys-v2`，`flow_worker.py:724-727`；Go 自 #60 起用 Go 戳记 `flow-definition-json-sortkeys-v2-go`——规范化语义与 Python 逐字节等价，但标记刻意分名，防「同名不同实现」让 `upgrade_suspected` 失明） |
 | `engine_version` | 创建者版本（观测用，resume 不覆写） |
 | `tenant_id` | str? |
 | `context` | dict，checkpoint（`$INPUT/$NODE/$LAST_NODE/$FLOW_ID/$ENV…`） |
@@ -355,7 +355,7 @@ EventSubscription: {subscription_id, event_type(非空强制), filter_condition?
    - 缓存键 `{tenant}:{flow_id}:{version|latest}`，TTLCache(100, 300s)（:1362-1365）；
    - 未命中 → `flow_storage.get_flow`：version 缺省时优先 `latest` 版本，否则按数字版本排序取最大（`storage/redis.py:764-782`）；
    - `Flow.model_validate(dict)` 解析（:2428）——**IR 的 Go 侧对齐面 = 这份 camelCase 部署 JSON**（plaita-go AGENTS.md 决策 2 已拍板同口径）；
-   - 同窗口缓存指纹 `compute_flow_definition_hash`（对 `model_validate` **之前**的原始定义 JSON `sort_keys + ensure_ascii=False + default=str + separators=(",",":")` 做 sha256，:810-835；算法标记 v2 :724）。
+   - 同窗口缓存指纹 `compute_flow_definition_hash`（对 `model_validate` **之前**的原始定义 JSON `sort_keys + ensure_ascii=False + default=str + separators=(",",":")` 做 sha256，:810-835；算法标记 v2 :724）。**#60 起 Go 逐字节等价**：`pkg/worker/canonicaljson.go` 复刻 CPython 编码器规则（ESCAPE_DCT 转义含 `\b`/`\f` 短形式、U+2028/U+2029 与 `<>&`/DEL 不转义、`float.__repr__` 数字归一——指数阈值 decpt∈(-4,16]、`.0` 尾巴、`1e400`→`Infinity`、整数 `-0`→`0`），输入取 `json.loads` 同款严格单文档（trailing data / NaN 字面量拒绝）。golden = `pkg/worker/testdata/flow_hash_golden.json`（`scripts/export_flow_hash_golden.py` 从活体 Python 引擎导出：A1 r120 十族 + 数字/转义/结构扩展矩阵 + 仓内 testdata 语料回放），混编端到端见 `TestMixedFleetResumeWithPythonHash`。**结论：capability manifest 的 `ir_contract_version` 不参与指纹计算与 resume 判定**——它随 manifest 演进（supported-node 变化等）漂移、与定义 JSON 语义无关，且 Python 侧无同形字段可比；算法身份已由 algo 标记承载，混编分级判定（`classify_flow_hash_change`）只看 `stored/current` 的 hash 与 algo 标记两元组。
 5. **resume**：`state.flow_version` 决定版本（:3458,3521-3529）；`flow_hash` 不匹配 → 终态化 error（5.4）；`data.allow_flow_hash_change=true` 显式放行（:3592-3617）。
 6. **start 载体重投/预铸 id**：查盘有 checkpoint → 转 resume 语义（:2979-3013,2758-2814）；execution_id 已属另一 flow → `ExecutionIdConflictError` poison ack（:2795-2806）。
 
@@ -511,7 +511,7 @@ worker 注册与心跳（§8.1 层 1）从 #82 起在 metadata 里声明 #300 �
 | §3 租约 | 三个 Lua 逐字移植 + holder token 格式（16 位 hex 末段是反解协议的一部分）+ fencegen 语义 + fenced CAS 存储 + 看门狗 | P0 | ✅ 一期；orphan watch = 二期 |
 | §5 写回 | ExecutionState JSON 字段级兼容（Python `model_dump` 的 camel/snake 混合——`node_timings`/`timeline` 键名以本文 §5.1 为准，落地前用真实 Redis 快照对拍）；终态 TTL；索引 ZSET；StatePersistError/StateSerializationError 二分 | P0 | ✅；挂起边界 checkpoint + 恢复（M6 §9.4），每步持久化未做（三期） |
 | §4 取消 | 取消标志键轮询（步界 + 步内两个层次）+ cancel resume 载体 + 终态写回 | P1（步界版先够对账） | ✅ 步内轮询 + 入口/租约内检查点 |
-| §7 flow 来源 | RedisFlowStorage 读路径（`{ns}:flow:{id}:{ver}` + flow_list/flow_versions SET + latest/数字版本序）；指纹算法（sort_keys JSON sha256 + algo v2 标记）——指纹是 resume 硬门，Go 必须同口径 | P0（同 Redis 即可对跑） | ✅ 读/指纹；resume 指纹硬门（flow_hash_mismatch + allow_flow_hash_change 放行）已落 |
+| §7 flow 来源 | RedisFlowStorage 读路径（`{ns}:flow:{id}:{ver}` + flow_list/flow_versions SET + latest/数字版本序）；指纹算法（sort_keys JSON sha256 + algo 标记）——指纹是 resume 硬门，Go 必须同口径 | P0（同 Redis 即可对跑） | ✅ 读/指纹；resume 指纹硬门（flow_hash_mismatch + allow_flow_hash_change 放行）已落；**#60 规范化逐字节对齐 Python + algo 标记改名 `-v2-go`**（旧 Go 行走 upgrade_suspected 可解释分支；运维放行 = 载体带 allow_flow_hash_change=true） |
 | §8 心跳 | 注册表键 + ServiceInfo JSON（status 生命周期、worker_capacity 块）+ 进度心跳（node_timings 在跑节点 `ended_at=""` 约定） | P1（keeper 误杀风险，随影子上线即需要） | ✅ 三层（含失租 orphan watch） |
 | §6 事件 | Go worker 第一阶段可只读不写业务事件；`timeline`/`node_timings` 落盘必须有（keeper 判据）；SSE 发布可后置 | P2 | ✅ timeline/耗时落盘 + execution events PUBLISH；业务事件 PUBLISH/订阅/唤醒（M6 §9.4） |
 | §9 退避/drain | 三层重试预算键 + 显式重投（先入队后 ack）+ resume 载体转换 + 信号处理 | P1 | ✅ 三层预算 + 退避重投 + drain 三态 + 重投载体查盘转 resume/continue（worker-tail：失败边界 checkpoint + continue 真推进；引擎中途入口缺位，推进为 flow 起点重入） |

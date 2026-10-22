@@ -26,8 +26,26 @@ const (
 	TaskSchemaVersion = 1
 
 	// FlowHashAlgoV2 is the flow definition fingerprint algorithm marker
-	// (protocol §7: flow-definition-json-sortkeys-v2).
-	FlowHashAlgoV2 = "flow-definition-json-sortkeys-v2"
+	// (protocol §7). #60: the marker is Go-stamped ("-v2-go") instead of
+	// sharing Python's "flow-definition-json-sortkeys-v2" — the canonical
+	// semantics are byte-equal to Python's since #60, but a shared label on
+	// a separately-maintained implementation is exactly the "same name,
+	// different algorithm" blind spot that made upgrade_suspected useless
+	// while this build mis-computed fingerprints. Rows written by pre-#60 Go
+	// builds carry the old label AND a wrong hash; the label flip routes any
+	// such in-flight row into the explainable upgrade_suspected=true branch
+	// of the resume gate instead of looking like a silent definition change.
+	// Operations remedy for those rows: allow_flow_hash_change=true on the
+	// resume carrier. Python rows (label v2, identical hash) keep resuming
+	// normally — hash equality passes the gate regardless of label.
+	//
+	// The capability manifest's ir_contract_version deliberately does NOT
+	// participate in this gate: it moves with every manifest evolution
+	// (supported-node changes etc.) without any fingerprint-relevant
+	// semantic, it has no Python-side counterpart to compare against, and
+	// algorithm identity is already carried by this marker. Recorded in
+	// docs/WORKER_PROTOCOL.md §7.
+	FlowHashAlgoV2 = "flow-definition-json-sortkeys-v2-go"
 
 	// DefaultKeyPrefix is the default key namespace root (§3.1 ns = plaita).
 	DefaultKeyPrefix = "plaita"
