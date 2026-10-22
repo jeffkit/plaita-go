@@ -44,6 +44,12 @@ func (c *Child) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to evaluate input for child node: %w", err)
 	}
+	if input == nil {
+		// plaita 实测（r78）：input 缺省/求值为 None 时子流程继承调用方
+		// $INPUT（evaluate(None) → None，子执行 params=None 走继承路径）——
+		// child 与 reference 同款语义。
+		input = runtime.WorkflowRuntimeContext(ctx).GetWorkflowInput()
+	}
 
 	if err = c.ChildFlow.InputType.ValidateValue(input); err != nil {
 		return nil, fmt.Errorf("failed to validate input for children workflow (%q): %w", c.ChildFlow.ID, err)

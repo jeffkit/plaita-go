@@ -71,3 +71,28 @@ func TestChildrenFlow_Execute(t *testing.T) {
 		})
 	}
 }
+
+// plaita 实测（r78）：child 的 input 缺省（求值为 None）→ 子流程继承调用方
+// $INPUT——child 与 reference 同款语义（Python 子执行 params=None 走继承）。
+func TestChildrenFlow_AbsentInputInheritsCallerInput(t *testing.T) {
+	childNode := &Child{
+		BaseNode: BaseNode{ID: "child", Next: "next-node"},
+		ChildFlow: &workflow.Workflow{
+			ID: "test-workflow",
+			Nodes: workflow.Nodes{
+				&Start{BaseNode{ID: "start", Next: "end"}},
+				&End{BaseNode: BaseNode{ID: "end", Output: "$INPUT"}},
+			},
+		},
+	}
+	parentCtx := runtime.WithWorkflowRuntimeContext(context.Background(),
+		&runtime.Context{WorkflowInput: map[string]any{"z": 42}})
+	got, err := childNode.Execute(parentCtx)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	want := map[string]any{"z": 42}
+	if !reflect.DeepEqual(got.Result, want) {
+		t.Errorf("Execute() got = %v, want %v", got.Result, want)
+	}
+}

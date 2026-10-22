@@ -1,6 +1,7 @@
 package ir
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -15,8 +16,9 @@ import (
 // engine's native JSON shape: alias keys folded, handlers canonicalized,
 // timeouts converted to ISO 8601, lossy-but-informative fields stashed into
 // metadata. Embedded flows (childFlow / branches[].flow) are normalized
-// recursively.
-func normalizeDoc(doc map[string]any, sc scope) error {
+// recursively. res carries the optional FlowProvider for reference nodes
+// (nil when loading without one).
+func normalizeDoc(doc map[string]any, sc scope, res *flowResolver) error {
 	meta := asMeta(doc)
 
 	// flow id: plaita emits flow_id; console exports may carry id; flowId is
@@ -95,12 +97,12 @@ func normalizeDoc(doc map[string]any, sc scope) error {
 		if !ok {
 			return fmt.Errorf("ir: flow %q: nodes[%d] is not an object", doc["id"], i)
 		}
-		if err := normalizeNode(n); err != nil {
+		if err := normalizeNode(n, res); err != nil {
 			return fmt.Errorf("ir: flow %q: node %q: %v", doc["id"], nodeLabel(n), err)
 		}
 		// embedded flows: synthesize an engine-required id, then normalize and
 		// validate recursively (mirrors plaita's check_childflow_reachable_end).
-		if err := normalizeEmbedded(doc["id"].(string), n); err != nil {
+		if err := normalizeEmbedded(doc["id"].(string), n, res); err != nil {
 			return err
 		}
 	}
@@ -111,7 +113,7 @@ func normalizeDoc(doc map[string]any, sc scope) error {
 // embedded in loop/child/parallel nodes. The engine requires a non-blank
 // workflow id, which plaita's embedded flows never carry, so one is
 // synthesized from the parent node id.
-func normalizeEmbedded(flowID string, n map[string]any) error {
+func normalizeEmbedded(flowID string, n map[string]any, res *flowResolver) error {
 	embed := func(sub map[string]any, name string) error {
 		if sub == nil {
 			return nil
@@ -119,7 +121,7 @@ func normalizeEmbedded(flowID string, n map[string]any) error {
 		if s, _ := sub["id"].(string); s == "" {
 			sub["id"] = fmt.Sprintf("%s.%s", n["id"], name)
 		}
-		if err := normalizeDoc(sub, scopeChild); err != nil {
+		if err := normalizeDoc(sub, scopeChild, res); err != nil {
 			return fmt.Errorf("ir: flow %q: node %q %s: %v", flowID, nodeLabel(n), name, err)
 		}
 		if err := validateDoc(sub, scopeChild); err != nil {
@@ -131,6 +133,15 @@ func normalizeEmbedded(flowID string, n map[string]any) error {
 	case "loop", "child", "map", "filter", "find", "reduce", "while":
 		if cf, ok := n["childFlow"].(map[string]any); ok {
 			return embed(cf, "childFlow")
+		}
+	case "reference":
+		// translateReference 已把 provider 解析出的子流程注入 childFlow；这里
+		// 与其他嵌入流程同路归一化+校验。深度计数随本子树闭合归还——菱形引用
+		// 不受误伤，真正的环撞 maxReferenceResolveDepth。
+		if cf, ok := n["childFlow"].(map[string]any); ok && res != nil {
+			err := embed(cf, "childFlow")
+			res.depth--
+			return err
 		}
 	case "parallel":
 		branches, _ := n["branches"].([]any)
@@ -153,7 +164,7 @@ func normalizeEmbedded(flowID string, n map[string]any) error {
 	return nil
 }
 
-func normalizeNode(n map[string]any) error {
+func normalizeNode(n map[string]any, res *flowResolver) error {
 	t, _ := n["type"].(string)
 	if t == "" {
 		return fmt.Errorf("missing type")
@@ -209,6 +220,13 @@ func normalizeNode(n map[string]any) error {
 	switch t {
 	case "switch":
 		return translateSwitch(n)
+	case "case":
+		// plaita 在模型校验期把 case 脱糖成 Switch（decide.py SwitchLegacy）；
+		// 脱糖后走 switch 的分支归一化。
+		if err := translateCase(n); err != nil {
+			return err
+		}
+		return translateSwitch(n)
 	case "if":
 		return translateIf(n)
 	case "parallel":
@@ -221,6 +239,8 @@ func normalizeNode(n map[string]any) error {
 		return translateWhile(n)
 	case "child":
 		return translateChild(n)
+	case "reference":
+		return translateReference(n, res)
 	case "http":
 		return translateHTTP(n)
 	case "code":
@@ -434,6 +454,148 @@ func translateSwitch(n map[string]any) error {
 			}
 		}
 	}
+	return nil
+}
+
+// translateCase 转正 plaita 的 case 节点（decide.py SwitchLegacy，等值匹配
+// 方言）。Python 在模型校验期把它脱糖成普通 Switch：每条 case 变成
+// Branch(name=case.id, condition={field:target, operator:eq, value:case.value},
+// next=case.id)，外加恒置 isDefault 的兜底分支；本函数在 IR 归一化层做同款
+// 脱糖（节点 type 改写为 switch + 构造 branches，metadata 记 caseDialect 留
+// 痕），命中/输出语义与 switch 完全一致。拍板依据（r78 Python 探针）：
+//
+//   - cases[].id 必填 = 跳转目标（Python Branch(next=case["id"]) 硬编码 id，
+//     builder 的 next→id 归一化只在 id 缺省时兜底；cases[].next 不参与路由）；
+//     cases[].value 必填（null 合法，eq None 比较）；cases[].name 可选 = label。
+//   - default 缺省或 null → 字面 "default" 节点 id（Python
+//     values.get("default", "default") + Switch branch_name_as_target 合成目标，
+//     实测命中 id 为 "default" 的节点）；非空字符串 → 该 id。
+//   - target 必须是表达式字符串或缺省：缺省/None 时条件恒 None，只有
+//     value:null 的 case 可命中——desugar 以引擎的 $NULL 字面量承载（引擎侧
+//     None 字面量，构造出的条件不回流 Python）；字面量 target 是常量条件，
+//     加载期拒绝（Python evaluate(字面量) 语义无部署意义）。
+//   - cases 必须是数组；条目缺 id/value 加载期拒绝（Python 模型层 ValueError
+//     前置）；空 cases 合法（只剩兜底分支，实测走 default）。
+func translateCase(n map[string]any) error {
+	target := n["target"]
+	if target != nil {
+		if _, ok := target.(string); !ok {
+			return fmt.Errorf("case target must be an expression string (or absent), got %T", target)
+		}
+	} else {
+		// Python condition field=None → evaluate(None) → None；引擎侧等价形。
+		target = "$NULL"
+	}
+	rawCases, ok := n["cases"].([]any)
+	if n["cases"] != nil && !ok {
+		return fmt.Errorf("cases must be an array, got %T", n["cases"])
+	}
+	branches := make([]any, 0, len(rawCases)+1)
+	for i, rc := range rawCases {
+		c, isMap := rc.(map[string]any)
+		if !isMap {
+			return fmt.Errorf("cases[%d] is not an object (got %v) — every case needs id/value, optional name", i, rc)
+		}
+		id, _ := c["id"].(string)
+		if id == "" {
+			return fmt.Errorf("cases[%d] missing required \"id\" (the jump target) — every case needs id/value, optional name", i)
+		}
+		if _, has := c["value"]; !has {
+			return fmt.Errorf("cases[%d] (%q) missing required \"value\"", i, id)
+		}
+		b := map[string]any{
+			"name": id,
+			"condition": map[string]any{
+				"field":    target,
+				"operator": "eq",
+				"value":    c["value"],
+			},
+			"next": id,
+		}
+		if name, isStr := c["name"].(string); isStr && name != "" {
+			b["label"] = name
+		}
+		branches = append(branches, b)
+	}
+	defaultNext := "default"
+	if d, has := n["default"]; has && d != nil {
+		s, isStr := d.(string)
+		if !isStr || s == "" {
+			return fmt.Errorf("default must be a node id string, got %v", d)
+		}
+		defaultNext = s
+	}
+	branches = append(branches, map[string]any{
+		"name":      "default",
+		"next":      defaultNext,
+		"isDefault": true,
+	})
+	n["type"] = "switch"
+	n["branches"] = branches
+	delete(n, "target")
+	delete(n, "cases")
+	delete(n, "default")
+	stash(asMeta(n), "caseDialect", "desugared-to-switch")
+	return nil
+}
+
+// maxReferenceResolveDepth caps reference-chain resolution (a cycle must fail
+// the load with a named error, not recurse forever).
+const maxReferenceResolveDepth = 32
+
+// flowResolver carries the FlowProvider through normalization; depth counts
+// open reference resolutions (incremented in translateReference, returned
+// when the injected subtree finishes in normalizeEmbedded).
+type flowResolver struct {
+	provider FlowProvider
+	depth    int
+}
+
+// translateReference 转正 plaita 的 reference 节点（child.py ReferenceFlow，
+// 引用逻辑）。plaita 的调度器在运行前按 flow_id/flow_version 把 child_flow
+// 注入节点；Go 的对应物在加载期完成——经 FlowProvider 取回部署形态子流程
+// JSON 注入 childFlow，随后与 inline childFlow 同路走 scopeChild 归一化+校验
+// （normalizeEmbedded），嵌套 reference 在递归里继续解析。拍板依据（r78
+// Python 实测）：
+//
+//   - inline childFlow 在 reference 上拒绝：plaita 运行时把它丢掉
+//     （ReferenceFlow.setup_child_flow 与基类 FlowNode 同名遮蔽，child_flow
+//     恒 None）并在执行期炸 "child_flow for reference flow node is required"。
+//     Go 在加载期具名拒绝并指路（child 节点内联、或 flowId+provider），不给
+//     「Go 能跑、plaita 跑不了」的跨运行时假象。
+//   - flowId 缺省（且无 inline）拒绝：调度器无从注入。
+//   - provider 未配置/解析失败/文档非法 → 加载失败（fail-closed）。
+func translateReference(n map[string]any, res *flowResolver) error {
+	foldKey(n, "flow_id", "flowId")
+	foldKey(n, "flow_version", "flowVersion")
+	if cf, has := n["childFlow"]; has && cf != nil {
+		return fmt.Errorf("reference node takes no inline childFlow: plaita's runtime drops it (validator shadowing) and fails at run time with " +
+			"\"child_flow for reference flow node is required\"; inline the sub-flow in a child node, or declare flowId/flowVersion and load via ir.LoadWithFlowProvider")
+	}
+	flowID := firstString(n, "flowId")
+	if flowID == "" {
+		return fmt.Errorf("reference node requires flowId/flow_id (plaita's scheduler injects the referenced flow by id; this engine resolves it at load time)")
+	}
+	flowVersion := firstString(n, "flowVersion")
+	if res == nil || res.provider == nil {
+		return fmt.Errorf("reference node %q references flow %q: no flow provider configured — use ir.LoadWithFlowProvider (plaita injects reference children by flowId at scheduling time)", n["id"], flowID)
+	}
+	if res.depth >= maxReferenceResolveDepth {
+		return fmt.Errorf("reference node %q: reference chain deeper than %d while resolving flow %q (cycle?)", n["id"], maxReferenceResolveDepth, flowID)
+	}
+	raw, err := res.provider.LoadFlowJSON(flowID, flowVersion)
+	if err != nil {
+		return fmt.Errorf("reference node %q: resolving flow %q (version %q): %w", n["id"], flowID, flowVersion, err)
+	}
+	sub := map[string]any{}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&sub); err != nil {
+		return fmt.Errorf("reference node %q: flow %q is not a JSON flow document: %w", n["id"], flowID, err)
+	}
+	res.depth++
+	n["childFlow"] = sub
+	stash(asMeta(n), "resolvedFrom", flowID+"@"+flowVersion)
 	return nil
 }
 

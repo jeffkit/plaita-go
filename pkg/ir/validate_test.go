@@ -27,7 +27,7 @@ func normalizedDoc(t *testing.T, data []byte) map[string]any {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	require.NoError(t, dec.Decode(&doc))
-	require.NoError(t, normalizeDoc(doc, scopeRoot))
+	require.NoError(t, normalizeDoc(doc, scopeRoot, nil))
 	require.NoError(t, validateDoc(doc, scopeRoot))
 	return doc
 }
@@ -128,7 +128,7 @@ func TestRefScanBoundaries(t *testing.T) {
 				map[string]any{"type": "start", "id": "s", "next": "e"},
 				tc.node,
 			}}
-			require.NoError(t, normalizeDoc(doc, scopeRoot))
+			require.NoError(t, normalizeDoc(doc, scopeRoot, nil))
 			require.NoError(t, validateDoc(doc, scopeRoot))
 		})
 	}

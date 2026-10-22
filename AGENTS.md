@@ -45,7 +45,7 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
 
 **校验子集**（pkg/ir/validate.go，对应 ir_validate DEFAULT_RULES）：唯一 start + 全图可达（R1）、next/分支引用存在（R3）、嵌入流程可达 end（R2）、`joinBranches ⊆ branches[].name`（R4 语义）。表达式级校验（R5）随表达式对齐工作流补。
 
-**fail-closed 拒载清单**：if / case / calculate / mock / reference（需 provider）/ code 非 javascript / end `nop` / http 的 `allowedHosts`/`deniedHosts`/`blockPrivateNetworks`（SSRF 护栏未移植，靠它保护的 flow 不许静默降级）/ parallel 分支 input 非 dict。**M6 起 event / hitl_await 已转正**（挂起节点；仅有根流程挂起语义）。**#80 phase 1（2026-10-22）起 map / filter / find / reduce / while 已转正**（Python 语义实装，见「集合/循环节点对齐」节；while 畸形 condition 与 map 负 maxConcurrent 在加载期拒绝）。
+**fail-closed 拒载清单**：calculate / ignore（**r78 结论：两者都不是 plaita 注册节点类型**——`Flow.model_validate` 对它们报 `unRecognized node type`，calculate.py 模块存在但未注册是遗留物、ignore 只是 Node 基类的 node_type 占位 ClassVar；Go 保持拒载对齐的是运行时行为，错误信息保留同款子串逐字对拍）/ code 非 javascript / end `nop` / http 的 `allowedHosts`/`deniedHosts`/`blockPrivateNetworks`（SSRF 护栏未移植，靠它保护的 flow 不许静默降级）/ parallel 分支 input 非 dict / reference 携带 inline childFlow（plaita 运行时把它丢掉并在执行期炸，见「节点对齐 phase 2」节）。**M6 起 event / hitl_await 已转正**。**#80 phase 1（2026-10-22）起 map / filter / find / reduce / while 已转正**。**#80 phase 2（2026-10-22，r78）起 case / mock / reference 已转正**（见「节点对齐 phase 2」节）。
 
 **随 ir 对齐落地的引擎语义修正**（plaita 语义为基准）：
 - loop：`$NODE.<loop>` = 末次子结果（前身引擎为 nil）
@@ -136,6 +136,19 @@ plaita 侧权威语义：`plaita/core/deadline.py` + `core/strategies.py`（#267
 - **capability contract 起步（plaita#300 数据源）**：`pkg/ir/capability.go` 导出 `SupportedNodeTypes()`/`UnsupportedNodeTypes()`/`ContractVersion`（"2026-10-22"）/`CapabilityManifest()`——`{engine, ir_contract_version, supported_node_types, unsupported_node_types, features}`，supported/unsupported 一律由白名单自动生成（#300 硬性要求：不许手写第二份）；`capability_test.go` 钉清单与白名单逐项相等、支持类型必有注册工厂、五新类型在 supported 不在 unsupported、JSON 形状与 #300 issue 文本逐键对拍。features = `["checkpoint","hitl_await","suspend"]`。worker registry 写 manifest 归 #300 后续单。
 - **已知残差（记录不修）**：① collection 求值为 dict 时取键（Python list(dict) 插入序 vs Go map 无序）——loop.go 既有分歧，author 端不该依赖，golden 规避；② Python Map 忽略 camel `maxConcurrent`（落 extra，真字段 `max_concurrent`），Go 收两者并集（fold `max_concurrent`→`maxConcurrent`）；③ Python While 触顶告警不报错的口径照搬（`max_iterations=0` 零轮且无告警）。
 
+## 节点对齐 phase 2（#80，2026-10-22，r78，分支 feat/node-parity-2）
+
+权威 = `plaita/node/decide.py`（SwitchLegacy）+ `mock.py` + `child.py`（ReferenceFlow）。golden 28 例真跑对拍（`scripts/export_node_parity2_golden.py` → `pkg/ir/testdata/node_parity2_golden.json`，`node_parity2_golden_test.go` 逐例对拍；reference 用例的 registry 即 ir.FlowProvider，复刻 plaita 调度器注入）。phase 3（server 节点）留 r79。
+
+- **case（拍板：IR 归一化层脱糖为 switch）**：Python 的 case = `SwitchLegacy`，**模型校验期就把自己改写成普通 Switch**（每条 case → Branch(field=target, op=eq, value=case.value, next=case.id) + 恒置 isDefault 兜底分支）——「映射 switch + 字段兼容」不是二选一，是 Python 本来的实现方式。Go `translateCase` 做同款脱糖（type 改写 switch、构造 branches、metadata 记 `caseDialect` 留痕），引擎侧 case 与 switch 同一执行面（工厂按 `types.NodeTypeCase` 别名注册，维持「支持类型必有注册工厂」的 manifest 不变量）。字段兼容：`cases[].id` 必填=跳转目标（`cases[].next` 不参与路由——Python `Branch(next=case["id"])` 硬编码 id）；`cases[].value` 必填（null 合法，eq None 比较）；`cases[].name` 可选=label；`default` 缺省/null → 字面 `"default"` 节点 id（`values.get("default","default")` 的合成目标，实测命中 id 为 "default" 的节点）；target 缺省=恒 None（只有 value:null 的 case 可命中，desugar 以引擎 `$NULL` 字面量承载）；target 非表达式串加载期拒绝；缺 id/value 的 case 条目加载期拒绝（Python 模型层 ValueError 前置）；空 cases 合法（只剩兜底分支）。
+- **mock**：数据固定 pin 占位（console 把被固定节点替换成本类型跳过真实执行），**未废弃、照实装**。语义：`value` 原样返回**不求值**（连 `"$INPUT.x"` 表达式串都字面成为节点结果——pin 语义即字面固定）；`output` 字段被忽略（runner 不对 mock 求 output）。
+- **reference（拍板：provider 解析=加载期注入；inline childFlow 拒载）**：plaita 的调度器在运行前按 flowId/flowVersion 把 child_flow 注入 reference 节点。Go 对应物 = **加载期注入**：`ir.FlowProvider`（部署形态 JSON 接口，刻意不复用 `providers.WorkflowProvider`——解析必须重入 ir 管线，不能绕过静态校验）+ `ir.LoadWithFlowProvider`；注入的子流程走 scopeChild 归一化+校验，嵌套 reference 递归解析（深度上限 32，环在限深处具名拒绝；菱形引用不误伤——深度计数随子树闭合归还）；解析来源落 metadata `resolvedFrom`。**inline childFlow 在 reference 上拒绝**：r78 实测 plaita 运行时把它丢掉（`ReferenceFlow.setup_child_flow` 与基类 FlowNode 同名遮蔽，child_flow 恒 None）并在执行期炸 "child_flow for reference flow node is required"——加载期具名拒绝并指路（child 节点内联、或 flowId+provider），不给「Go 能跑、plaita 跑不了」的跨运行时假象。无 provider 的 `ir.Load` 遇 flowId 引用具名拒绝（worker 的 flowsource 走 `ir.Load`，provider 接线归 #300 后续单）。
+- **reference/child 子流程语义（r78 实测钉死，golden + 单测双钉）**：①input 缺省/求值为 None → 子流程**继承调用方 $INPUT**（child 与 reference 同款，`child.go` 同步修——原为 nil）；②子流程**继承 $GLOBAL/$ENV 与执行身份**（$FLOW_ID/$EXECUTION_ID），但 **$PARENT.<x> 求值为 null**——「引用逻辑不能使用父逻辑上下文的数据」是实测口径（plain-run 路径不给子流程播种父快照，child 节点同款）；Go 的 reference 用 ambient-carrier 种子上下文实现（只携带 global/env/FlowDeadline/身份，不带 input/node，`referenceChildContext`）。**已知残差（记录不修）**：`$PARENT.GLOBAL.*`/`$PARENT.ENV.*` 在 Go 侧可解析到继承值（Python 疑似 null，未逐字验证）；child/loop/collection 子流程的 $PARENT 仍指向真实父执行（数据可见），与 Python 的 null 语义存在**既有分歧**——本轮不动（engine-wide，涉及 child/parallel/collection 的既有测试），留单。
+- **`$PARENT.<bare-path>` 求值修正**（plaitaexpr evaluator，r78）：原实现把 `$PARENT.x` 重写为父上下文里的 `$x` 查寻，根缺省=KeyError 错误；Python 的 $PARENT 是快照**对象**，字段缺省=None（`_get_attr`）。修正：bare 路径（无 $ 根前缀）按「已存在对象缺字段→nil」解析，`$PARENT.$INPUT.x` 等 $ 根形式保持重写（其自身已有 nil-on-field-miss）。
+- **calculate/ignore（拍板：保持拒载，issue 留痕）**：两者都**不是 plaita 注册节点类型**——registry.get 均为 None，`Flow.model_validate` 报 `unRecognized node type`（calculate.py 模块存在但 Calculate 类未注册=遗留物；ignore 只是 Node 基类的 `node_type: ClassVar = "ignore"` 占位）。给 Go 实装 calculate 反而会**放行 Python 拒绝的 flow**（反 parity）；knownUnsupported 提示保留 `unRecognized node type:` 同款子串逐字对拍（golden `reject_*` 用例钉）。
+- **capability contract 收口（#300 五键定稿）**：manifest 五键 `{engine, ir_contract_version, supported_node_types, unsupported_node_types, features}` 不变；supported += case/mock/reference（白名单自动生成纪律不变），unsupported = calculate/ignore/sleep/trpc/mdb/readmdb/writemdb（calculate/ignore 的提示含逐字对拍子串）；`ContractVersion` bump 到 **"2026-10-22.2"**（同日 phase 1 为初始 "2026-10-22"——同版本字符串对应不同清单会让消费者缓存失真，必须 bump）。`ignore` 确认结论：**不是部署 IR 节点**（无注册、无前端产出、plaita 自身拒载），永远留在 unsupported。worker registry 写 manifest 归 #300 后续单。
+- **负控（先红后绿，stash 基线实测）**：capability_test（phase 2 类型必须在 supported）基线红（Should be true，实测）；child input 继承单测基线红（got nil, want map[z:42]，实测）；golden 22 个行为用例基线全红（ir.Load 拒载，neg-red 逐例实测）；mock/reference 单测与 golden provider 路径在基线为编译级红（新 API/新符号，新接受面固有）。
+
 ## 常用命令
 
 ```bash
@@ -174,7 +187,10 @@ make lint   # gofmt 检查 + vet（golangci-lint 配置存在但未接线）
 | event（挂起） | event（pkg/workflow/nodes/event.go） | ✅ M6 落地（2026-10-19）：订阅/过滤/超时/event·timeout·cancel 恢复；仅根流程挂起 |
 | hitl_await（挂起） | hitl_await（pkg/workflow/nodes/hitl_await.go） | ✅ M6 落地（2026-10-19）：发消息拿 session_id 即 pending，hitl_reply 事件/超时唤醒 |
 | if（Bool） | if（pkg/workflow/nodes/if.go） | ✅ 2026-10-20 落地：condition Python 真值/两分支/缺 else 显式报错；ir 边集补 if 假分支 |
-| mock / calculate | — | 拒载（清单见上）；decision/llm/hitl 族已转正 |
+| case（SwitchLegacy） | switch（IR 脱糖，工厂别名注册） | ✅ #80 phase 2（r78）：等值匹配方言按 Python 模型校验期脱糖语义实装（golden 过） |
+| mock | mock | ✅ #80 phase 2（r78）：value 原样透传（不求值）、output 忽略（golden 过） |
+| reference | reference | ✅ #80 phase 2（r78）：加载期 provider 注入（ir.FlowProvider）+ $PARENT 隔离/$GLOBAL 继承/input 继承；inline childFlow 拒载（plaita 运行时同炸，golden 过） |
+| calculate / ignore | — | 拒载（r78 结论：plaita 运行时未注册，unRecognized node type；清单见上） |
 | —（plaita-nodes 仓余量） | agent/gate/rate_limit/report/notify 族等 | ✅ 已对齐（见上）|
 | trpc / mdb（前身引擎特有） | 已删 | 不移植（公司内网设施） |
 

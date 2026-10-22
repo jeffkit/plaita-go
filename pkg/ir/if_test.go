@@ -232,7 +232,7 @@ func TestIfNormalizePreservesContractKeys(t *testing.T) {
 			map[string]any{"type": "end", "id": "e2", "resultType": "success", "output": "miss"},
 		},
 	}
-	require.NoError(t, normalizeDoc(doc, scopeRoot))
+	require.NoError(t, normalizeDoc(doc, scopeRoot, nil))
 
 	ifNode := doc["nodes"].([]any)[1].(map[string]any)
 	assert.Equal(t, "if", ifNode["type"], "type 不得被改写成 switch")
@@ -244,7 +244,7 @@ func TestIfNormalizePreservesContractKeys(t *testing.T) {
 
 	// 幂等：二次 normalize 不再变化。
 	before := len(ifNode)
-	require.NoError(t, normalizeDoc(doc, scopeRoot))
+	require.NoError(t, normalizeDoc(doc, scopeRoot, nil))
 	ifNode = doc["nodes"].([]any)[1].(map[string]any)
 	assert.Equal(t, before, len(ifNode))
 	assert.Equal(t, "e2", ifNode["else_next"])
