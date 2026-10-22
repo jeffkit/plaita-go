@@ -367,7 +367,7 @@ EventSubscription: {subscription_id, event_type(非空强制), filter_condition?
 
 | 心跳 | 间隔 | 写入 | 行号 |
 |---|---|---|---|
-| 注册表心跳 | 10s（TTL 30s） | `SETEX plaita:registry:flow_worker:{instance_id}` = ServiceInfo JSON `{instance_id, service_type, host, status(starting/running/draining/stopping/stopped), start_time, metadata{queue_name, redis_url(掩码), host/port/db, cache_*, worker_capacity}, active_tasks, last_heartbeat}` | `registry.py:122-126,187-251,351-387`；metadata `flow_worker.py:4552-4567` |
+| 注册表心跳 | 10s（TTL 30s） | `SETEX plaita:registry:flow_worker:{instance_id}` = ServiceInfo JSON `{instance_id, service_type, host, status(starting/running/draining/stopping/stopped), start_time, metadata{queue_name, redis_url(掩码), host/port/db, cache_*, worker_capacity, engine, capability_manifest}, active_tasks, last_heartbeat}`（plaita-go 侧自 #82 起：engine + capability_manifest，见 §9.6） | `registry.py:122-126,187-251,351-387`；metadata `flow_worker.py:4552-4567` |
 | 容量直推 | 在跑数变化即刷 + 盘闸迁移即刷 | `metadata.worker_capacity` = `{schema_version:1, free_disk_gib(null=探不到), min_free_disk_gib, disk_blocked, active_tasks, concurrency, sampled_at}` | `flow_worker.py:6630-6692`、`capacity.py:57,170-199` |
 | 执行进度心跳 | 复用看门狗周期（TTL/3≈40s） | 长**节点执行期间**把 `node_timings` 当前快照（含在跑节点 `ended_at=""`）+ `last_update_time` 合并落盘（持每执行写锁 + fence CAS）；失败只告警 | `flow_worker.py:4924-5002` |
 
@@ -480,6 +480,15 @@ EventSubscription: {subscription_id, event_type(非空强制), filter_condition?
 | HTTP `requestTimeout` | 30s 缺省，整个请求（含全部重定向跳）**共享总预算** | 跳前检查，耗尽 → 具名 `requestTimeout budget exhausted`（1002 可重试族，同 plaita `_RequestBudgetExceeded`=TimeoutError） | plaita#267：逐跳重置曾让 600s × 21 跳 = 单 attempt 3.5h |
 
 **负控**（`pkg/worker/exec_deadline_test.go` / `pkg/ir/budget_caps_test.go` / `pkg/workflow/nodes/http_budget_test.go`，先红后绿）：自循环 switch flow 在 pre-fix 基线 30s 看门狗内仍占用消费者（红）；post-fix 在预算内终态化、错误签名正确、队尾任务立即恢复处理；钩子关闸时行为守恒（仍 running）。caps:retryTimes=11 / 节点 timeout=24h+1ms 在 IR 装载期具名拒绝，=10 / =24h 照常装载；flow 级 timeout 不 cap。
+
+### 9.6 registry capability manifest（plaita-go #82，2026-10-22）
+
+worker 注册与心跳（§8.1 层 1）从 #82 起在 metadata 里声明 #300 能力清单——此前 plaita-go worker 的注册条目既无 `capability_manifest` 也无 `engine`，console 能力门（`plaita/server/capability.py` `manifest_from_metadata` → `plaita-console/backend/services/capability_gate.py`）对 go 池**恒为无清单 → 恒 fail-open**，「含不支持节点的 flow 绝不产生 queued 行」只对 python 池成立。
+
+- **写入点**：`Registry.Start`（`pkg/worker/registry.go`）构造 metadata 时挂两个键——`engine` = `ir.EngineName`（"plaita-go"，经 console `ENGINE_TO_RUNTIME` 映射到 `go` 池键）、`capability_manifest` = `ir.CapabilityManifest()` **整结构体嵌套序列化**（不是再 marshal 成字符串——console 解析器要求 dict，字符串形态会被判「无清单」退回 fail-open）。清单由 ir accept-list 白名单自动生成（supported/unsupported/node_dependencies 六键），无第二份手写清单；`Flush` 每 10s 整份重写 ServiceInfo，清单随心跳持续在场，无独立续期逻辑。
+- **降级口径（具名 WARNING，不 fail-closed）**：清单构造是内存 accept-list 上的纯函数，序列化实际不可失败；若未来形态演进出序列化失败，registry 条目**整体省略** `capability_manifest`/`engine` 两键（console 按无清单走 fail-open 兜底），并打具名 WARNING marker `PLAITA_CAPABILITY_MANIFEST_UNAVAILABLE`。刻意**不**写「在但为空」的清单（过不了 console 五键形状闸、却对粗看者显得健康），也**不**因这个不可达错误拒绝 worker 启动。旧 build（< #82）条目天然无清单 → console 维持 fail-open + `POOL_MANIFEST_MISSING_WARNING`（#300 验收③的兜底路径不回归）。
+- **消费面与验收**：console `collect_pool_manifests` 按 `engine→runtime` 池取交集判门；go 池有真注册条目后，含白名单外节点（如 `sql_query`——Go 侧未做，不在 supported 也不在 unsupported）的 publish/start 被 422 `unsupported_node_types` 结构化拒、零 queued 行/零配额占位。`ir_contract_version` 两侧代际不同（Go `2026-10-22.3` vs Python `2026-10-22`），能力门只消费 `supported_node_types`，版本仅展示/诊断。
+- **测试**：`pkg/worker/manifest_registry_test.go`（负控先红后绿——pre-fix `metadata.engine=nil` 实测红；清单形状对 console `MANIFEST_KEYS` 逐键 + supported/unsupported 与 ir 白名单全等 + 心跳 Flush 存活）；`TestExportRegistryFixture`（env 门控）导出**真实注册产物** fixture，console 侧 `test_issue300_runtime_capability_gate.py::TestRealGoWorkerRegistration` 用真品（替代既有合成清单）复跑 #300 负控矩阵。
 
 ---
 
