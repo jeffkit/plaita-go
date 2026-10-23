@@ -1,0 +1,25 @@
+{
+  "name": "28_suspendresume_r2_continue_replay",
+  "description": "R2 suspend/resume×continue 载体（声明分叉 replay-from-start:go）：start→assignment A→code 必败(abort retryTimes=1，ValueError 确定性两侧均 1 次尝试)→end，driver=continue-after-error。实测：py 分布式首拍止于失败边界（start+a 后返回），continue 载体自 checkpoint 步进恰好重跑失败节点（失败节点无 checkpoint 条目）——A 只现一次；go 整链终态失败后从 flow 起点重入——A 双现（原始轨迹 6 事件留证，AGENTS.md §worker 二期）⇒ 副作用节点重复执行风险（#317 §3 声明分叉，矩阵 red-declared，收敛指针=Stage 1 中途入口单）。投影后节点序一致；attempts 豁免（重入伪影）。终态两侧同为 ValueError 具名失败",
+  "dimension": "suspend-resume",
+  "driver": "continue-after-error",
+  "declaredDivergences": ["replay-from-start:go"],
+  "input": {},
+  "expect": null,
+  "expectError": {"match": "ValueError: once"},
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s28_r2_continue_replay",
+    "inputType": {"dataType": "object"},
+    "nodes": [
+      {"type": "start", "id": "start", "next": "a"},
+      {"type": "assignment", "id": "a",
+       "output": {"marker": "done-once"},
+       "next": "c"},
+      {"type": "code", "id": "c", "language": "python", "sandbox_backend": "subprocess",
+       "code": "def run(input):\n    raise ValueError('once')\n",
+       "errorHandler": {"strategy": "abort", "retryTimes": 1}, "next": "end"},
+      {"type": "end", "id": "end", "resultType": "success", "output": "$NODE.a"}
+    ]
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "19_error_e3_exit_noenvelope_retryable",
+  "description": "E3 错误分类×重试归属：沙箱进程 os._exit(2) 无信封非零退出=基础设施失败维持可重试——与 E2 分打「退出状态」路径（E2 是信封解码路径），两侧各 3 次尝试",
+  "dimension": "error-classification",
+  "input": {},
+  "expect": null,
+  "expectError": {"match": "Subprocess exited with code 2"},
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s19_e3_exit",
+    "inputType": {"dataType": "object"},
+    "nodes": [
+      {"type": "start", "id": "start", "next": "c"},
+      {"type": "code", "id": "c", "language": "python", "sandbox_backend": "subprocess",
+       "code": "import os\n\ndef run(input):\n    os._exit(2)\n",
+       "errorHandler": {"strategy": "abort", "retryTimes": 2}, "next": "end"},
+      {"type": "end", "id": "end", "resultType": "success", "output": "$NODE.c"}
+    ]
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "24_shape_s2_end_error_numeric_code",
+  "description": "S2 结果形状：end error 携带数字 code=12345——py ErrorResultException code int 保真、go HandlerError.Code int 解码保真，两侧错误文本均携带消息；code 类型漂移会打断消费方 switch（rs EndError.code 是 String 的风险面另单）",
+  "dimension": "result-shape",
+  "input": {},
+  "expect": null,
+  "expectError": { "match": "numeric code" },
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s24_s2_numeric_code",
+    "inputType": { "dataType": "object" },
+    "nodes": [
+      { "type": "start", "id": "start", "next": "end" },
+      {
+        "type": "end",
+        "id": "end",
+        "resultType": "error",
+        "error": { "code": 12345, "message": "numeric code" }
+      }
+    ]
+  }
+}

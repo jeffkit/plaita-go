@@ -1,0 +1,16 @@
+{
+  "name": "25_shape_s3_end_output_missing_var",
+  "description": "S3 结果形状：end output 引用缺失变量 $INPUT.nothere——实测两侧同款静默折叠 null（模板方言「静默空值」族在执行面的钉子；16 例只测过正常插值 03）",
+  "dimension": "result-shape",
+  "input": {},
+  "expect": null,
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s25_s3_missing_var",
+    "inputType": { "dataType": "object" },
+    "nodes": [
+      { "type": "start", "id": "start", "next": "end" },
+      { "type": "end", "id": "end", "resultType": "success", "output": "$INPUT.nothere" }
+    ]
+  }
+}

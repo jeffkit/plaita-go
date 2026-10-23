@@ -1,0 +1,19 @@
+{
+  "name": "22_error_e6_http_loopback_refused",
+  "description": "E6 http 错误分类：loopback 连接拒绝=传输瞬态 1002 可重试——显式 127.0.0.1 避代理 env 面（本机 HTTP_PROXY 有把不可达主机变 502 值的前科），retryTimes=2 下各 3 次尝试",
+  "dimension": "error-classification",
+  "input": {},
+  "expect": null,
+  "expectError": {"match": "1002"},
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s22_e6_refused",
+    "inputType": {"dataType": "object"},
+    "nodes": [
+      {"type": "start", "id": "start", "next": "h"},
+      {"type": "http", "id": "h", "method": "GET", "url": "http://127.0.0.1:1/",
+       "errorHandler": {"strategy": "abort", "retryTimes": 2}, "next": "end"},
+      {"type": "end", "id": "end", "resultType": "success", "output": "$NODE.h"}
+    ]
+  }
+}

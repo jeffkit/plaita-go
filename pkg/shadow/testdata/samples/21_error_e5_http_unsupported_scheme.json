@@ -1,0 +1,19 @@
+{
+  "name": "21_error_e5_http_unsupported_scheme",
+  "description": "E5 http 错误分类：ftp:// 不支持协议——实测两侧都落在 do-request 期 code=1002 瞬态可重试（非 1001 生成期，修正 A1 评审表格引文），retryTimes=3 下各 4 次尝试；hermetic 零网络（scheme 在 dial 前被拒）",
+  "dimension": "error-classification",
+  "input": {},
+  "expect": null,
+  "expectError": {"match": "1002"},
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s21_e5_scheme",
+    "inputType": {"dataType": "object"},
+    "nodes": [
+      {"type": "start", "id": "start", "next": "h"},
+      {"type": "http", "id": "h", "method": "GET", "url": "ftp://example.invalid/x",
+       "errorHandler": {"strategy": "abort", "retryTimes": 3}, "next": "end"},
+      {"type": "end", "id": "end", "resultType": "success", "output": "$NODE.h"}
+    ]
+  }
+}

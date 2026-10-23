@@ -1,0 +1,22 @@
+{
+  "name": "27_suspendresume_r1_event_resume",
+  "description": "R1 suspend/resume×event 载体：start→event→assignment→end，driver=event-resume。比较口径=恢复后节点状态经公共可见面（status 翻转 completed + event_data 保真，经 assignment 复制进 end 输出）。event_id 含毫秒时间戳且挂起态形状两侧结构性不同（go 恢复态多 event_filter/is_async/subscription_id，py 无），均不进比对面；plaita 分布式 resume 只处理被恢复节点本身、go Workflow.Resume 恢复+续跑一步到位——AGENTS.md「恢复状态形状（Python 实测钉死）」的共有面口径第一次进自动对拍",
+  "dimension": "suspend-resume",
+  "driver": "event-resume",
+  "driverOptions": {"eventType": "approve", "eventData": {"ok": true, "by": "shadow"}},
+  "input": {},
+  "expect": {"completed": "completed", "data": {"ok": true, "by": "shadow"}},
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s27_r1_event_resume",
+    "inputType": {"dataType": "object"},
+    "nodes": [
+      {"type": "start", "id": "start", "next": "ev"},
+      {"type": "event", "id": "ev", "event_type": "approve", "next": "as"},
+      {"type": "assignment", "id": "as",
+       "output": {"completed": "$NODE.ev.status", "data": "$NODE.ev.event_data.event_data"},
+       "next": "end"},
+      {"type": "end", "id": "end", "resultType": "success", "output": "$NODE.as"}
+    ]
+  }
+}

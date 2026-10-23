@@ -1,0 +1,19 @@
+{
+  "name": "20_error_e4_end_errorresult_nonretryable",
+  "description": "E4 错误分类×重试归属：end resultType=error 是 flow 的决定不是瞬态故障（plaita-go#43 裁决原文）——py ErrorResultException 逃出重试环、go 构造点即 NonRetryable，retryTimes=3 下 1 次尝试",
+  "dimension": "error-classification",
+  "input": {},
+  "expect": null,
+  "expectError": {"match": "end says error"},
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s20_e4_end_error",
+    "inputType": {"dataType": "object"},
+    "nodes": [
+      {"type": "start", "id": "start", "next": "end"},
+      {"type": "end", "id": "end", "resultType": "error",
+       "error": {"code": -1, "message": "end says error"},
+       "errorHandler": {"strategy": "abort", "retryTimes": 3}}
+    ]
+  }
+}

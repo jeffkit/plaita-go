@@ -1,0 +1,24 @@
+{
+  "name": "26_shape_s4_code_null_penetration",
+  "description": "S4 结果形状：code 返回 {a: null} 后 end output 走 $NODE.c.a.b null 穿透求值——实测两侧同款折叠 null（#63 修的是文法投影层，本例钉求值层；16 例全是存在路径，反向面零覆盖）",
+  "dimension": "result-shape",
+  "input": {},
+  "expect": null,
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s26_s4_null_penetration",
+    "inputType": { "dataType": "object" },
+    "nodes": [
+      { "type": "start", "id": "start", "next": "c" },
+      {
+        "type": "code",
+        "id": "c",
+        "language": "python",
+        "sandbox_backend": "subprocess",
+        "code": "def run(input):\n    return {'a': None}\n",
+        "next": "end"
+      },
+      { "type": "end", "id": "end", "resultType": "success", "output": "$NODE.c.a.b" }
+    ]
+  }
+}

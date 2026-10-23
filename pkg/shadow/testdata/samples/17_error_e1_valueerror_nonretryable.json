@@ -1,0 +1,20 @@
+{
+  "name": "17_error_e1_valueerror_nonretryable",
+  "description": "E1 错误分类×重试归属：ValueError（确定性四类白名单）不烧重试——py 信封 origin_type 判不重试、go pyDeterministicEnvelopeTypes 判 NonRetryable，retryTimes=5 预算全额保留（plaita-go#43 裁决口径）",
+  "dimension": "error-classification",
+  "input": {},
+  "expect": null,
+  "expectError": {"match": "ValueError: boom"},
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s17_e1_valueerror",
+    "inputType": {"dataType": "object"},
+    "nodes": [
+      {"type": "start", "id": "start", "next": "c"},
+      {"type": "code", "id": "c", "language": "python", "sandbox_backend": "subprocess",
+       "code": "def run(input):\n    raise ValueError('boom')\n",
+       "errorHandler": {"strategy": "abort", "retryTimes": 5}, "next": "end"},
+      {"type": "end", "id": "end", "resultType": "success", "output": "$NODE.c"}
+    ]
+  }
+}

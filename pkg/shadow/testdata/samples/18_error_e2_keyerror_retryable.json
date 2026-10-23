@@ -1,0 +1,20 @@
+{
+  "name": "18_error_e2_keyerror_retryable",
+  "description": "E2 错误分类×重试归属：KeyError（四类白名单之外）维持历史可重试缺省——两侧各烧满 retryTimes=2 即 3 次尝试；钉「白名单语义」而非「凡异常皆不重试」",
+  "dimension": "error-classification",
+  "input": {},
+  "expect": null,
+  "expectError": {"match": "KeyError: 'k'"},
+  "flow": {
+    "runtime": "python",
+    "flow_id": "shadow_s18_e2_keyerror",
+    "inputType": {"dataType": "object"},
+    "nodes": [
+      {"type": "start", "id": "start", "next": "c"},
+      {"type": "code", "id": "c", "language": "python", "sandbox_backend": "subprocess",
+       "code": "def run(input):\n    raise KeyError('k')\n",
+       "errorHandler": {"strategy": "abort", "retryTimes": 2}, "next": "end"},
+      {"type": "end", "id": "end", "resultType": "success", "output": "$NODE.c"}
+    ]
+  }
+}
