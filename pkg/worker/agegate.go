@@ -39,19 +39,31 @@ func taskAgeFromTimestamp(ts string) (float64, bool) {
 	return time.Since(t).Seconds(), true
 }
 
+// streamIDTime parses a Redis stream id ("<ms>-<seq>") into its write time.
+// Only purely numeric ids with a positive millisecond prefix carry a usable
+// write time (Python timestamp_from_stream_id 口径); "0-1" and non-numeric
+// ids report not-ok.
+func streamIDTime(messageID string) (time.Time, bool) {
+	dash := strings.IndexByte(messageID, '-')
+	if dash <= 0 {
+		return time.Time{}, false
+	}
+	ms, err := strconv.ParseInt(messageID[:dash], 10, 64)
+	if err != nil || ms <= 0 {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(ms), true
+}
+
 // taskAgeFromStreamID parses a Redis stream id ("<ms>-<seq>") into an age in
 // seconds. Only purely numeric ids carry a usable write time (Python
 // timestamp_from_stream_id 口径).
 func taskAgeFromStreamID(messageID string) (float64, bool) {
-	dash := strings.IndexByte(messageID, '-')
-	if dash <= 0 {
+	t, ok := streamIDTime(messageID)
+	if !ok {
 		return 0, false
 	}
-	ms, err := strconv.ParseInt(messageID[:dash], 10, 64)
-	if err != nil || ms <= 0 {
-		return 0, false
-	}
-	return time.Since(time.UnixMilli(ms)).Seconds(), true
+	return time.Since(t).Seconds(), true
 }
 
 // carrierAgeSeconds is the dual-source max age (payload timestamp vs Stream

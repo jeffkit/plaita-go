@@ -217,7 +217,9 @@ func TestWorkerStaleEventResumeLeavesExecutionSuspended(t *testing.T) {
 	}
 
 	// A carrier bound to a different subscription is stale: it must neither
-	// wake the node nor terminalize the execution.
+	// wake the node nor terminalize the execution. #68: the permanent
+	// rejection (ResumeGuardError) is ACKED — leaving it pending fed the
+	// reclaim → dead-letter → recovery-clone loop forever.
 	enqueueTask(t, rdb, cfg, map[string]any{
 		"type":         "resume",
 		"flow_id":      "event_stale_flow",
@@ -229,15 +231,18 @@ func TestWorkerStaleEventResumeLeavesExecutionSuspended(t *testing.T) {
 			"event_type":      "approval",
 		},
 	}, "")
-	if _, err := w.ProcessOne(ctx); err == nil {
-		t.Fatal("stale carrier must surface an error (message left pending)")
+	if _, err := w.ProcessOne(ctx); err != nil {
+		t.Fatalf("stale carrier ProcessOne: %v", err)
 	}
 	state := loadStateRow(t, rdb, cfg, executionID)
 	if state.Status != StatusSuspended {
 		t.Fatalf("status = %q, want suspended (stale carrier must not advance)", state.Status)
 	}
-	if got := pendingCount(t, rdb, cfg); got != 1 {
-		t.Fatalf("pending messages = %d, want 1 (stale carrier left pending)", got)
+	if got := pendingCount(t, rdb, cfg); got != 0 {
+		t.Fatalf("pending messages = %d, want 0 (permanently rejected carrier acked, #68)", got)
+	}
+	if n := streamLen(t, rdb, cfg.QueueName); n != 0 {
+		t.Fatalf("queue XLEN = %d, want 0 (acked + XDELed, #68)", n)
 	}
 }
 
