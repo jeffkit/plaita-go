@@ -2,6 +2,7 @@ package nodes
 
 import (
 	"context"
+	"fmt"
 	"maps"
 
 	validation "github.com/go-ozzo/ozzo-validation"
@@ -33,10 +34,26 @@ type BaseNode struct {
 
 // Validate validates the node info.
 func (n *BaseNode) Validate() error {
+	// #49: explicit policy enforcement — ozzo does not dispatch
+	// pointer-receiver Validatable on value struct fields, so the bare
+	// Field() rules below never invoked RecoverableErrorHandlePolicy.Validate
+	// (dead code: retryTimes=1e9 and 10-year node timeouts loaded clean).
+	// The timeout cap mirrors the IR loader's checkBudgetCaps (same
+	// MaxNodeTimeout; a longer budget belongs in an explicit flow-level
+	// timeout).
+	if err := n.ErrorHandlePolicy.Validate(); err != nil {
+		return err
+	}
+	if err := n.TimeoutHandlePolicy.Validate(); err != nil {
+		return err
+	}
+	if !n.Timeout.IsZero() && n.Timeout.TimeDuration() > workflow.MaxNodeTimeout {
+		return fmt.Errorf("timeout: %s exceeds the %s cap (plaita#267/#35); "+
+			"a longer budget needs an explicit flow-level timeout, which still sits under the worker execution deadline",
+			n.Timeout, workflow.MaxNodeTimeout)
+	}
 	return validation.ValidateStruct(n,
-		validation.Field(&n.ID, validation.Required.Error("node id is required")),
-		validation.Field(&n.ErrorHandlePolicy),
-		validation.Field(&n.TimeoutHandlePolicy))
+		validation.Field(&n.ID, validation.Required.Error("node id is required")))
 }
 
 // GetID returns the id of the node.

@@ -114,6 +114,20 @@ func (f *Workflow) Validate() error {
 		return err
 	}
 
+	// #49: the engine layer of the budget caps (budget.go). These explicit
+	// calls are the wiring — without them RecoverableErrorHandlePolicy.Validate
+	// / TimeoutHandlePolicy.Validate were dead code (ozzo does not dispatch
+	// pointer-receiver Validatable on value struct fields), so retryTimes=1e9
+	// and bogus strategies loaded clean at this entrypoint. The flow-level
+	// Timeout stays uncapped by decision (an operator budget that composes
+	// with the worker execution deadline at runtime).
+	if err := f.ErrorHandlePolicy.Validate(); err != nil {
+		return err
+	}
+	if err := f.TimeoutHandlePolicy.Validate(); err != nil {
+		return err
+	}
+
 	if _, ok := f.findStartNode(); !ok {
 		return ErrStartNodeNotFound
 	}
