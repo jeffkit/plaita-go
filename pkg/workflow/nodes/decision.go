@@ -594,11 +594,11 @@ func (decisionLLMProvider) Decide(ctx context.Context, req *DecisionRequest) (*D
 		}
 		results := make([]DecisionItemResult, 0, len(entries))
 		for _, entry := range entries {
-			choice, conf, err := one(entry)
+			choice, conf, err := one(entry.data)
 			if err != nil {
 				return nil, err
 			}
-			results = append(results, DecisionItemResult{Index: entry["_idx"].(int), Choice: choice, Confidence: conf})
+			results = append(results, DecisionItemResult{Index: entry.idx, Choice: choice, Confidence: conf})
 		}
 		return &DecisionOutcome{Results: results, Model: endpoint.Model, Raw: decisionTruncate(resp.Text, 2000)}, nil
 	}
@@ -611,10 +611,20 @@ func (decisionLLMProvider) Decide(ctx context.Context, req *DecisionRequest) (*D
 		Raw: decisionTruncate(resp.Text, 2000)}, nil
 }
 
+// decisionBatchEntry keeps the validated index out-of-band (idx) so the
+// model's own map is never augmented with engine keys — a model-supplied
+// "_idx" is just an ignored unknown key, and no trusted value can be
+// shadowed by upstream data (mirrors decision.py:116-146 returning
+// (index, entry) tuples).
+type decisionBatchEntry struct {
+	idx  int
+	data map[string]any
+}
+
 // decisionParseBatchEntries validates the model's results array shape the
 // way decision.py:116-146 does — including that "index" is an integer (a
 // JSON 2.0 is a Python float and is rejected).
-func decisionParseBatchEntries(data map[string]any, count int) ([]map[string]any, error) {
+func decisionParseBatchEntries(data map[string]any, count int) ([]decisionBatchEntry, error) {
 	raw, ok := data["results"]
 	if !ok {
 		raw = nil
@@ -624,7 +634,7 @@ func decisionParseBatchEntries(data map[string]any, count int) ([]map[string]any
 		return nil, fmt.Errorf("批量结果数不符：期望 %d 条，实际 %s",
 			count, decisionTruncate(decisionStringify(raw), 120))
 	}
-	out := make([]map[string]any, 0, count)
+	out := make([]decisionBatchEntry, 0, count)
 	for pos, el := range entries {
 		entry, ok := el.(map[string]any)
 		if !ok {
@@ -641,11 +651,7 @@ func decisionParseBatchEntries(data map[string]any, count int) ([]map[string]any
 		if idx < 0 || idx >= count {
 			return nil, fmt.Errorf("批量结果第 %d 条的 index 越界: %d（期望 0..%d）", pos, idx, count-1)
 		}
-		wrapped := map[string]any{"_idx": idx}
-		for k, v := range entry {
-			wrapped[k] = v
-		}
-		out = append(out, wrapped)
+		out = append(out, decisionBatchEntry{idx: idx, data: entry})
 	}
 	return out, nil
 }

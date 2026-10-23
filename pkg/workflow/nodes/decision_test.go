@@ -323,6 +323,46 @@ func TestDecisionBatch(t *testing.T) {
 	}
 }
 
+// #65: a model entry may carry a contract-foreign "_idx" key; like Python's
+// _indexed_batch (which keeps the trusted index out of the model map), it
+// must be treated as an ignored unknown key — never overwrite the trusted
+// index, never reach a bare type assertion (pre-fix: panic at the batch
+// loop's entry["_idx"].(int)).
+func TestDecisionBatchModelIdxKeyIsIgnored(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+	}{
+		{"string idx", `{"results":[{"index":0,"choice":"spam","confidence":0.9,"_idx":"boom"},{"index":1,"choice":"ham","confidence":0.9}]}`},
+		{"numeric idx", `{"results":[{"index":0,"choice":"spam","confidence":0.9,"_idx":7},{"index":1,"choice":"ham","confidence":0.9}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("model _idx key must not panic: %v", r)
+				}
+			}()
+			srv := decisionFakeLLM(t, tc.content, nil)
+			defer srv.Close()
+			n := decisionNode(srv.URL, func(d *Decision) { d.Items = []any{"a", "b"} })
+			res, err := n.Execute(llmContext(t, map[string]any{}, nil))
+			if err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+			results := res.Result.(map[string]any)["results"].([]map[string]any)
+			if len(results) != 2 {
+				t.Fatalf("results = %v", results)
+			}
+			if results[0]["index"] != 0 || results[0]["choice"] != "spam" {
+				t.Errorf("r0 = %v", results[0])
+			}
+			if results[1]["index"] != 1 || results[1]["choice"] != "ham" {
+				t.Errorf("r1 = %v", results[1])
+			}
+		})
+	}
+}
+
 func TestDecisionDryRun(t *testing.T) {
 	srv := decisionFakeLLM(t, `{"choice":"spam","confidence":0.9}`, nil)
 	defer srv.Close()
