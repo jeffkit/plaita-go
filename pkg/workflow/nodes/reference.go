@@ -79,6 +79,16 @@ func (r *Reference) Execute(ctx context.Context) (*workflow.ExecuteResult, error
 
 	result, err := target.Execute(r.referenceChildContext(ctx), input)
 	if err != nil {
+		// 嵌套挂起 v1 传播转换点（主闸）：rs 的教训——reference 的 ambient
+		// 父链会遮蔽作用域闸的链行走（seed → ambient → nil），本转换点的
+		// 调用方帧 kind 是真实帧，是 loop→reference 组合的正确性主闸：
+		// 迭代/分支帧上的载体在此具名拒绝并注销已注册订阅；child/reference
+		// 调用链放行，载体原样上抛。
+		if susp := workflow.AsSuspend(err); susp != nil {
+			if rc := runtime.WorkflowRuntimeContext(ctx); !rc.FrameKind.AllowsSuspension() {
+				err = workflow.RejectSuspendedCarrier(ctx, susp, rc.FrameKind)
+			}
+		}
 		return nil, fmt.Errorf("reference node %q: failed to execute referenced workflow (%q): %w", r.GetID(), target.ID, err)
 	}
 	return &workflow.ExecuteResult{Result: result, NextNode: r.NextNode()}, nil
@@ -101,6 +111,9 @@ func (r *Reference) referenceChildContext(ctx context.Context) context.Context {
 		ParentWorkflowContext: ambientCtx,
 		FlowID:                parent.FlowID,
 		ExecutionID:           parent.ExecutionID,
+		// 嵌套挂起 v1：reference 帧标注。ambient 保持 Root kind（rs 同款——
+		// 链行走因此对 loop→reference 组合失明，主闸在 reference.go 的转换点）。
+		FrameKind: runtime.FrameKindReferenceCall,
 	}
 	return runtime.WithWorkflowRuntimeContext(ambientCtx, seed)
 }

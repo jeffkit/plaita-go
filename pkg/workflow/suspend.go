@@ -22,10 +22,12 @@ import (
 //     node's next pointer — the same polymorphic dispatch as
 //     `DistributedStrategy._handle_resume` + `EventNode.resume`.
 //
-// Scope (deliberate, fail-closed): only the ROOT flow can suspend. A
-// suspending node inside a child/loop/parallel sub-flow returns an explicit
-// engine error instead of parking a nested execution whose resume position
-// the checkpoint cannot express.
+// Scope (nested suspend v1, rs 语义契约对齐): a suspending node inside a
+// child/reference CALL CHAIN suspends the whole tree — the live call stack
+// travels on the SuspendError carrier and ResumeSuspension walks it back to
+// the root. A suspension on a loop/map/filter/find/reduce/while iteration
+// frame or a parallel branch frame is named-rejected (SuspendRejectedError):
+// its resume position needs iteration-state snapshotting, a future milestone.
 
 // Resume carrier types (§9.2 / plaita ResumeType).
 const (
@@ -141,6 +143,61 @@ type SuspendError struct {
 	Checkpoint *Checkpoint
 	// SubscriptionID is the registered wake-up subscription, when any.
 	SubscriptionID string
+	// 嵌套挂起 v1（进程内载体，rs SuspendedExecution 同形）：Flow 是挂起节点
+	// 所在的 flow，Ctx 是该帧的活运行态；CallStack 是待返回的父帧，index 0 =
+	// 最内父帧，递增到根（空栈 = 根流程挂起）。Checkpoint 保持扁平单帧快照
+	// （worker 持久化层如何序列化调用栈路径是后续单的规格面，见 jeffkit/
+	// plaita-go#88 备注）。
+	Flow      *Workflow
+	Ctx       *runtime.Context
+	CallStack []CallFrame
+}
+
+// CallFrame is one frame of a nested suspension's call stack: the parent
+// execution awaiting the return of its child node (rs CallFrame 同形).
+type CallFrame struct {
+	// NodeID is the child node id inside the parent flow.
+	NodeID NodeID
+	// Workflow is the parent flow containing the child node.
+	Workflow *Workflow
+	// Ctx is the parent frame's live runtime context.
+	Ctx *runtime.Context
+}
+
+// CallStackPathEntry is one (flow_id, node_id) pair of the suspension's call
+// stack path (the observation surface, rs call_stack_path 同形).
+type CallStackPathEntry struct {
+	FlowID string
+	NodeID NodeID
+}
+
+// CallStackPath returns the suspension's call stack path: the flow_id/node_id
+// chain from the innermost parent frame up to the root (observation only).
+func (e *SuspendError) CallStackPath() []CallStackPathEntry {
+	if e == nil {
+		return nil
+	}
+	out := make([]CallStackPathEntry, 0, len(e.CallStack))
+	for _, frame := range e.CallStack {
+		flowID := ""
+		if frame.Workflow != nil {
+			flowID = string(frame.Workflow.ID)
+		}
+		out = append(out, CallStackPathEntry{FlowID: flowID, NodeID: frame.NodeID})
+	}
+	return out
+}
+
+// carrierTenant reads the registration tenant recorded in the carrier's
+// snapshot (resume/rejection deregisters the exact namespaced key).
+func (e *SuspendError) carrierTenant() (string, bool) {
+	if e == nil || e.Checkpoint == nil {
+		return "", false
+	}
+	nodes, _ := e.Checkpoint.Context["$NODE"].(map[string]any)
+	state, _ := nodes[string(e.NodeID)].(map[string]any)
+	tenant, ok := state["subscription_tenant"].(string)
+	return tenant, ok
 }
 
 func (e *SuspendError) Error() string {
@@ -158,6 +215,64 @@ func AsSuspend(err error) *SuspendError {
 		return se
 	}
 	return nil
+}
+
+// SuspendRejectedError is the named scope-gate rejection of nested suspend v1
+// (rs FlowError::SuspendRejected / ErrorClass::SuspendRejected 同形): the
+// suspension cannot be expressed as a resumable position (iteration frame /
+// parallel branch frame). Fail-closed: a terminal error — never retried,
+// never swallowed by any errorHandler/timeoutHandler policy, no pending state
+// and no subscription left behind.
+type SuspendRejectedError struct{ Message string }
+
+func (e *SuspendRejectedError) Error() string { return e.Message }
+
+// IsSuspendRejected reports whether err carries a scope-gate rejection
+// (possibly wrapped).
+func IsSuspendRejected(err error) bool {
+	var sre *SuspendRejectedError
+	return errors.As(err, &sre)
+}
+
+// RejectSuspendedCarrier named-rejects a suspension carrier that crossed a
+// blocking frame boundary (rs suspension_carrier_or_reject 的拒绝臂同形) and
+// unregisters the subscription it already registered — the subscription was
+// registered before the conversion point could see the blocking frame (the
+// reference ambient chain blinds the advisory gate), so deregistering here is
+// what keeps the rejection orphan-free.
+func RejectSuspendedCarrier(ctx context.Context, susp *SuspendError, blocker runtime.FrameKind) error {
+	if susp != nil && susp.SubscriptionID != "" {
+		if opts := SuspendOptionsFromContext(ctx); opts != nil && opts.Subscriptions != nil {
+			tenant := opts.TenantID
+			if stored, ok := susp.carrierTenant(); ok {
+				tenant = stored
+			}
+			_ = opts.Subscriptions.Unregister(ctx, susp.SubscriptionID, tenant)
+		}
+	}
+	return &SuspendRejectedError{Message: fmt.Sprintf(
+		"suspension carrier crossed a %s frame boundary: suspension v1 supports only "+
+			"child/reference call chains (subscription deregistered)", blocker)}
+}
+
+// frameChainBlocker walks the frame chain from rc to the root and returns the
+// first frame kind that cannot carry a suspension (advisory fast path, rs
+// frame_chain_blocker 同形). The chain walk can be blinded by the reference
+// node's ambient parent link — this check only guarantees "rejected BEFORE the
+// subscription registration" (no orphans); correctness is owned by the
+// caller-frame-kind check at the propagation conversion points (nodes package).
+func frameChainBlocker(rc *runtime.Context) (runtime.FrameKind, bool) {
+	for rc != nil {
+		if !rc.FrameKind.AllowsSuspension() {
+			return rc.FrameKind, true
+		}
+		parent, ok := runtime.LookupWorkflowRuntimeContext(rc.ParentWorkflowContext)
+		if !ok || parent == nil {
+			break
+		}
+		rc = parent
+	}
+	return runtime.FrameKindRoot, false
 }
 
 // ResumeGuardError is plaita's ResumeGuardError: the resume carrier cannot be
@@ -351,12 +466,19 @@ func stripResumeBindingKey(data map[string]any) map[string]any {
 
 // suspend parks the flow at node: it registers the node's wake-up
 // subscription, snapshots the execution context, persists the checkpoint and
-// surfaces a *SuspendError.
+// surfaces a *SuspendError carrying the live frames (nested suspend v1).
 func (f *Workflow) suspend(ctx context.Context, node Node, result *ExecuteResult) error {
 	rc := runtime.WorkflowRuntimeContext(ctx)
-	if rc.ParentWorkflowContext != nil {
-		return fmt.Errorf("node %s suspended inside a nested flow: checkpoint v1.5 only supports suspend/resume in the root flow",
-			node.GetID())
+	// 作用域闸（嵌套挂起 v1）：child/reference 调用链允许（恢复位置由载体的
+	// 活帧调用栈表达）；迭代帧/分支帧具名拒绝（恢复需要迭代状态快照，v2）。
+	// 本检查是注册订阅**之前**的快路径（防孤儿订阅）；reference 帧的 ambient
+	// 父链会遮蔽链行走，正确性由传播转换点的调用方帧 kind 检查兜底（nodes 包，
+	// 越界载体在转换点具名拒并注销已注册订阅）。
+	if blocker, blocked := frameChainBlocker(rc); blocked {
+		return &SuspendRejectedError{Message: fmt.Sprintf(
+			"node %s suspends inside a %s frame: suspension v1 supports only child/reference "+
+				"call chains (iteration-state snapshotting is a future milestone; see docs/PROGRAM.md)",
+			node.GetID(), blocker)}
 	}
 	opts := SuspendOptionsFromContext(ctx)
 
@@ -428,7 +550,13 @@ func (f *Workflow) suspend(ctx context.Context, node Node, result *ExecuteResult
 			return fmt.Errorf("checkpoint persist for node %s: %w", node.GetID(), err)
 		}
 	}
-	return &SuspendError{NodeID: node.GetID(), Checkpoint: cp, SubscriptionID: subscriptionID}
+	return &SuspendError{
+		NodeID:         node.GetID(),
+		Checkpoint:     cp,
+		SubscriptionID: subscriptionID,
+		Flow:           f,
+		Ctx:            rc,
+	}
 }
 
 // buildCheckpoint snapshots the runtime context at the suspend boundary.

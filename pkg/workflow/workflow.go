@@ -339,6 +339,17 @@ func (f *Workflow) runNodes(ctx context.Context, node Node) (any, error) {
 	for node != nil {
 		result, err := f.executeNode(ctx, node)
 		if err != nil {
+			// 嵌套挂起 v1：内层挂起沿子节点体上抛到本层——把本帧压入其调用
+			// 栈后继续向上（rs advance_from 的 push_frame 同形）。挂起不是本
+			// 层节点的失败；作用域闸拒绝（SuspendRejectedError）不是载体，
+			// 不压帧。
+			if susp := AsSuspend(err); susp != nil {
+				susp.CallStack = append(susp.CallStack, CallFrame{
+					NodeID:   node.GetID(),
+					Workflow: f,
+					Ctx:      runtime.WorkflowRuntimeContext(ctx),
+				})
+			}
 			return nil, err
 		}
 
@@ -515,6 +526,16 @@ func (f *Workflow) executeNode(ctx context.Context, node Node) (result *ExecuteR
 		if err == nil {
 			return nil
 		}
+		// 嵌套挂起 v1：挂起载体与作用域闸拒绝先于一切策略链（预算归属/超时/
+		// 重试/errorHandler）原样上抛，与取消同待遇——挂起不是节点失败。
+		// 不带 RetryableError 标记返回：IsRetryableError 对未知错误默认可
+		// 重试，标记会让 retrier 重跑整个子流。
+		if AsSuspend(err) != nil {
+			return err
+		}
+		if IsSuspendRejected(err) {
+			return err
+		}
 		if contextTimeoutError(err) {
 			if flowBudgetBinding(runtimeCtx, ctx) {
 				// The flow-level budget is the binding constraint — this is a
@@ -536,6 +557,14 @@ func (f *Workflow) executeNode(ctx context.Context, node Node) (result *ExecuteR
 	}
 	errorHandlePolicy := node.GetErrorHandlePolicy()
 	if err = errorHandlePolicy.Retrier().Do(ctx, retryFunc); err != nil {
+		// 嵌套挂起 v1：挂起载体/作用域闸拒绝不可被 errorHandler continue 吞
+		//（rs 修正清单 #3——continue 策略不得把挂起洗成默认值，fail-closed）。
+		if AsSuspend(err) != nil {
+			return nil, err
+		}
+		if IsSuspendRejected(err) {
+			return nil, err
+		}
 		// 当错误策略是继续执行时，把错误信息存到Context中
 		if errorHandlePolicy.IsContinue() {
 			runtimeCtx := runtime.WorkflowRuntimeContext(ctx)

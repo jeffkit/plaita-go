@@ -24,8 +24,21 @@ func runCollectionChild(ctx context.Context, childFlow *workflow.Workflow, input
 	childCtx := runtime.WithWorkflowRuntimeContext(ctx, &runtime.Context{
 		WorkflowInput:         input,
 		ParentWorkflowContext: ctx,
+		// 嵌套挂起 v1：迭代帧标注（作用域闸的链行走依据之一）。
+		FrameKind: runtime.FrameKindLoopIteration,
 	})
-	return childFlow.Execute(childCtx, input)
+	result, err := childFlow.Execute(childCtx, input)
+	if err != nil {
+		// 迭代帧边界（rs 修正清单 #2）：挂起载体在循环帧上无条件具名拒绝并
+		// 注销已注册订阅——绝不进普通错误链（stringify 会变成可重试可吞的
+		// transient：重试 N 次 × N 条孤儿订阅 × 可被 errorHandler 吞）；
+		// 作用域闸拒绝原样透传（具名保真）。
+		if susp := workflow.AsSuspend(err); susp != nil {
+			return nil, workflow.RejectSuspendedCarrier(ctx, susp, runtime.FrameKindLoopIteration)
+		}
+		return nil, err
+	}
+	return result, nil
 }
 
 // collectionExecuteResult is the shared output tail: without an explicit
