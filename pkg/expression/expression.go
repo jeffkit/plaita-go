@@ -72,7 +72,10 @@ func Eval(ctx context.Context, expr any) (any, error) {
 		for k, v := range e {
 			vv, err := Eval(ctx, v)
 			if err != nil {
-				return nil, fmt.Errorf("failed to eval expression %q: %v", v, err)
+				// %w keeps the wrap chain intact so the engine's deterministic
+				// bridge can classify a recovered plaitaexpr RuntimeError (#56);
+				// rendered text identical to the historical %v form.
+				return nil, fmt.Errorf("failed to eval expression %q: %w", v, err)
 			}
 			m[k] = vv
 		}
@@ -82,7 +85,7 @@ func Eval(ctx context.Context, expr any) (any, error) {
 		for _, v := range e {
 			vv, err := Eval(ctx, v)
 			if err != nil {
-				return nil, fmt.Errorf("failed to eval expression %q: %v", v, err)
+				return nil, fmt.Errorf("failed to eval expression %q: %w", v, err)
 			}
 			res = append(res, vv)
 		}

@@ -86,7 +86,10 @@ func (e *End) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
 
 	evaluatedOutput, err := expression.Eval(ctx, e.Output)
 	if err != nil {
-		return nil, fmt.Errorf("failed to evaluate end node output: %v", err)
+		// %w keeps the wrap chain intact — the deterministic bridge classifies
+		// a recovered plaitaexpr RuntimeError by walking it (#56); the rendered
+		// text is identical to the historical %v form.
+		return nil, fmt.Errorf("failed to evaluate end node output: %w", err)
 	}
 
 	// Validate the evaluated output using the OutputType Property
