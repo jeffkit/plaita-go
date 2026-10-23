@@ -330,8 +330,24 @@ func preResolveStatementVariables(expr parser.Expr, statement string, execArgs m
 		rewrites = append(rewrites, rewrite{from: v.Variable, to: synthetic})
 	}
 
-	for _, r := range rewrites {
-		statement = replaceStatementVariable(statement, r.from, r.to)
+	if len(rewrites) > 0 {
+		// Mask literals around the rewrite loop (#62): the boundary regex in
+		// replaceStatementVariable hits business text inside string arguments
+		// ("see $INPUT.a here" became "see __pv0 here") and leaked the
+		// engine's internal naming into flow output. Same masking shape as
+		// referencesLiveRoot below.
+		var literals []string
+		masked := quotedSpanRe.ReplaceAllStringFunc(statement, func(lit string) string {
+			literals = append(literals, lit)
+			return fmt.Sprintf("\x00%d\x00", len(literals)-1)
+		})
+		for _, r := range rewrites {
+			masked = replaceStatementVariable(masked, r.from, r.to)
+		}
+		for i, lit := range literals {
+			masked = strings.ReplaceAll(masked, fmt.Sprintf("\x00%d\x00", i), lit)
+		}
+		statement = masked
 	}
 	return statement, nil
 }

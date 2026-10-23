@@ -117,15 +117,35 @@ func slice(v any, start, end any) (any, error) {
 // appendItem is plaita $F.append/$F.addListItem — Python `a + [b]`: returns a
 // NEW list; the input list (and whatever backing array it shares) is never
 // modified (issue #9: the previous append(slice, item) could write through a
-// shared backing array).
-func appendItem(s []any, item any) []any {
+// shared backing array). The result-size gate runs before the allocation
+// (#64, _fn_append shape: projection len+1, elements unit).
+func appendItem(s []any, item any) ([]any, error) {
+	if err := checkResultSize(fmt.Sprintf("$F.append(%d + 1)", len(s)), int64(len(s))+1, int64(len(s))+1, "elements"); err != nil {
+		return nil, err
+	}
 	out := make([]any, 0, len(s)+1)
 	out = append(out, s...)
-	return append(out, item)
+	return append(out, item), nil
 }
 
 // extend is plaita $F.extend(a, b) — Python `a + b` (same domain as add).
+// Same-kind concatenation is gated under extend's own name before delegating
+// (#64): Python's _fn_extend wording carries `$F.extend(...)`, not `$F.add`.
 func extend(a, b any) (any, error) {
+	if as, ok := a.(string); ok {
+		if bs, ok2 := b.(string); ok2 {
+			if err := gatePairConcat("$F.extend", int64(utf8.RuneCountInString(as)), int64(utf8.RuneCountInString(bs)), "chars"); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if al, ok := a.([]any); ok {
+		if bl, ok2 := b.([]any); ok2 {
+			if err := gatePairConcat("$F.extend", int64(len(al)), int64(len(bl)), "elements"); err != nil {
+				return nil, err
+			}
+		}
+	}
 	return add(a, b)
 }
 

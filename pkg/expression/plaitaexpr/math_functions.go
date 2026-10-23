@@ -87,11 +87,19 @@ func add(a, b any) (any, error) {
 	}
 	if as, aok := a.(string); aok {
 		if bs, bok := b.(string); bok {
+			// result-size gate before the allocation (#64): the projection
+			// equals the input size, only the hard cap binds.
+			if err := gatePairConcat("$F.add", int64(utf8.RuneCountInString(as)), int64(utf8.RuneCountInString(bs)), "chars"); err != nil {
+				return nil, err
+			}
 			return as + bs, nil
 		}
 	}
 	if al, aok := a.([]any); aok {
 		if bl, bok := b.([]any); bok {
+			if err := gatePairConcat("$F.add", int64(len(al)), int64(len(bl)), "elements"); err != nil {
+				return nil, err
+			}
 			out := make([]any, 0, len(al)+len(bl))
 			out = append(out, al...)
 			out = append(out, bl...)
