@@ -3,6 +3,8 @@ package workflow_test
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"testing"
 	"time"
@@ -12,7 +14,25 @@ import (
 	"github.com/jeffkit/plaita-go/pkg/workflow/nodes"
 )
 
+// refusedURL returns a loopback URL whose port was listening a moment ago and
+// is now closed, so every dial fails with ECONNREFUSED. The error-node cases
+// need a transport-level failure (code 1002, which carries the request
+// snapshot); a public hostname cannot provide one reliably: without egress
+// DNS fails (1002), with egress a redirect chain ends in a 200 value, and
+// behind an HTTP proxy the proxy answers 502 for unresolvable hosts — a 5xx
+// is a VALUE for this node (#12), so no error frame is written and
+// $ERROR.http evaluates to []. Loopback is exempt from proxying regardless
+// of NO_PROXY, so the outcome depends on none of the three.
+func refusedURL(t *testing.T) string {
+	t.Helper()
+	srv := httptest.NewServer(http.NotFoundHandler())
+	u := srv.URL
+	srv.Close()
+	return u
+}
+
 func TestWorkflow_Execute(t *testing.T) {
+	refused := refusedURL(t)
 	tests := []struct {
 		name        string
 		wf          *workflow.Workflow
@@ -154,7 +174,7 @@ func TestWorkflow_Execute(t *testing.T) {
 								RetryTimes:   0,
 							},
 						},
-						RawURL:        "http://invalid-url",
+						RawURL:        refused,
 						RawAddressing: &nodes.RawAddressing{},
 					},
 					&nodes.End{
@@ -190,7 +210,7 @@ func TestWorkflow_Execute(t *testing.T) {
 								RetryTimes:   0,
 							},
 						},
-						RawURL:        "http://tencent.com",
+						RawURL:        refused,
 						RawAddressing: &nodes.RawAddressing{},
 					},
 					&nodes.End{

@@ -19,8 +19,9 @@ build:
 test:
 	GOPROXY=$(GOPROXY) go test ./... -count=1 -skip '$(SKIP)'
 
-# Same suite with the CI skips removed — red on a host without egress, which is
-# why the skip exists; run it when touching the http node.
+# Same suite with the CI skips removed (currently only Test_now_today_eval,
+# unstable under -count>1; see AGENTS.md 已知问题). The http node tests are
+# hermetic (httptest) — nothing here needs egress.
 test-all:
 	GOPROXY=$(GOPROXY) go test ./... -count=1
 
