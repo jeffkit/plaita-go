@@ -37,6 +37,15 @@ type ExecuteResult struct {
 	NextNode NodeID
 }
 
+// childOutputTyper is satisfied by nodes exposing their declared output
+// schema (nodes.BaseNode.GetOutputType) — the nested-suspend return step
+// validates the child's value against it (rs validate_child_return_output
+// 同形). Duck-typed so engine-level node implementations without a schema
+// keep working.
+type childOutputTyper interface {
+	GetOutputType() Property
+}
+
 // Nodes represents slice of Node
 type Nodes []Node
 
