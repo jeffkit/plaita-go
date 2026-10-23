@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -135,13 +136,71 @@ func Run(ctx context.Context, spec *AgentSpec, opts RunOptions) (*RunResult, err
 	return readEvents(ctx, cmd, stdout, opts)
 }
 
+// streamGrace bounds the waits that follow the end of the stream (or a
+// watchdog kill): how long the direct child may take to exit — and the pipe
+// to drain — before the group is killed and the wait is abandoned. Bridges
+// exit as soon as their stdout closes, so the ceiling only bites a bridge
+// that hangs after its last byte, or a grandchild that escaped the process
+// group and holds the write end; without it Run's bounded phases turn back
+// into an unbounded one (#66).
+const streamGrace = 5 * time.Second
+
+func closeReader(stdout interface {
+	Read([]byte) (int, error)
+}) {
+	if c, ok := stdout.(io.Closer); ok {
+		_ = c.Close()
+	}
+}
+
+// drainStream waits for the reader goroutine, but no longer than
+// streamGrace. On expiry the read end is closed so a scanner blocked on a
+// pipe that will never EOF (an escapee holding the write end) wakes up and
+// the goroutine finishes; either way it returns only after done is closed,
+// so everything the reader wrote is visible to the caller.
+func drainStream(stdout interface {
+	Read([]byte) (int, error)
+}, done <-chan struct{}) {
+	select {
+	case <-done:
+		return
+	case <-time.After(streamGrace):
+	}
+	closeReader(stdout)
+	<-done
+}
+
+// waitCommand reaps the child behind a streamGrace ceiling: a process still
+// running after the stream is over gets killed, and a kill that somehow does
+// not reap within another grace is reported instead of waited on. The bool
+// reports that the ceiling fired — the caller prefers a named failure over
+// interpreting whatever exit status the kill raced into.
+func waitCommand(cmd *exec.Cmd) (graceKilled bool, waitErr error) {
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	select {
+	case err := <-waitDone:
+		return false, err
+	case <-time.After(streamGrace):
+		killGroup(cmd)
+		select {
+		case err := <-waitDone:
+			return true, err
+		case <-time.After(streamGrace):
+			return true, fmt.Errorf("process did not exit within %s of the group kill", 2*streamGrace)
+		}
+	}
+}
+
 // readPlain handles the plain stdout path (recursive-direct): accumulate
 // everything, then extract the trailing JSON result object.
 //
 // Ordering matters: the stream must be drained to EOF BEFORE cmd.Wait() —
 // exec closes the pipe's read end inside Wait, so reaping first can lose
 // buffered output (documented os/exec pitfall).
-func readPlain(ctx context.Context, cmd *exec.Cmd, stdout interface{ Read([]byte) (int, error) }, opts RunOptions) (*RunResult, error) {
+func readPlain(ctx context.Context, cmd *exec.Cmd, stdout interface {
+	Read([]byte) (int, error)
+}, opts RunOptions) (*RunResult, error) {
 	var body strings.Builder
 	var details []string
 	done := make(chan struct{})
@@ -164,12 +223,12 @@ func readPlain(ctx context.Context, cmd *exec.Cmd, stdout interface{ Read([]byte
 
 	// watchdog only kills; the stream goroutine observes EOF and finishes
 	if err := armWatchdog(ctx, cmd, opts.Timeout, done); err != nil {
-		<-done
-		_ = cmd.Wait()
+		drainStream(stdout, done)
+		_, _ = waitCommand(cmd)
 		return nil, fmt.Errorf("agentproc: %s", err)
 	}
 
-	waitErr := cmd.Wait()
+	graceKilled, waitErr := waitCommand(cmd)
 
 	res := &RunResult{SessionID: opts.SessionID, Details: details}
 	obj := extractRecursiveResult(body.String())
@@ -186,6 +245,9 @@ func readPlain(ctx context.Context, cmd *exec.Cmd, stdout interface{ Read([]byte
 	res.Text = ResultText(obj)
 	if raw, _ := obj["raw"].(bool); raw {
 		res.Text = strings.TrimSpace(res.Text)
+	}
+	if graceKilled {
+		return res, fmt.Errorf("agentproc: stream ended but the process did not exit within %s (process group killed)", streamGrace)
 	}
 	if waitErr != nil {
 		if exitErr, ok := waitErr.(*exec.ExitError); ok && res.Text == "" {
@@ -205,7 +267,9 @@ type turnOutcome struct {
 	terminalErrSet bool
 }
 
-func readEvents(ctx context.Context, cmd *exec.Cmd, stdout interface{ Read([]byte) (int, error) }, opts RunOptions) (*RunResult, error) {
+func readEvents(ctx context.Context, cmd *exec.Cmd, stdout interface {
+	Read([]byte) (int, error)
+}, opts RunOptions) (*RunResult, error) {
 	out := &turnOutcome{streaming: opts.Streaming, RunResult: RunResult{Details: []string{}}}
 	if opts.SessionID != "" {
 		out.SessionID = opts.SessionID
@@ -224,6 +288,13 @@ func readEvents(ctx context.Context, cmd *exec.Cmd, stdout interface{ Read([]byt
 			out.consumeLine(line)
 			if out.terminalErrSet {
 				// spec: after an error the host may stop reading entirely.
+				// The bridge neither exits nor stops writing on our behalf,
+				// so stop it here: an alive process would pin cmd.Wait()
+				// below forever, defeating Timeout and the caller's ctx
+				// (#66). failedReason is already recorded and outranks
+				// whatever exit status the kill produces.
+				killGroup(cmd)
+				closeReader(stdout)
 				break
 			}
 		}
@@ -232,14 +303,23 @@ func readEvents(ctx context.Context, cmd *exec.Cmd, stdout interface{ Read([]byt
 	// watchdog only kills; the stream goroutine observes EOF and finishes.
 	// Drain to EOF BEFORE cmd.Wait() — exec closes the read end inside Wait.
 	if err := armWatchdog(ctx, cmd, opts.Timeout, done); err != nil {
-		<-done
-		_ = cmd.Wait()
+		drainStream(stdout, done)
+		_, _ = waitCommand(cmd)
+		// a recorded terminal error outranks the watchdog's cleanup reason
+		if out.failedReason != "" {
+			return &out.RunResult, fmt.Errorf("agentproc: %s", out.failedReason)
+		}
 		return &out.RunResult, fmt.Errorf("agentproc: %s", err)
 	}
 
-	waitErr := cmd.Wait()
+	graceKilled, waitErr := waitCommand(cmd)
 
-	if out.failedReason == "" && waitErr != nil {
+	switch {
+	case out.failedReason != "":
+		// terminal error event wins over the exit status
+	case graceKilled:
+		out.failedReason = fmt.Sprintf("stream ended but the process did not exit within %s (process group killed)", streamGrace)
+	case waitErr != nil:
 		if exitErr, ok := waitErr.(*exec.ExitError); ok {
 			out.failedReason = fmt.Sprintf("agent exited with code %d", exitErr.ExitCode())
 		} else {
@@ -255,7 +335,10 @@ func readEvents(ctx context.Context, cmd *exec.Cmd, stdout interface{ Read([]byt
 
 // armWatchdog kills the process group when the turn exceeds its timeout or
 // the caller's context is canceled. It reports the kill reason as an error;
-// nil means the stream reached EOF first (normal completion).
+// nil means the reader goroutine finished first — stream EOF, a terminal
+// error event's early exit, or a read failure. done is the reader's
+// liveness, NOT proof the child exited or the pipe drained; the bounded
+// drain/wait that follows covers what remains (#66).
 func armWatchdog(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, done <-chan struct{}) error {
 	if timeout <= 0 {
 		// fall back to a very long ceiling so ctx still governs

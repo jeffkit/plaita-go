@@ -2,9 +2,12 @@ package agentproc
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -230,5 +233,108 @@ func TestRunEmptyMessageRejected(t *testing.T) {
 	spec := &AgentSpec{Name: "fake", Command: "/bin/sh", Args: []string{"-c", "exit 0"}}
 	if _, err := Run(context.Background(), spec, RunOptions{Message: "  "}); err == nil {
 		t.Fatal("empty turn must be rejected (spec: empty turns are an error)")
+	}
+}
+
+// #66: after a terminal error event the bridge may keep streaming (the spec
+// only says the host MAY stop reading) or keep running without exiting —
+// Run must still return promptly. Pre-fix the host broke out of the read
+// loop, the watchdog stood down on the closed done channel, and cmd.Wait()
+// blocked forever, defeating both Timeout and the caller's ctx.
+func TestRunErrorEventThenStreamReturns(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		script string
+	}{
+		{"loud stream", `printf '%s\n' '{"type":"error","message":"boom"}'; yes hello`},
+		{"silent hang", `printf '%s\n' '{"type":"error","message":"boom"}'; sleep 600`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pidFile := filepath.Join(t.TempDir(), "pid")
+			script := fmt.Sprintf("echo $$ > %s; %s", pidFile, tc.script)
+			spec := &AgentSpec{Name: "fake", Command: "/bin/sh", Args: []string{"-c", script}}
+			start := time.Now()
+			done := make(chan error, 1)
+			var res *RunResult
+			go func() {
+				var err error
+				res, err = Run(context.Background(), spec, RunOptions{Message: "hi", Streaming: true, Timeout: 2 * time.Second})
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if elapsed := time.Since(start); elapsed > 3*time.Second {
+					t.Errorf("Run returned in %s, want ≤3s", elapsed)
+				}
+				if err == nil || !strings.Contains(err.Error(), "error: boom") {
+					t.Fatalf("err = %v, want error: boom", err)
+				}
+				if res == nil {
+					t.Fatal("Run returned nil result; partials/session must survive the error")
+				}
+			case <-time.After(8 * time.Second):
+				t.Fatal("Run did not return within 8s — unbounded wait after the error event (#66)")
+			}
+			assertBridgeGone(t, pidFile)
+		})
+	}
+}
+
+// #66 ctx variant: with no host timeout the caller's context must still
+// bound the turn. The error event arrives first, so the message is the
+// error's, but the invariant under test is bounded return.
+func TestRunErrorEventThenCtxCancelReturns(t *testing.T) {
+	spec := &AgentSpec{Name: "fake", Command: "/bin/sh", Args: []string{"-c",
+		`printf '%s\n' '{"type":"error","message":"boom"}'; sleep 600`}}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		_, err := Run(ctx, spec, RunOptions{Message: "hi", Streaming: true})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Errorf("Run returned in %s, want ≤1s", elapsed)
+		}
+		if err == nil || !(strings.Contains(err.Error(), "error: boom") || strings.Contains(err.Error(), "canceled")) {
+			t.Fatalf("err = %v, want error: boom or canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return within 5s — ctx unenforced after the error event (#66)")
+	}
+}
+
+// Conservation: a streaming writer WITHOUT an error event still goes through
+// the watchdog — timeout text and prompt return are unchanged.
+func TestRunTimeoutStillKillsStreamingWriter(t *testing.T) {
+	start := time.Now()
+	_, err := runScript(t, `yes hello`, RunOptions{Message: "hi"}, 300*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "timeout after 300ms") {
+		t.Fatalf("err = %v, want timeout", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("timeout kill took %s", elapsed)
+	}
+}
+
+// assertBridgeGone signals the recorded bridge pid with 0 — after the group
+// kill and reap it must be gone (ESRCH).
+func assertBridgeGone(t *testing.T, pidFile string) {
+	t.Helper()
+	pidBuf, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("pid file: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(pidBuf)))
+	if err != nil || pid <= 0 {
+		t.Fatalf("bad pid %q", pidBuf)
+	}
+	if p, err := os.FindProcess(pid); err == nil {
+		if err := p.Signal(syscall.Signal(0)); err == nil {
+			t.Errorf("bridge pid %d still alive after Run returned", pid)
+		}
 	}
 }
