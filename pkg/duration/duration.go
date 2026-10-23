@@ -53,6 +53,9 @@ func ParseISO8601(s string) (Duration, error) {
 	if err != nil {
 		return Duration{}, err
 	}
+	if weeks > math.MaxInt64/7 {
+		return Duration{}, unrepresentable(s)
+	}
 	days += weeks * 7
 	hours, err := atofComponent(m[5], s)
 	if err != nil {
@@ -66,11 +69,32 @@ func ParseISO8601(s string) (Duration, error) {
 	if err != nil {
 		return Duration{}, err
 	}
+	// The synthesis below is int64 nanoseconds with no natural overflow
+	// check — a declared budget past time.Duration's ~292-year domain used
+	// to wrap into a negative, zero, or shortened budget that only detonated
+	// at execute time (#57). Bound the total in float64 before converting
+	// (components are non-negative, so every per-component conversion then
+	// stays in range and cannot wrap negative on either float->int behaviour:
+	// amd64 wraps, arm64 saturates); the post-synthesis guard catches a
+	// float-rounding slip in the last nanoseconds of the domain. Named
+	// fail-closed shape aligned with plaita-rs duration.rs.
+	if total := (float64(days)*86400 + hours*3600 + minutes*60 + seconds) * 1e9; total > float64(math.MaxInt64) {
+		return Duration{}, unrepresentable(s)
+	}
 	d := time.Duration(days)*24*time.Hour +
 		time.Duration(hours*float64(time.Hour)) +
 		time.Duration(minutes*float64(time.Minute)) +
 		time.Duration(seconds*float64(time.Second))
+	if d < 0 {
+		return Duration{}, unrepresentable(s)
+	}
 	return Duration{d: d, set: true}, nil
+}
+
+// unrepresentable reports a duration whose nanosecond total does not fit a
+// time.Duration (#57).
+func unrepresentable(s string) error {
+	return fmt.Errorf("duration %q is not representable as a time.Duration", s)
 }
 
 // MustParseDuration must parse a duration string

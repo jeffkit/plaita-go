@@ -830,6 +830,11 @@ func translateChild(n map[string]any) error {
 	return fmt.Errorf("child node requires an inline childFlow document")
 }
 
+// maxRequestTimeoutSecs mirrors plaita's MAX_REQUEST_TIMEOUT_SECONDS
+// (plaita/plaita/node/http.py): the load-time cap on a declared per-request
+// HTTP budget (#58).
+const maxRequestTimeoutSecs = 600.0
+
 func translateHTTP(n map[string]any) error {
 	foldKey(n, "content_type", "contentType")
 	meta := asMeta(n)
@@ -859,21 +864,28 @@ func translateHTTP(n map[string]any) error {
 			delete(n, k)
 		}
 	}
-	// requestTimeout (seconds, float) folds into the node timeout when absent.
-	for _, k := range []string{"requestTimeout", "request_timeout"} {
-		if v, ok := n[k]; ok {
-			secs, err := asFloat(v)
-			if err != nil {
-				return fmt.Errorf("requestTimeout: %v", err)
-			}
-			if secs > 0 {
-				if cur, has := n["timeout"]; !has || cur == "" || cur == nil {
-					n["timeout"] = "PT" + strconv.FormatFloat(secs, 'f', -1, 64) + "S"
-				} else {
-					stash(meta, "requestTimeoutIgnored", v)
-				}
-			}
-			delete(n, k)
+	// requestTimeout (seconds): the per-request budget — the WHOLE request
+	// including every redirect hop (nodes/http.go #35/r64). Keep the
+	// declared value on the node map (folded to the canonical camel key,
+	// never deleted) so it reaches nodes.HTTP.RequestTimeoutSecs; folding
+	// it into the node timeout and deleting it made the budget unreachable
+	// via the deployment IR and silently dropped the declaration when a node
+	// timeout was also present — metadata.requestTimeoutIgnored has no
+	// production reader (#58). Bounds mirror plaita's model validator
+	// (plaita/plaita/node/http.py MAX_REQUEST_TIMEOUT_SECONDS=600): finite,
+	// positive, <= 600; out-of-band values fail the load instead of being
+	// dropped or rewritten into a different budget.
+	foldKey(n, "request_timeout", "requestTimeout")
+	if v, ok := n["requestTimeout"]; ok {
+		secs, err := asFloat(v)
+		if err != nil {
+			return fmt.Errorf("http %q: requestTimeout must be a finite number of seconds (0 < requestTimeout <= %v): %v", n["id"], maxRequestTimeoutSecs, err)
+		}
+		if math.IsInf(secs, 0) || math.IsNaN(secs) || secs <= 0 {
+			return fmt.Errorf("http %q: requestTimeout must be a positive number of seconds (0 < requestTimeout <= %v), got %v", n["id"], maxRequestTimeoutSecs, v)
+		}
+		if secs > maxRequestTimeoutSecs {
+			return fmt.Errorf("http %q: requestTimeout %v exceeds the %v cap (plaita MAX_REQUEST_TIMEOUT_SECONDS)", n["id"], secs, maxRequestTimeoutSecs)
 		}
 	}
 	if v, ok := n["maxRedirects"]; ok {
@@ -1077,8 +1089,16 @@ func normalizeTimeout(v any) (string, error) {
 		if strings.HasPrefix(s, "P") {
 			// validate the ISO spelling here so a bad budget fails at load,
 			// not at execute
-			if _, err := duration.ParseISO8601(s); err != nil {
+			d, err := duration.ParseISO8601(s)
+			if err != nil {
 				return "", fmt.Errorf("timeout %q: %v", t, err)
+			}
+			// #57 belt-and-suspenders: ParseISO8601 now rejects
+			// unrepresentable budgets, but no declared spelling should ever
+			// yield a negative budget either — reject one explicitly so a
+			// future Duration producer cannot reintroduce the wrap.
+			if d.TimeDuration() < 0 {
+				return "", fmt.Errorf("timeout %q: parsed to a negative budget (%s)", t, d)
 			}
 			return s, nil
 		}

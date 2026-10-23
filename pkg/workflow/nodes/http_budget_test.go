@@ -82,3 +82,15 @@ func TestHTTP_RequestBudgetExhaustedNamedError(t *testing.T) {
 		t.Fatalf("message = %q, want the named requestTimeout budget exhaustion", msg)
 	}
 }
+
+// #58: the declared per-request budget must reach the executor unchanged and
+// keep overriding the 30s default — pre-fix the IR loader deleted the
+// declaration, so RequestTimeoutSecs could only ever be 0 via that path.
+func TestHTTPRequestTimeoutUnits(t *testing.T) {
+	if got := (&httpExecutor{RequestTimeoutSecs: 5}).requestTimeout(); got != 5*time.Second {
+		t.Errorf("requestTimeout() with declared 5s = %v, want 5s", got)
+	}
+	if got := (&httpExecutor{}).requestTimeout(); got != 30*time.Second {
+		t.Errorf("requestTimeout() default = %v, want 30s (must not regress)", got)
+	}
+}
