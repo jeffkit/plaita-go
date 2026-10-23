@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -67,17 +68,32 @@ func taskAgeFromStreamID(messageID string) (float64, bool) {
 }
 
 // carrierAgeSeconds is the dual-source max age (payload timestamp vs Stream
-// ID); known=false when neither source is determinable.
+// ID). Every parsable source participates in the max — including negative
+// ages (Python max(ages) 口径): a negative max means the worker clock is
+// behind the producer clock, i.e. the carrier is fresher than "now" — that is
+// freshness, clamped to 0 ("just enqueued"), NOT an unknown age (#59: the old
+// `best := -1.0` sentinel merged "both unparsable" and "both future-dated"
+// into one known=false verdict and fail-closed dropped fresh carriers).
+// known=false only when NEITHER source is parsable.
 func carrierAgeSeconds(task *Task, messageID string) (age float64, known bool) {
-	best := -1.0
-	if a, ok := taskAgeFromTimestamp(task.Timestamp); ok && a > best {
-		best = a
+	best := math.Inf(-1)
+	if a, ok := taskAgeFromTimestamp(task.Timestamp); ok {
+		known = true
+		if a > best {
+			best = a
+		}
 	}
-	if a, ok := taskAgeFromStreamID(messageID); ok && a > best {
-		best = a
+	if a, ok := taskAgeFromStreamID(messageID); ok {
+		known = true
+		if a > best {
+			best = a
+		}
+	}
+	if !known {
+		return 0, false
 	}
 	if best < 0 {
-		return 0, false
+		best = 0
 	}
 	return best, true
 }
@@ -100,11 +116,31 @@ func (w *Worker) carrierTooOld(task *Task, messageID string) bool {
 	age, known := carrierAgeSeconds(task, messageID)
 	if !known {
 		// Fail closed: an undeterminable carrier could have been backing up
-		// since before the horizon; admitting it would void the gate.
-		w.logger.Warn("task age undeterminable (no timestamp, non-numeric stream id); dropping fail-closed",
-			"type", task.Type, "id", messageID)
+		// since before the horizon; admitting it would void the gate. Name
+		// each source's reason (#59): the old canned message asserted "no
+		// timestamp, non-numeric stream id" even when both sources were
+		// present (the future-dated shape, since fixed) — it sent debugging
+		// toward the producer format.
+		w.logger.Warn("task age undeterminable ("+carrierAgeUnknownReason(task, messageID)+"); dropping fail-closed",
+			"type", task.Type, "id", messageID, "timestamp", task.Timestamp)
 		w.metrics.IncCounter(MetricTaskAgeUnknownTotal, metricLabels("tenant", task.TenantID, "type", task.Type))
 		return true
 	}
 	return age > maxAge
+}
+
+// carrierAgeUnknownReason names why each age source is unusable, so an
+// operator can tell a legacy producer (no timestamp) from a forged/manual
+// XADD (non-numeric stream id).
+func carrierAgeUnknownReason(task *Task, messageID string) string {
+	var parts []string
+	if task.Timestamp == "" {
+		parts = append(parts, "no timestamp")
+	} else if _, ok := parseProducerTimestamp(task.Timestamp); !ok {
+		parts = append(parts, "unparsable timestamp")
+	}
+	if _, ok := streamIDTime(messageID); !ok {
+		parts = append(parts, "non-numeric stream id")
+	}
+	return strings.Join(parts, ", ")
 }

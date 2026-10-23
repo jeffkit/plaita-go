@@ -146,10 +146,27 @@ func (s *FlowSource) resolveVersion(ctx context.Context, tenantID, flowID, versi
 	if contains(versions, latestVersion) {
 		return latestVersion, nil
 	}
-	sort.Slice(versions, func(i, j int) bool {
-		return numericVersionLess(versions[i], versions[j])
+	// Numeric resolution is Python's口径 (storage/redis.py:964-974): filter
+	// to purely-numeric dotted versions FIRST, then take the tuple-order max
+	// within that subset — a numeric member must never lose to a
+	// lexicographically larger non-numeric one (#61: the old comparator fed
+	// dotted versions to ParseFloat, so "1.10" collapsed to 1.1 < "1.9", and
+	// three-segment versions fell back to string compare, "9.0.0" > "10.0.0").
+	numeric := make([]string, 0, len(versions))
+	for _, v := range versions {
+		if _, ok := parseDottedVersion(v); ok {
+			numeric = append(numeric, v)
+		}
+	}
+	if len(numeric) == 0 {
+		// No comparable numeric version: an arbitrary member (Python
+		// next(iter(all_versions))) — deliberately NOT an error.
+		return versions[0], nil
+	}
+	sort.Slice(numeric, func(i, j int) bool {
+		return numericVersionLess(numeric[i], numeric[j])
 	})
-	return versions[len(versions)-1], nil
+	return numeric[len(numeric)-1], nil
 }
 
 func contains(list []string, want string) bool {
@@ -161,13 +178,48 @@ func contains(list []string, want string) bool {
 	return false
 }
 
+// numericVersionLess orders purely-numeric dotted versions by tuple order:
+// segments compare as ints and a shorter prefix sorts first ([1,10] <
+// [1,10,0], matching Python's list comparison). Both operands must have been
+// accepted by parseDottedVersion (resolveVersion filters before sorting).
 func numericVersionLess(a, b string) bool {
-	ai, aerr := strconv.ParseFloat(strings.TrimPrefix(a, "v"), 64)
-	bi, berr := strconv.ParseFloat(strings.TrimPrefix(b, "v"), 64)
-	if aerr != nil || berr != nil {
-		return a < b
+	as, _ := parseDottedVersion(a)
+	bs, _ := parseDottedVersion(b)
+	for i := 0; i < len(as) && i < len(bs); i++ {
+		if as[i] != bs[i] {
+			return as[i] < bs[i]
+		}
 	}
-	return ai < bi
+	return len(as) < len(bs)
+}
+
+// parseDottedVersion accepts exactly ^[0-9]+(\.[0-9]+)*$ — the Go mirror of
+// Python's v.replace(".", "").isdigit() filter. A "v" prefix disqualifies
+// (v1.2 can only reach the arbitrary-member fallback, Python 严格口径), as do
+// empty segments and segments beyond int range (fail-safe: such members just
+// stop competing for the max).
+func parseDottedVersion(v string) ([]int, bool) {
+	if v == "" {
+		return nil, false
+	}
+	parts := strings.Split(v, ".")
+	out := make([]int, 0, len(parts))
+	for _, p := range parts {
+		if p == "" {
+			return nil, false
+		}
+		for i := 0; i < len(p); i++ {
+			if p[i] < '0' || p[i] > '9' {
+				return nil, false
+			}
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return nil, false
+		}
+		out = append(out, n)
+	}
+	return out, true
 }
 
 // FlowDefinitionHash is the byte-exact Go counterpart of Python
