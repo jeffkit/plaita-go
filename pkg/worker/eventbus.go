@@ -266,81 +266,150 @@ func (w *Worker) HandleEvent(ctx context.Context, ev *Event) error {
 	return nil
 }
 
+// Subscription-timeout sweep tuning. A member whose execution state is
+// momentarily unreadable is parked past the due window (delay) and may come
+// back at most timeoutRequeueAttempts sweeps before it is dropped with a
+// warning (#50: it must never sit at the front of the page forever).
+var timeoutRequeueDelay = 30 * time.Second
+
+const (
+	timeoutSweepPageSize   = 100
+	timeoutSweepMaxPasses  = 100
+	timeoutRequeueAttempts = 5
+)
+
+// timeoutAttemptsKey tracks per-member requeue attempts (1h sliding TTL,
+// aligned with the dedup window).
+func (s *EventSubscriptions) timeoutAttemptsKey() string {
+	return s.cfg.KeyPrefix + ":event:subscriptions:timeout_attempts"
+}
+
+// dropTimeoutIndexMember removes a member from the timeout index together
+// with its requeue-attempts bookkeeping (best effort).
+func (w *Worker) dropTimeoutIndexMember(ctx context.Context, subKey string) {
+	pipe := w.rdb.TxPipeline()
+	pipe.ZRem(ctx, w.eventSubs.timeoutsKey(), subKey)
+	pipe.HDel(ctx, w.eventSubs.timeoutAttemptsKey(), subKey)
+	_, _ = pipe.Exec(ctx)
+}
+
 // SweepEventTimeouts mirrors SubscriptionTimeoutChecker: subscriptions whose
 // deadline elapsed enqueue a resume_type=timeout carrier (deduped for 1h).
 // Terminal executions get their leftover subscriptions reclaimed.
+//
+// #50: the timeout index is consumed as a ONE-SHOT due queue, not a
+// re-scannable set. Every exit either drops the member (enqueued, dedup hit,
+// unresolvable state) or parks it outside the due window under an attempts
+// ceiling (momentarily unreadable state) — a stuck member can no longer pin
+// the first page and starve every due subscription behind it. The pass loop
+// re-reads from offset 0 because every pass strictly shrinks the due set.
 func (w *Worker) SweepEventTimeouts(ctx context.Context) error {
 	now := float64(time.Now().UnixNano()) / 1e9
-	keys, err := w.rdb.ZRangeByScore(ctx, w.eventSubs.timeoutsKey(), &redis.ZRangeBy{
-		Min:   "0",
-		Max:   fmt.Sprintf("%.6f", now),
-		Count: 100,
-	}).Result()
-	if err != nil {
-		return fmt.Errorf("event timeout sweep: %w", err)
-	}
-	for _, subKey := range keys {
-		raw, err := w.rdb.Get(ctx, subKey).Result()
-		if errors.Is(err, redis.Nil) {
-			w.rdb.ZRem(ctx, w.eventSubs.timeoutsKey(), subKey)
-			continue
-		}
+	for pass := 0; pass < timeoutSweepMaxPasses; pass++ {
+		keys, err := w.rdb.ZRangeByScore(ctx, w.eventSubs.timeoutsKey(), &redis.ZRangeBy{
+			Min:   "0",
+			Max:   fmt.Sprintf("%.6f", now),
+			Count: timeoutSweepPageSize,
+		}).Result()
 		if err != nil {
-			return fmt.Errorf("event timeout subscription read: %w", err)
+			return fmt.Errorf("event timeout sweep: %w", err)
 		}
-		var subscription EventSubscription
-		if err := json.Unmarshal([]byte(raw), &subscription); err != nil {
-			w.logger.Warn("event timeout: corrupt subscription, dropping from index", "key", subKey, "error", err)
-			w.rdb.ZRem(ctx, w.eventSubs.timeoutsKey(), subKey)
-			continue
+		if len(keys) == 0 {
+			return nil
 		}
-		if subscription.CorrelationID == "" {
-			w.rdb.ZRem(ctx, w.eventSubs.timeoutsKey(), subKey)
-			continue
+		for _, subKey := range keys {
+			raw, err := w.rdb.Get(ctx, subKey).Result()
+			if errors.Is(err, redis.Nil) {
+				w.dropTimeoutIndexMember(ctx, subKey)
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("event timeout subscription read: %w", err)
+			}
+			var subscription EventSubscription
+			if err := json.Unmarshal([]byte(raw), &subscription); err != nil {
+				w.logger.Warn("event timeout: corrupt subscription, dropping from index", "key", subKey, "error", err)
+				w.dropTimeoutIndexMember(ctx, subKey)
+				continue
+			}
+			if subscription.CorrelationID == "" {
+				w.dropTimeoutIndexMember(ctx, subKey)
+				continue
+			}
+			state, err := w.store.LoadExecutionState(ctx, subscription.TenantID, subscription.CorrelationID)
+			if err != nil {
+				// #50: momentarily unreadable — park past the due window
+				// under an attempts ceiling instead of leaving it pinned at
+				// the front of the page.
+				attempts, aerr := w.rdb.HIncrBy(ctx, w.eventSubs.timeoutAttemptsKey(), subKey, 1).Result()
+				if aerr != nil {
+					return fmt.Errorf("event timeout attempts bookkeeping: %w", aerr)
+				}
+				w.rdb.Expire(ctx, w.eventSubs.timeoutAttemptsKey(), time.Hour)
+				if attempts > timeoutRequeueAttempts {
+					w.logger.Warn("event timeout: state load keeps failing, dropping from index",
+						"key", subKey, "execution_id", subscription.CorrelationID,
+						"attempts", attempts, "error", err)
+					w.dropTimeoutIndexMember(ctx, subKey)
+					continue
+				}
+				w.logger.Warn("event timeout: state load failed, requeued for a later sweep",
+					"key", subKey, "execution_id", subscription.CorrelationID,
+					"attempts", attempts, "error", err)
+				w.rdb.ZAdd(ctx, w.eventSubs.timeoutsKey(), redis.Z{
+					Score:  float64(time.Now().UnixNano())/1e9 + timeoutRequeueDelay.Seconds(),
+					Member: subKey,
+				})
+				continue
+			}
+			if state == nil {
+				// #50: the execution is gone — the subscription can never be
+				// woken again, and keeping it only pins the sweep page.
+				w.dropTimeoutIndexMember(ctx, subKey)
+				continue
+			}
+			if TerminalStatuses[state.Status] {
+				w.dropTimeoutIndexMember(ctx, subKey)
+				_ = w.eventSubs.Unregister(ctx, subscription.SubscriptionID, subscription.TenantID)
+				continue
+			}
+			dedupKey := w.cfg.KeyPrefix + ":event_filter:timeout:" + subscription.SubscriptionID
+			first, err := w.rdb.SetNX(ctx, dedupKey, "1", time.Hour).Result()
+			if err != nil {
+				return fmt.Errorf("event timeout dedup claim: %w", err)
+			}
+			if !first {
+				// #50: the carrier already went out within the dedup window —
+				// the member has served its purpose; dropping it here also
+				// closes the re-enqueue-after-window-expiry leak.
+				w.dropTimeoutIndexMember(ctx, subKey)
+				continue
+			}
+			body := map[string]any{
+				"type":         "resume",
+				"flow_id":      subscription.FlowID,
+				"execution_id": subscription.CorrelationID,
+				"resume_type":  "timeout",
+				"timestamp":    nowISO(),
+				"data": map[string]any{
+					"subscription_id": subscription.SubscriptionID,
+					"event_type":      subscription.EventType,
+					"node_id":         subscription.NodeID,
+				},
+			}
+			if subscription.TenantID != "" {
+				body["tenant_id"] = subscription.TenantID
+			}
+			if _, err := w.queue.Enqueue(ctx, body, TaskSchemaVersion); err != nil {
+				w.rdb.Del(ctx, dedupKey)
+				return fmt.Errorf("event timeout resume enqueue: %w", err)
+			}
+			// #50: drop only after the enqueue landed — a failed enqueue must
+			// leave the member in the index for the next sweep to retry.
+			w.dropTimeoutIndexMember(ctx, subKey)
+			w.logger.Info("subscription timed out, resume carrier enqueued",
+				"subscription_id", subscription.SubscriptionID, "execution_id", subscription.CorrelationID)
 		}
-		state, err := w.store.LoadExecutionState(ctx, subscription.TenantID, subscription.CorrelationID)
-		if err != nil {
-			w.logger.Warn("event timeout: state load failed, will retry next sweep", "error", err)
-			continue
-		}
-		if state == nil {
-			// Python keeps the subscription when the state cannot be loaded;
-			// a later sweep retries (the subscription TTL bounds the wait).
-			continue
-		}
-		if TerminalStatuses[state.Status] {
-			_ = w.eventSubs.Unregister(ctx, subscription.SubscriptionID, subscription.TenantID)
-			continue
-		}
-		dedupKey := w.cfg.KeyPrefix + ":event_filter:timeout:" + subscription.SubscriptionID
-		first, err := w.rdb.SetNX(ctx, dedupKey, "1", time.Hour).Result()
-		if err != nil {
-			return fmt.Errorf("event timeout dedup claim: %w", err)
-		}
-		if !first {
-			continue
-		}
-		body := map[string]any{
-			"type":         "resume",
-			"flow_id":      subscription.FlowID,
-			"execution_id": subscription.CorrelationID,
-			"resume_type":  "timeout",
-			"timestamp":    nowISO(),
-			"data": map[string]any{
-				"subscription_id": subscription.SubscriptionID,
-				"event_type":      subscription.EventType,
-				"node_id":         subscription.NodeID,
-			},
-		}
-		if subscription.TenantID != "" {
-			body["tenant_id"] = subscription.TenantID
-		}
-		if _, err := w.queue.Enqueue(ctx, body, TaskSchemaVersion); err != nil {
-			w.rdb.Del(ctx, dedupKey)
-			return fmt.Errorf("event timeout resume enqueue: %w", err)
-		}
-		w.logger.Info("subscription timed out, resume carrier enqueued",
-			"subscription_id", subscription.SubscriptionID, "execution_id", subscription.CorrelationID)
 	}
 	return nil
 }

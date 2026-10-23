@@ -388,7 +388,12 @@ func TestRetryCarrierBodyConversion(t *testing.T) {
 		}
 	})
 
-	t.Run("flow_id mismatch → start copy", func(t *testing.T) {
+	t.Run("flow_id mismatch → continue, downstream gate poison-acks (#52)", func(t *testing.T) {
+		// #52: the old "start copy on mismatch" fallback fed a self-feed loop
+		// whenever the carrier's flow_id was EMPTY (the #29 gate needs both
+		// ids to block). The conversion now always produces a continue
+		// carrier; a mismatched flow id is poison-acked downstream by
+		// loadContinuationDefinition, an empty one resolves from the row.
 		row, _ := json.Marshal(map[string]any{
 			"execution_id": "e3", "status": "running", "flow_id": "other",
 		})
@@ -398,8 +403,26 @@ func TestRetryCarrierBodyConversion(t *testing.T) {
 		if err != nil {
 			t.Fatalf("retryCarrierBody: %v", err)
 		}
-		if body["type"] != "start" {
-			t.Fatalf("carrier = %v, want the start copy for a flow mismatch", body)
+		if body["type"] != "resume" || body["resume_type"] != "continue" {
+			t.Fatalf("carrier = %v, want resume/continue (mismatch handled downstream)", body)
+		}
+		if body["flow_id"] != "f1" {
+			t.Fatalf("carrier flow_id = %v, want the carrier's own f1 (gate input)", body["flow_id"])
+		}
+	})
+
+	t.Run("empty carrier flow_id on existing row → continue (#52)", func(t *testing.T) {
+		row, _ := json.Marshal(map[string]any{
+			"execution_id": "e6", "status": "running", "flow_id": "f1",
+		})
+		rdb.Set(ctx, stateKeyOf(cfg, "e6"), string(row), 0)
+		task := &Task{Type: "start", FlowID: "", ExecutionID: "e6"}
+		body, err := w.retryCarrierBody(ctx, task)
+		if err != nil {
+			t.Fatalf("retryCarrierBody: %v", err)
+		}
+		if body["type"] != "resume" || body["resume_type"] != "continue" {
+			t.Fatalf("carrier = %v, want resume/continue (never a start copy)", body)
 		}
 	})
 

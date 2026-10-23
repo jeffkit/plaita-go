@@ -223,12 +223,13 @@ func isRetryableNodeFailure(err error, run *executionRun) bool {
 //     "degrade to a start copy" fallback would be idempotently-acked by the
 //     start gate against the existing row — the retry would be lost);
 //   - no state row (crash before the first persist) → start copy;
-//   - stored flow_id ≠ carrier flow_id → start copy (a converted copy would
-//     be poison-acked by the resume flow-id gate, and the #29 gate's
-//     flow-conflict branch likewise — the copy redelivers into the same
-//     deterministic outcome);
 //   - a row exists → {"type":"resume","resume_type":"continue", …} with
-//     params passed through when non-empty (#122). The version is
+//     params passed through when non-empty (#122), REGARDLESS of flow_id
+//     (#52: the old "mismatch → start copy" fallback self-fed forever when
+//     the carrier's flow_id was empty — the #29 gate needs both ids to block,
+//     so the copy re-hit the same route; a mismatched NON-empty id is
+//     poison-acked downstream by loadContinuationDefinition's flow-id gate,
+//     an empty one resolves from the stored row at resume). The version is
 //     deliberately dropped: the resume path resolves the definition from the
 //     state row's flow_version (§7).
 func (w *Worker) retryCarrierBody(ctx context.Context, task *Task) (map[string]any, error) {
@@ -263,11 +264,9 @@ func (w *Worker) retryCarrierBody(ctx context.Context, task *Task) (map[string]a
 	if state == nil {
 		return startCarrierBody(task), nil
 	}
-	if state.FlowID != "" && state.FlowID != task.FlowID {
-		w.logger.Warn("retry carrier flow_id differs from the stored row, re-enqueueing a start copy",
-			"execution_id", task.ExecutionID, "carrier_flow", task.FlowID, "stored_flow", state.FlowID)
-		return startCarrierBody(task), nil
-	}
+	// #52: a row exists → always continue. No flow-id fallback to a start
+	// copy: the start gate only blocks on BOTH ids non-empty, so an
+	// empty-flow_id copy would loop through the running route forever.
 	body := map[string]any{
 		"type":         "resume",
 		"flow_id":      task.FlowID,
