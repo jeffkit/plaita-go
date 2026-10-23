@@ -72,7 +72,9 @@ func (r *Reduce) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
 		// plaita: initial 表达式在父侧求值；显式求值为 None 时 items 仍为全集
 		//（与 self.initial is not None 的 Python 判据一致——JSON null 视同缺省）。
 		if acc, err = expression.Eval(ctx, r.Initial); err != nil {
-			return nil, fmt.Errorf("eval reduce initial error: %v", err)
+			// %w keeps the wrap chain intact for the deterministic bridge (#56);
+			// rendered text identical to the historical %v form.
+			return nil, fmt.Errorf("eval reduce initial error: %w", err)
 		}
 	} else {
 		if len(collection) == 0 {

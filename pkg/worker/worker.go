@@ -1882,7 +1882,7 @@ func (w *Worker) resumeUnderLease(ctx context.Context, task *Task) error {
 		// #258: the carrier arrived after the suspend point was consumed —
 		// normalize it into a continue carrier instead of acking the only
 		// recovery path.
-		return w.requeueNormalizedContinue(ctx, task)
+		return w.requeueNormalizedContinue(ctx, task, handle)
 	}
 
 	if state.Status == StatusSuspended &&
@@ -1971,7 +1971,14 @@ func (w *Worker) writeResumeCancelled(ctx context.Context, tenant, executionID s
 // normalization: an event/timeout carrier that missed the suspend point is
 // replaced by a continue carrier. The caller acks the original only after the
 // enqueue succeeded (ProcessOne's standard ack).
-func (w *Worker) requeueNormalizedContinue(ctx context.Context, task *Task) error {
+//
+// Ordering is routeStartRedeliveryOnRunning's discipline (#47, #55): release
+// the lease BEFORE the enqueue. The normalized carrier is not a decision
+// carrier, so a consumer picking it up while this worker still held the lease
+// would ack it under the §3.5 live-holder rule — stranding the execution in
+// running with no carrier left. Release is compare-and-del, so the caller's
+// deferred release below is a no-op after this one.
+func (w *Worker) requeueNormalizedContinue(ctx context.Context, task *Task, handle *LeaseHandle) error {
 	body := map[string]any{
 		"type":         "resume",
 		"flow_id":      task.FlowID,
@@ -1985,6 +1992,7 @@ func (w *Worker) requeueNormalizedContinue(ctx context.Context, task *Task) erro
 	if len(task.Params) > 0 {
 		body["params"] = task.Params
 	}
+	_ = w.lease.Release(ctx, handle)
 	if _, err := w.queue.Enqueue(ctx, body, task.EnvelopeSchemaVer); err != nil {
 		w.logger.Warn("normalized continue re-enqueue failed; leaving the original pending",
 			"execution_id", task.ExecutionID, "error", err)

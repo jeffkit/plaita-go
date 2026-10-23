@@ -123,6 +123,37 @@ func TestDeterministicEndErrorExecutesOnce(t *testing.T) {
 	}
 }
 
+// TestExpressionRuntimeErrorExecutesOnce (#56): an integer divide by zero in
+// an end-node output expression is deterministic — the same input divides by
+// zero again, so the retryTimes budget must not burn (plaitaexpr's recovered
+// RuntimeError is bridge-classified deterministic, ValueError-family
+// treatment per #43). Pre-fix the goval runtime.Error panics straight through
+// Execute.
+func TestExpressionRuntimeErrorExecutesOnce(t *testing.T) {
+	flow := &workflow.Workflow{
+		ID:      "r56-expr-divzero-deterministic",
+		Runtime: workflow.RuntimeGo,
+		Nodes: workflow.Nodes{
+			&nodes.Start{BaseNode: nodes.BaseNode{ID: "start", Next: "boom"}},
+			&nodes.End{
+				BaseNode: nodes.BaseNode{
+					ID:   "boom",
+					Next: "never",
+					ErrorHandlePolicy: workflow.RecoverableErrorHandlePolicy{
+						Strategy:   workflow.HandleStrategyAbort,
+						RetryTimes: 2,
+					},
+					Output: map[string]any{"x": "$F.add(1 / 0, 1)"},
+				},
+				ResultType: nodes.ResultTypeSuccess,
+			},
+		},
+	}
+	if got := nodeExecutions(t, flow, "boom"); got != 1 {
+		t.Fatalf("divide-by-zero output executed %d times, want exactly 1 (retryTimes=2)", got)
+	}
+}
+
 // TestTransientErrorStillRetries: the 1002 (send-phase) class stays
 // retryable — the #43 change must not damp transient retries.
 func TestTransientErrorStillRetries(t *testing.T) {

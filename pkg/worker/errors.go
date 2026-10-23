@@ -151,7 +151,10 @@ func errorTypeName(err error) string {
 			if t.Kind() == reflect.Pointer {
 				t = t.Elem()
 			}
-			if t.Name() != "" && t.Name() != "retryableError" && t.Name() != "wrapErr" {
+			// "wrapError" is fmt/errors' %w wrapper (the skip list's "wrapErr"
+			// spelling is historical) — a packaging trace, not a meaningful
+			// error type; keep walking for the wrapped type's own name (#56).
+			if t.Name() != "" && t.Name() != "retryableError" && t.Name() != "wrapErr" && t.Name() != "wrapError" {
 				return t.Name()
 			}
 		}

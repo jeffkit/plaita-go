@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	stdruntime "runtime"
 	"sort"
 	"strings"
 
@@ -108,8 +109,30 @@ func (e *Evaluator) evalFunc(
 	// `no such function` and its caller recovers it as an error — plaita's
 	// default-registry NameError. Arguments stay eager: goval evaluates them
 	// before resolving the function, so a failing argument errors first.
-	result, err := goval.NewEvaluator().Evaluate(statement, execArgs, AllFunctions())
+	result, err := evalGoval(statement, execArgs)
 	return model.NewValue(result), err
+}
+
+// evalGoval guards the goval call (#56): goval's recover deliberately
+// re-panics runtime.Error — an integer divide/modulo by zero inside an
+// argument expression would otherwise fly straight through Eval and kill the
+// worker process (the PEL message then re-crashes every reclaiming worker).
+// safeCall in function.go only covers $F function bodies, not the eager
+// argument expressions goval evaluates first, so this is the last line of
+// defense. Non-runtime panics keep goval's own contract (re-panic).
+func evalGoval(statement string, execArgs map[string]any) (result any, err error) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		if re, ok := r.(stdruntime.Error); ok {
+			err = &RuntimeError{Err: re}
+			return
+		}
+		panic(r)
+	}()
+	return goval.NewEvaluator().Evaluate(statement, execArgs, AllFunctions())
 }
 
 // mutatorFuncs are the $F functions Python's expression.py registers with

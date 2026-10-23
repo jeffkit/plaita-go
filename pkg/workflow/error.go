@@ -219,6 +219,7 @@ var deterministicErrorTypeNames = map[string]bool{
 	"NotifyDeterministicError": true, // notify family: credential/config errors
 	"DeterministicError":       true, // llm side: plaita-nodes _retry.DeterministicError port
 	"HitlError":                true, // hitl-server explicit rejections (send success=false, poll status=error)
+	"RuntimeError":             true, // plaitaexpr: recovered Go runtime error (integer div/mod 0, #56) — same input divides again, retry only re-fails
 }
 
 // retryClassifier is the structural contract an error type can expose to
