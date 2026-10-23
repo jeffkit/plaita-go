@@ -101,11 +101,40 @@ func main() {
 	os.Exit(runWorker(context.Background(), cfg, w, logger))
 }
 
+// exitCodeSecondSignal is the process exit code for a second SIGINT/SIGTERM
+// during drain (128+SIGINT, the conventional "interrupted" status).
+const exitCodeSecondSignal = 130
+
+// drainableRunner is the slice of *worker.Worker the shutdown driver needs.
+// It exists so runWorkerUntil can be exercised against a scripted runner in
+// tests (a Run that blocks until force-stopped pins the second-signal branch
+// without racing a real drain).
+type drainableRunner interface {
+	Run(ctx context.Context) error
+	RequestDrain(reason string)
+	ForceStop(reason string)
+}
+
 // runWorker drives the consume loop until Run returns or a signal arrives,
 // and returns the process exit code (#75): non-zero when Run itself failed
 // (a startup failure must not masquerade as a clean shutdown), 0 on clean
-// drain / cancellation.
+// drain / cancellation, exitCodeSecondSignal on a second signal.
 func runWorker(ctx context.Context, cfg *worker.Config, w *worker.Worker, logger *slog.Logger) int {
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	// Stop (not Reset) on the way out: it waits for the os/signal dispatcher
+	// to go idle, so a signal already raised cannot land on a channel
+	// registered later by somebody else in this process.
+	defer signal.Stop(sigCh)
+	return runWorkerUntil(ctx, cfg, w, logger, sigCh)
+}
+
+// runWorkerUntil is runWorker with the shutdown-signal source injected.
+// Everything here is owned by the call: no goroutine survives the return and
+// nothing calls os.Exit — process signals are process-global, and a stale
+// "second signal → exit" goroutine left behind by one caller used to take
+// down whatever ran next in the same process (the CI test binary).
+func runWorkerUntil(ctx context.Context, cfg *worker.Config, w drainableRunner, logger *slog.Logger, sigCh <-chan os.Signal) int {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -123,8 +152,6 @@ func runWorker(ctx context.Context, cfg *worker.Config, w *worker.Worker, logger
 		runDone <- w.Run(ctx)
 	}()
 
-	sigCh := make(chan os.Signal, 2)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	select {
 	case err := <-runDone:
 		// Run only returns nil on ctx cancellation or drain completion; a
@@ -137,18 +164,20 @@ func runWorker(ctx context.Context, cfg *worker.Config, w *worker.Worker, logger
 		w.RequestDrain("signal:" + sig.String())
 	}
 
-	go func() {
-		<-sigCh
+	// A second signal exits at once — it does not wait for Run to come back.
+	secondSignal := func() int {
 		logger.Warn("second signal, force stop")
 		w.ForceStop("second signal")
 		cancel()
-		os.Exit(130)
-	}()
+		return exitCodeSecondSignal
+	}
 
 	deadline := cfg.DrainTimeout + 5*time.Second
 	select {
 	case err := <-runDone:
 		return exitOnRunResult(err, logger)
+	case <-sigCh:
+		return secondSignal()
 	case <-time.After(deadline):
 		logger.Warn("drain deadline exceeded, force-stopping in-flight work",
 			"deadline", deadline)
@@ -157,6 +186,8 @@ func runWorker(ctx context.Context, cfg *worker.Config, w *worker.Worker, logger
 		select {
 		case err := <-runDone:
 			return exitOnRunResult(err, logger)
+		case <-sigCh:
+			return secondSignal()
 		case <-time.After(5 * time.Second):
 			logger.Error("worker did not stop after force-stop")
 			return 1
