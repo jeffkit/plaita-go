@@ -2,6 +2,7 @@ package plaitaexpr
 
 import (
 	"context"
+	stdruntime "runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -368,4 +369,89 @@ func Test_ceil_floor_boundaries_keep_working(t *testing.T) {
 			assert.Equal(t, model.NewValue(c.want), got)
 		})
 	}
+}
+
+func Test_mod_printf_size_gate(t *testing.T) {
+	// Issue #69: the printf branch rendered before any scale pre-check —
+	// width/precision parsed without a cap (and wrapping on overflow), so one
+	// evaluation could allocate 1e8~2e9 chars. Python's _fn_mod refuses by
+	// name BEFORE building the result; pyFormat now projects the same way and
+	// refuses over the engine's 1e8 budget (lenLimit, per #45 — Python's
+	// 100k floor is a known tier gap, not ported).
+	attacks := []struct {
+		name    string
+		expr    string
+		input   any
+		wantErr []string
+	}{
+		{
+			name:    "1e8 width %d refuses",
+			expr:    `$F.mod('%100000000d', 1)`,
+			wantErr: []string{"result too large", "Refusing to build an unbounded result."},
+		},
+		{
+			name:    "format string from runtime data refuses",
+			expr:    `$F.mod($INPUT.fmt, 1)`,
+			input:   map[string]any{"fmt": "%100000000d"},
+			wantErr: []string{"result too large", "Refusing to build an unbounded result."},
+		},
+		{
+			name:    "1e8 precision %f refuses (not width-only)",
+			expr:    `$F.mod('%.100000000f', 1.5)`,
+			wantErr: []string{"result too large"},
+		},
+		{
+			name:    "20-digit width refuses, never wraps to 9",
+			expr:    `$F.mod('%99999999999999999999d', 1)`,
+			wantErr: []string{"result too large"},
+		},
+	}
+	e := &Evaluator{}
+	for _, c := range attacks {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := runtime.WithWorkflowRuntimeContext(context.Background(), &runtime.Context{
+				WorkflowInput: c.input,
+			})
+			var before, after stdruntime.MemStats
+			stdruntime.GC()
+			stdruntime.ReadMemStats(&before)
+			_, err := e.Eval(ctx, c.expr, nil)
+			stdruntime.ReadMemStats(&after)
+			for _, want := range c.wantErr {
+				assert.ErrorContains(t, err, want)
+			}
+			// The refusal must happen BEFORE the big allocation: pre-fix the
+			// 1e8-width call grew TotalAlloc by ~286MiB; the gate keeps the
+			// whole evaluation under 10MiB.
+			assert.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(10<<20),
+				"refused format must not allocate")
+		})
+	}
+}
+
+func Test_mod_printf_size_gate_reverse(t *testing.T) {
+	// Ordinary formats must not be refused by the gate.
+	cases := []struct {
+		name string
+		expr string
+		want any
+	}{
+		{name: "%5d pads", expr: `$F.mod('%5d', 42)`, want: "   42"},
+		{name: "%(k)s mapping", expr: `$F.mod('%(k)s', {'k': 'v'})`, want: "v"},
+		{name: "%s-%s tuple", expr: `$F.mod('%s-%s', [1, 2])`, want: "1-2"},
+		{name: "%d apples", expr: `$F.mod('%d apples', 3)`, want: "3 apples"},
+		{name: "%.2f", expr: `$F.mod('%.2f', 3.14159)`, want: "3.14"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := evalMath(t, c.expr, map[string]any{})
+			require.NoError(t, err)
+			assert.Equal(t, model.NewValue(c.want), got)
+		})
+	}
+	// %100000d (1e5 chars) stays inside the engine's 1e8 budget: allowed
+	// here, refused by Python's 100k floor — the documented tier gap (#69 边界).
+	got, err := evalMath(t, `$F.mod('%100000d', 1)`, map[string]any{})
+	require.NoError(t, err)
+	assert.Len(t, got.AsString(), 100000)
 }

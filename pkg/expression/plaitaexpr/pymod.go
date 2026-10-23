@@ -39,6 +39,20 @@ type pyFmtSpec struct {
 // "format requires a mapping"). It returns an error where Python would raise
 // TypeError/KeyError/ValueError.
 func pyFormat(fmtStr string, args any) (string, error) {
+	// Scale gate BEFORE any rendering (issue #69, mirroring Python _fn_mod →
+	// _check_result_size): parse every spec first — parse errors surface
+	// first, as in Python — and refuse when the projected result exceeds the
+	// engine's 1e8 budget (lenLimit, per #45; Python's 100k floor is a known
+	// tier gap, not ported). The refusal keeps Python's _size_refusal wording
+	// verbatim — deliberately no extra "$F.mod: " prefix on top of it.
+	projected, err := projectPyFmtSize(fmtStr)
+	if err != nil {
+		return "", err
+	}
+	if projected > lenLimit {
+		return "", fmt.Errorf("$F.mod(format %d chars) result too large: %d chars (limit %d). "+
+			"Refusing to build an unbounded result.", len(fmtStr), int64(projected), int64(lenLimit))
+	}
 	argList, isTuple := pyFmtPositional(args)
 	pos := 0
 	mappingUsed := false
@@ -107,6 +121,78 @@ func pyFormat(fmtStr string, args any) (string, error) {
 	return b.String(), nil
 }
 
+// projectPyFmtSize walks the format string, parses every spec and returns a
+// conservative upper bound on the rendered length WITHOUT rendering anything
+// (issue #69). Each numeric conversion counts its padding width plus a fixed
+// content bound; %s/%r/%a count the width only — their content is the
+// argument itself, input-proportional and outside this gate (#69 边界).
+func projectPyFmtSize(fmtStr string) (int, error) {
+	total := 0
+	add := func(n int) {
+		total += n
+		if total > lenLimit {
+			// Saturate: the caller only compares against lenLimit, and long
+			// runs of width digits must not overflow the accumulator.
+			total = math.MaxInt64
+		}
+	}
+	i := 0
+	for i < len(fmtStr) {
+		if fmtStr[i] != '%' {
+			j := i
+			for j < len(fmtStr) && fmtStr[j] != '%' {
+				j++
+			}
+			add(j - i)
+			i = j
+			continue
+		}
+		spec, next, err := parsePyFmtSpec(fmtStr, i)
+		if err != nil {
+			return 0, err
+		}
+		i = next
+		if spec.conv == '%' {
+			add(1)
+			continue
+		}
+		add(pyFmtSpecBound(spec))
+	}
+	return total, nil
+}
+
+// pyFmtSpecBound bounds one conversion's rendered length before the argument
+// is known. The width covers the content and the bound adds headroom —
+// Python's projection adds the same style of slack (its %d row shows width +
+// 19), which is what puts a width exactly AT the budget over the line.
+func pyFmtSpecBound(spec pyFmtSpec) int {
+	w := spec.width
+	if w < 0 {
+		w = 0
+	}
+	var content int
+	switch spec.conv {
+	case 'd', 'i', 'u', 'o', 'x', 'X':
+		content = 24 // "-9223372036854775808" + 0o/0x prefix + sign
+	case 'e', 'E', 'g', 'G':
+		content = pyFmtPrecision(spec) + 7 // "-1." + digits + "e+308"
+	case 'f', 'F':
+		content = pyFmtPrecision(spec) + 320 // sign + 309 integer digits + "."
+	case 'c':
+		content = 4 // one rune
+	default: // 's', 'r', 'a': precision only truncates, content unknowable
+		content = 0
+	}
+	return w + content
+}
+
+func pyFmtPrecision(spec pyFmtSpec) int {
+	if spec.hasPrec {
+		return spec.precision
+	}
+	return 6
+}
+
 // pyFmtPositional classifies the argument for positional conversions: a list
 // is a tuple, any other value (a map included — Python treats a bare mapping
 // as a single %s value) is a one-element tuple.
@@ -158,11 +244,19 @@ flagsDone:
 	if j < len(fmtStr) && fmtStr[j] == '*' {
 		return spec, j + 1, fmt.Errorf("$F.mod: '*' width/precision is not supported")
 	}
+	// Width/precision saturate just past lenLimit instead of wrapping around
+	// int (issue #69: '%99999999999999999999d' silently parsed as width=9);
+	// the size gate then refuses any spec beyond the budget.
 	for j < len(fmtStr) && fmtStr[j] >= '0' && fmtStr[j] <= '9' {
 		if spec.width < 0 {
 			spec.width = 0
 		}
-		spec.width = spec.width*10 + int(fmtStr[j]-'0')
+		if spec.width <= lenLimit {
+			spec.width = spec.width*10 + int(fmtStr[j]-'0')
+		}
+		if spec.width > lenLimit+1 {
+			spec.width = lenLimit + 1
+		}
 		j++
 	}
 	if j < len(fmtStr) && fmtStr[j] == '.' {
@@ -170,7 +264,12 @@ flagsDone:
 		spec.precision = 0
 		j++
 		for j < len(fmtStr) && fmtStr[j] >= '0' && fmtStr[j] <= '9' {
-			spec.precision = spec.precision*10 + int(fmtStr[j]-'0')
+			if spec.precision <= lenLimit {
+				spec.precision = spec.precision*10 + int(fmtStr[j]-'0')
+			}
+			if spec.precision > lenLimit+1 {
+				spec.precision = lenLimit + 1
+			}
 			j++
 		}
 	}
