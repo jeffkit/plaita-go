@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -38,6 +40,10 @@ const (
 	ReplayReasonExecutionID = "execution_id_mismatch"
 	ReplayReasonDeleted     = "execution_deleted"
 	ReplayReasonEnqueueFail = "enqueue_failed"
+	// #67 (A69-04): the payload has no timestamp and neither dead_lettered_at
+	// nor the DLQ stream id is parseable — replaying would reset the carrier
+	// age and wash it past the 30-day age gate.
+	ReplayReasonCarrierTimestampUnknown = "carrier_timestamp_unknown"
 )
 
 // ReplayMarkerTTL is REPLAY_MARKER_TTL_SECONDS (7 days, same as start dedup).
@@ -213,6 +219,25 @@ func (w *Worker) ReplayDeadLetter(ctx context.Context, opts ReplayOptions) *Repl
 		return w.rejectReplay(ctx, opts, ReplayReasonNotReplay, "tombstone check failed: "+err.Error())
 	}
 
+	// A69-04 (#67): replay must not wash an old carrier into a fresh one. A
+	// replayed entry is XADDed with a NOW stream id, and the age gate takes
+	// the MAX of payload timestamp and stream id — so a payload without a
+	// timestamp would measure ~0s old and sail past the 30-day horizon.
+	// Resolve a real carrier timestamp first; both sources unparseable ⇒
+	// named fail-closed rejection (before the marker, so the entry stays
+	// replayable after the data is fixed). now() is never a fallback.
+	if ts, ok := body["timestamp"].(string); !ok || strings.TrimSpace(ts) == "" {
+		carrierTs, resolved := deadLetterCarrierTimestamp(envelope, msgID)
+		if !resolved {
+			res := &ReplayResult{Reason: ReplayReasonCarrierTimestampUnknown, ExecutionID: carrierExecutionID,
+				TenantID: owner, Detail: "dead-letter payload has no timestamp and neither " +
+					"dead_lettered_at nor dlq stream id is parseable; replay would reset the carrier age"}
+			w.auditReplay(ctx, opts, res, msgID, sourceID)
+			return res
+		}
+		body["timestamp"] = carrierTs
+	}
+
 	markerKey := w.replayMarkerKey(opts.DLQKey, msgID)
 	marker := map[string]any{
 		"actor":             opts.Actor,
@@ -360,4 +385,52 @@ func schemaVersionOf(v any) (int, error) {
 	default:
 		return 0, fmt.Errorf("unsupported type %T", v)
 	}
+}
+
+// deadLetterCarrierTimestamp resolves the A69-04 carrier timestamp (#67):
+// the DLQ envelope's dead_lettered_at first (JSON number = float epoch, as
+// both runtimes write it; else numeric string; else ISO string), then the DLQ
+// entry's stream id millisecond prefix (same parse as the age gate's
+// taskAgeFromStreamID). The result is a naive local ISO string that
+// parseProducerTimestamp accepts. Both sources unresolvable → not-ok; the
+// caller must reject fail-closed (now() is never a fallback — Python
+// dlq_replay._dead_letter_carrier_timestamp 口径).
+func deadLetterCarrierTimestamp(envelope map[string]any, dlqMessageID string) (string, bool) {
+	switch raw := envelope["dead_lettered_at"].(type) {
+	case float64:
+		if t, ok := epochSecondsToTime(raw); ok {
+			return naiveLocalISO(t), true
+		}
+	case string:
+		if s := strings.TrimSpace(raw); s != "" {
+			if f, err := strconv.ParseFloat(s, 64); err == nil {
+				if t, ok := epochSecondsToTime(f); ok {
+					return naiveLocalISO(t), true
+				}
+			} else if t, ok := parseProducerTimestamp(s); ok {
+				return naiveLocalISO(t), true
+			}
+		}
+	}
+	if t, ok := streamIDTime(dlqMessageID); ok {
+		return naiveLocalISO(t), true
+	}
+	return "", false
+}
+
+// epochSecondsToTime converts a float epoch (seconds) and rejects values
+// outside the representable wall-clock range (Python fromtimestamp's
+// OverflowError/OSError 口径 — an absurd epoch must not fabricate an age).
+func epochSecondsToTime(f float64) (time.Time, bool) {
+	if math.IsNaN(f) || math.IsInf(f, 0) || f < -62135596800 || f > 253402300799 {
+		return time.Time{}, false
+	}
+	sec := int64(math.Floor(f))
+	return time.Unix(sec, int64(math.Round((f-float64(sec))*1e9))), true
+}
+
+// naiveLocalISO formats a time the way Python datetime.isoformat() does for
+// naive local datetimes (the producer timestamp shape, §2.3).
+func naiveLocalISO(t time.Time) string {
+	return t.Format("2006-01-02T15:04:05.999999")
 }
