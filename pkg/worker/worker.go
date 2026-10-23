@@ -1292,8 +1292,10 @@ func (w *Worker) rpushServiceTask(ctx context.Context, keyPrefix, tenant, execut
 }
 
 // deleteCheckpoint removes the execution's checkpoint after a terminal write.
-// A failure only warns: the state row is authoritative and the key expires
-// with the execution's lifecycle (no checkpoint TTL is set while suspended).
+// The key carries no TTL (§9.4: a suspended approval may wait arbitrarily
+// long), so this delete is the only thing that reclaims it — every terminal
+// write path must go through here. A failure only warns: the state row is
+// authoritative and the execution can no longer be resumed anyway.
 func (w *Worker) deleteCheckpoint(ctx context.Context, tenant, executionID string) {
 	if err := w.checkpoints.DeleteCheckpoint(ctx, tenant, executionID); err != nil {
 		w.logger.Warn("checkpoint cleanup failed", "execution_id", executionID, "error", err)
@@ -2121,6 +2123,10 @@ func (w *Worker) deadLetterGuard(ctx context.Context, env *Envelope, task *Task,
 				w.logger.Warn("dead letter guard: terminalization failed, skipping", "error", err)
 				return false
 			}
+			// #51: the checkpoint has no TTL — the terminal delete is its
+			// only reclamation. This terminal write skips
+			// persistErrorTerminal, so it deletes on its own.
+			w.deleteCheckpoint(ctx, task.TenantID, task.ExecutionID)
 			return true
 		}
 	}
@@ -2386,6 +2392,10 @@ func (w *Worker) terminalizeHandoverExhausted(ctx context.Context, task *Task, c
 		_ = w.lease.Release(ctx, handle)
 		return true, err
 	}
+	// #51: terminal write outside persistErrorTerminal — reclaim the
+	// checkpoint here too (the key has no TTL; the terminal delete is its
+	// only reclamation).
+	w.deleteCheckpoint(ctx, task.TenantID, task.ExecutionID)
 	_ = w.lease.Release(ctx, handle)
 	return true, nil
 }
