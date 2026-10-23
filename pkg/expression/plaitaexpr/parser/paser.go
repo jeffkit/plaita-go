@@ -109,6 +109,11 @@ type variableExpr struct{ variable VariableExpr }
 
 // NewVariableExpr creates a new variable expression
 func NewVariableExpr(s string) (Expr, error) {
+	// Same full-match rule as Parse's variable branch (#63): a `$PARENT`
+	// rewrite must not take the lenient path through an inner construction.
+	if err := validateVariablePath(s); err != nil {
+		return nil, err
+	}
 	return parseVariable(s)
 }
 
@@ -147,6 +152,9 @@ func Parse(expr string) (Expr, error) {
 	case "$F":
 		return parseFunc(expr)
 	default:
+		if err := validateVariablePath(expr); err != nil {
+			return nil, err
+		}
 		return parseVariable(expr)
 	}
 }
