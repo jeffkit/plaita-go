@@ -179,6 +179,27 @@ func TestLoadAcceptsMock(t *testing.T) {
 
 // reference：provider 解析在加载期完成（调度器注入的 Go 对应物），注入的
 // 子流程走 scopeChild 归一化+校验；flowId/camel 与 snake 双拼写都收。
+// plaita 生产者方言（ReferenceFlow.LEGACY_KEYS）：flowID/flowVersion 键原生
+// 折叠（NS-M4 对拍集顺带发现的装载面方言收口）。
+func TestLoadReferenceFlowIDProducerDialect(t *testing.T) {
+	reg := map[string]string{
+		"sub": `{"flow_id":"sub","nodes":[
+			{"type":"start","id":"a","next":"b"},
+			{"type":"end","id":"b","resultType":"success","output":"ok"}
+		]}`,
+	}
+	data := `{"nodes":[
+		{"type":"start","id":"s","next":"r"},
+		{"type":"reference","id":"r","flowID":"sub","flowVersion":"2","next":"o"},
+		{"type":"end","id":"o","resultType":"success","output":"$NODE.r"}
+	]}`
+	wf, err := LoadWithFlowProvider([]byte(data), mapProvider(reg))
+	require.NoError(t, err)
+	got, err := wf.Execute(t.Context(), map[string]any{})
+	require.NoError(t, err)
+	assert.Equal(t, "ok", got)
+}
+
 func TestLoadReferenceWithProvider(t *testing.T) {
 	reg := map[string]string{
 		"sub": `{"flow_id":"sub","nodes":[

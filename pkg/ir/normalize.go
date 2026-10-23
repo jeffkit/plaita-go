@@ -577,6 +577,8 @@ type flowResolver struct {
 //   - provider 未配置/解析失败/文档非法 → 加载失败（fail-closed）。
 func translateReference(n map[string]any, res *flowResolver) error {
 	foldKey(n, "flow_id", "flowId")
+	// plaita 生产者方言（ReferenceFlow.LEGACY_KEYS）：flowID。
+	foldKey(n, "flowID", "flowId")
 	foldKey(n, "flow_version", "flowVersion")
 	if cf, has := n["childFlow"]; has && cf != nil {
 		return fmt.Errorf("reference node takes no inline childFlow: plaita's runtime drops it (validator shadowing) and fails at run time with " +
