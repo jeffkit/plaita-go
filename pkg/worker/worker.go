@@ -426,15 +426,40 @@ func (w *Worker) ProcessOne(ctx context.Context) (bool, error) {
 	return true, w.queue.Ack(ctx, task.MessageID)
 }
 
-// dispositionHandlerError maps a handler error to the §9.2 disposition. Only
-// the node-retryable class is acked (after enqueueing a fresh carrier); every
-// other error leaves the message pending.
+// dispositionHandlerError maps a handler error to the §9.2 disposition. The
+// node-retryable class is acked after enqueueing a fresh carrier; the
+// permanent resume-carrier rejection (ResumeGuardError, #68) is acked in
+// place — leaving it pending only feeds the reclaim → dead-letter →
+// recovery-clone loop, where the guard clones the same poisoned payload
+// forever (the self-feeding non-convergence loop). Every other error leaves
+// the message pending.
 func (w *Worker) dispositionHandlerError(ctx context.Context, delivery *Delivery, err error) (bool, error) {
 	var nre *NodeRetryableError
 	if errors.As(err, &nre) {
 		return w.requeueRetryableFailure(ctx, delivery, nre)
 	}
+	var guard *workflow.ResumeGuardError
+	if errors.As(err, &guard) {
+		return w.ackRejectedResumeCarrier(ctx, delivery, guard)
+	}
 	return true, err
+}
+
+// ackRejectedResumeCarrier exits the #68 clone loop: a ResumeGuardError is by
+// construction permanent (missing checkpoint, schema mismatch, non-pending
+// node, stale subscription binding — suspend.go's admission gates), so the
+// carrier can never wake the run. Acking it does not endanger the real
+// decision carrier — that is a new message — and the execution row stays
+// suspended. Mirrors Python WORKER_PROTOCOL's "ResumeProtocolError … 否则原样
+// ack": the loop must not exist structurally. The lease was already released
+// by the resume-rejection branch; only the queue disposition happens here.
+func (w *Worker) ackRejectedResumeCarrier(ctx context.Context, delivery *Delivery, guard *workflow.ResumeGuardError) (bool, error) {
+	task := delivery.Task
+	w.metrics.IncCounter(MetricResumeCarrierRejectedTotal, metricLabels("resume_type", task.ResumeType))
+	w.logger.Warn("resume carrier permanently rejected; acked, execution stays suspended",
+		"execution_id", task.ExecutionID, "resume_type", task.ResumeType,
+		"message_id", task.MessageID, "error", guard.Message)
+	return true, w.queue.Ack(ctx, task.MessageID)
 }
 
 // handleStart executes a start task: lease acquire (BEFORE the running row,
@@ -972,13 +997,14 @@ func (w *Worker) executeAndFinalize(ctx context.Context, plan executePlan) error
 		_ = w.lease.Release(loopCtx, handle)
 		return ErrDrainAborted
 	case plan.resume != nil && isResumeCarrierRejection(execErr):
-		// A stale/invalid carrier (ResumeGuardError) or a failing node resume
-		// handler (ResumeError) is not an execution failure: the run stays
-		// suspended and the message must stay pending so the real decision
-		// carrier can still arrive (§9.2 "execution stays suspended").
+		// Neither class is an execution failure: the run stays suspended
+		// (§9.2). Disposition differs by class (#68): a ResumeGuardError is a
+		// permanent rejection — dispositionHandlerError acks it (the real
+		// decision carrier is a NEW message), while a ResumeError may be a
+		// transient handler failure — its message stays pending.
 		run.markFinished()
 		_ = w.lease.Release(loopCtx, handle)
-		w.logger.Warn("resume carrier rejected; execution stays suspended, message left pending",
+		w.logger.Warn("resume carrier rejected; execution stays suspended",
 			"execution_id", task.ExecutionID, "resume_type", task.ResumeType, "error", execErr)
 		return fmt.Errorf("resume carrier rejected: %w", execErr)
 	case susp != nil:

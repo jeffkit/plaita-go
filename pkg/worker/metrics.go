@@ -52,6 +52,8 @@ const (
 	MetricQuotaRunning        = "tenant_quota_running" // gauge: admitted starts per tenant
 
 	MetricExecDeadlineTotal = "exec_deadline_total" // #35: executions terminalized by the worker-level execution budget
+
+	MetricResumeCarrierRejectedTotal = "resume_carrier_rejected_total" // #68: permanently rejected resume carriers (ResumeGuardError), acked
 )
 
 // metricLabels builds a label map from k/v pairs, dropping empty values so
