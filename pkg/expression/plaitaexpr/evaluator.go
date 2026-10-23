@@ -6,8 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"sort"
 	stdruntime "runtime"
+	"sort"
 	"strings"
 
 	"github.com/jinzhu/copier"
