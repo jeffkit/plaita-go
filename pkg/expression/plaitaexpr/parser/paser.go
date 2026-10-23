@@ -187,12 +187,32 @@ func normalizeBrackets(expr string) string {
 	return mask
 }
 
+// literalMask renders the placeholder that stands in for a string literal
+// while a statement is rewritten. It contains NUL bytes, which cannot occur in
+// the source expression's non-literal syntax.
+func literalMask(i int) string {
+	return fmt.Sprintf("\x00%d\x00", i)
+}
+
 func parseFunc(expr string) (*funcExpr, error) {
-	expr = funcRegexp.ReplaceAllString(expr, "")
+	// Mask string literals BEFORE every text rewrite (#62): the `$F.` strip,
+	// the `$` strip and the trailing-comma drop used to run over the raw
+	// statement, silently rewriting business text inside arguments ("cost:
+	// $100" became "cost: 100"). Single-quoted literals are converted on the
+	// way into the mask (the same singleQuotedToDouble pass that used to run
+	// after the rewrites), so the restored statement keeps its historical
+	// outward shape.
+	var literals []string
+	masked := quotedLiteralRe.ReplaceAllStringFunc(expr, func(lit string) string {
+		literals = append(literals, singleQuotedToDouble(lit))
+		return literalMask(len(literals) - 1)
+	})
+
+	masked = funcRegexp.ReplaceAllString(masked, "")
 
 	var variables []VariableExpr
-	for _, loc := range dollarRegexp.FindAllStringSubmatchIndex(expr, -1) {
-		name := expr[loc[0]+1 : loc[1]]
+	for _, loc := range dollarRegexp.FindAllStringSubmatchIndex(masked, -1) {
+		name := masked[loc[0]+1 : loc[1]]
 		if len(name) == 0 {
 			return nil, errors.New("invalid function variable, empty variable name")
 		}
@@ -201,8 +221,10 @@ func parseFunc(expr string) (*funcExpr, error) {
 		// Absorb `PARENT.` chains: in `$PARENT.$NODE.node1.a` the inner
 		// `$NODE...` is not an independent variable of this runtime context —
 		// it resolves through the parent context (goval navigation).
+		// Offsets stay on the same masked string throughout, so placeholders
+		// of any width cannot skew the absorption arithmetic (#62).
 		start := loc[0]
-		for source != ValueSourceParent && strings.HasSuffix(expr[:start], string(ValueSourceParent)+splitToken) {
+		for source != ValueSourceParent && strings.HasSuffix(masked[:start], string(ValueSourceParent)+splitToken) {
 			name = string(ValueSourceParent) + splitToken + name
 			start -= len(string(ValueSourceParent)) + len(splitToken)
 			source = ValueSourceParent
@@ -214,11 +236,35 @@ func parseFunc(expr string) (*funcExpr, error) {
 		})
 	}
 
-	statement := singleQuotedToDouble(freeDollar(expr))
+	statement := freeDollar(masked)
 	// plaita's grammar allows a trailing comma in argument lists
 	// ("trailing-comma default"); goval does not — drop it.
 	statement = trailingCommaRe.ReplaceAllString(statement, ")")
+
+	for i, lit := range literals {
+		statement = strings.ReplaceAll(statement, literalMask(i), lit)
+	}
+	if err := checkLiteralsRestored(statement, literals); err != nil {
+		return nil, err
+	}
 	return &funcExpr{expr: statement, variables: variables}, nil
+}
+
+// checkLiteralsRestored asserts the mask/restore round trip (#62): every
+// literal that went into the mask must come back byte-identical at its
+// original position. A mismatch means a rewrite reached masked text — that is
+// a parse error now, never a silently rewritten string.
+func checkLiteralsRestored(statement string, want []string) error {
+	got := quotedLiteralRe.FindAllString(statement, -1)
+	if len(got) != len(want) {
+		return fmt.Errorf("unable to parse expression: literal mask/restore mismatch (%d in, %d out)", len(want), len(got))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return fmt.Errorf("unable to parse expression: literal mask/restore mismatch at %d: %q != %q", i, got[i], want[i])
+		}
+	}
+	return nil
 }
 
 // singleQuotedToDouble converts plaita's single-quoted string literals into
