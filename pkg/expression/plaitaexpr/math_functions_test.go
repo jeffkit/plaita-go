@@ -2,6 +2,7 @@ package plaitaexpr
 
 import (
 	"context"
+	stdruntime "runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -298,4 +299,159 @@ func Test_sqrt_eval(t *testing.T) {
 	// negative operand: math domain error (Python ValueError), not NaN
 	_, err3 := evalMath(t, `$F.sqrt(-1)`, map[string]any{})
 	assert.ErrorContains(t, err3, "math domain error")
+}
+
+func Test_ceil_floor_float_to_int_guards(t *testing.T) {
+	// Issue #70: ceil/floor bypassed the NaN/Inf/range guard that pyToInt
+	// (trunc) already had — NaN silently became 0, ±Inf and finite
+	// beyond-int64 floats became ±MaxInt64. The guard aligns the three with
+	// CPython float→int semantics: NaN/±Inf are named errors and finite
+	// floats outside int64 are refused (Python returns an arbitrary-precision
+	// int; the engine's int64 value domain cannot — declared divergence).
+	// Bounds use ±2^63, NOT f > math.MaxInt64: float64(MaxInt64) rounds up
+	// to 2^63, so that comparison lets f == 2^63 slip through.
+	cases := []struct {
+		name    string
+		expr    string
+		input   any
+		wantErr string
+	}{
+		{name: "ceil +Inf", expr: `$F.ceil($F.mul(1e308, 10))`, wantErr: "cannot convert float infinity to integer"},
+		{name: "floor -Inf", expr: `$F.floor($F.mul(-1e308, 10))`, wantErr: "cannot convert float infinity to integer"},
+		{name: "ceil NaN (Inf-Inf)", expr: `$F.ceil($F.sub($F.mul(1e308, 10), $F.mul(1e308, 10)))`, wantErr: "cannot convert float NaN to integer"},
+		{name: "floor NaN (Inf-Inf)", expr: `$F.floor($F.sub($F.mul(1e308, 10), $F.mul(1e308, 10)))`, wantErr: "cannot convert float NaN to integer"},
+		{name: "ceil finite beyond int64", expr: `$F.ceil(1e308)`, wantErr: "cannot convert float to integer"},
+		{name: "ceil data-driven 1e308", expr: `$F.ceil($INPUT.x)`, input: map[string]any{"x": 1e308}, wantErr: "cannot convert float to integer"},
+		{name: "ceil data-driven 1e308*10 = +Inf", expr: `$F.ceil($F.mul($INPUT.x, 10))`, input: map[string]any{"x": 1e308}, wantErr: "cannot convert float infinity to integer"},
+		{name: "ceil 2^63 upper bound", expr: `$F.ceil(9223372036854775808.0)`, wantErr: "cannot convert float to integer"},
+		{name: "floor below -2^63", expr: `$F.floor(-9223372036854777856.0)`, wantErr: "cannot convert float to integer"},
+		// pyToInt now shares the guard: trunc's 2^63 hole (silent MaxInt64)
+		// closes — an intentional tightening, pinned here.
+		{name: "trunc 2^63 tightened", expr: `$F.trunc(9223372036854775808.0)`, wantErr: "cannot convert float to integer"},
+		{name: "trunc +Inf keeps erroring", expr: `$F.trunc($F.mul(1e308, 10))`, wantErr: "cannot convert float infinity to integer"},
+		{name: "trunc NaN keeps erroring", expr: `$F.trunc($F.sub($F.mul(1e308, 10), $F.mul(1e308, 10)))`, wantErr: "cannot convert float NaN to integer"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := evalMath(t, c.expr, c.input)
+			require.Error(t, err)
+			assert.ErrorContains(t, err, c.wantErr)
+		})
+	}
+}
+
+func Test_ceil_floor_boundaries_keep_working(t *testing.T) {
+	// Exact MinInt64 is representable — the guard must not over-reject it.
+	for _, fn := range []string{"ceil", "floor"} {
+		got, err := evalMath(t, "$F."+fn+"(-9223372036854775808.0)", map[string]any{})
+		require.NoError(t, err, fn)
+		assert.Equal(t, model.NewValue(int64(-9223372036854775808)), got, fn)
+	}
+	// Normal values unchanged (pre-fix behaviour, Python math.ceil/floor).
+	cases := []struct {
+		name string
+		expr string
+		want any
+	}{
+		{name: "ceil(2.3)", expr: `$F.ceil(2.3)`, want: int64(3)},
+		{name: "floor(-2.3)", expr: `$F.floor(-2.3)`, want: int64(-3)},
+		{name: "ceil(2) stays int", expr: `$F.ceil(2)`, want: int64(2)},
+		{name: "floor(2) stays int", expr: `$F.floor(2)`, want: int64(2)},
+		{name: "ceil(10.2)", expr: `$F.ceil(10.2)`, want: int64(11)},
+		{name: "floor(10.2)", expr: `$F.floor(10.2)`, want: int64(10)},
+		{name: "ceil(7.2) via input", expr: `$F.ceil($INPUT.a)`, want: int64(8)},
+		{name: "floor(7.2) via input", expr: `$F.floor($INPUT.a)`, want: int64(7)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := evalMath(t, c.expr, map[string]any{"a": 7.2})
+			require.NoError(t, err)
+			assert.Equal(t, model.NewValue(c.want), got)
+		})
+	}
+}
+
+func Test_mod_printf_size_gate(t *testing.T) {
+	// Issue #69: the printf branch rendered before any scale pre-check —
+	// width/precision parsed without a cap (and wrapping on overflow), so one
+	// evaluation could allocate 1e8~2e9 chars. Python's _fn_mod refuses by
+	// name BEFORE building the result; pyFormat now projects the same way and
+	// refuses over the engine's 1e8 budget (lenLimit, per #45 — Python's
+	// 100k floor is a known tier gap, not ported).
+	attacks := []struct {
+		name    string
+		expr    string
+		input   any
+		wantErr []string
+	}{
+		{
+			name:    "1e8 width %d refuses",
+			expr:    `$F.mod('%100000000d', 1)`,
+			wantErr: []string{"result too large", "Refusing to build an unbounded result."},
+		},
+		{
+			name:    "format string from runtime data refuses",
+			expr:    `$F.mod($INPUT.fmt, 1)`,
+			input:   map[string]any{"fmt": "%100000000d"},
+			wantErr: []string{"result too large", "Refusing to build an unbounded result."},
+		},
+		{
+			name:    "1e8 precision %f refuses (not width-only)",
+			expr:    `$F.mod('%.100000000f', 1.5)`,
+			wantErr: []string{"result too large"},
+		},
+		{
+			name:    "20-digit width refuses, never wraps to 9",
+			expr:    `$F.mod('%99999999999999999999d', 1)`,
+			wantErr: []string{"result too large"},
+		},
+	}
+	e := &Evaluator{}
+	for _, c := range attacks {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := runtime.WithWorkflowRuntimeContext(context.Background(), &runtime.Context{
+				WorkflowInput: c.input,
+			})
+			var before, after stdruntime.MemStats
+			stdruntime.GC()
+			stdruntime.ReadMemStats(&before)
+			_, err := e.Eval(ctx, c.expr, nil)
+			stdruntime.ReadMemStats(&after)
+			for _, want := range c.wantErr {
+				assert.ErrorContains(t, err, want)
+			}
+			// The refusal must happen BEFORE the big allocation: pre-fix the
+			// 1e8-width call grew TotalAlloc by ~286MiB; the gate keeps the
+			// whole evaluation under 10MiB.
+			assert.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(10<<20),
+				"refused format must not allocate")
+		})
+	}
+}
+
+func Test_mod_printf_size_gate_reverse(t *testing.T) {
+	// Ordinary formats must not be refused by the gate.
+	cases := []struct {
+		name string
+		expr string
+		want any
+	}{
+		{name: "%5d pads", expr: `$F.mod('%5d', 42)`, want: "   42"},
+		{name: "%(k)s mapping", expr: `$F.mod('%(k)s', {'k': 'v'})`, want: "v"},
+		{name: "%s-%s tuple", expr: `$F.mod('%s-%s', [1, 2])`, want: "1-2"},
+		{name: "%d apples", expr: `$F.mod('%d apples', 3)`, want: "3 apples"},
+		{name: "%.2f", expr: `$F.mod('%.2f', 3.14159)`, want: "3.14"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := evalMath(t, c.expr, map[string]any{})
+			require.NoError(t, err)
+			assert.Equal(t, model.NewValue(c.want), got)
+		})
+	}
+	// %100000d (1e5 chars) stays inside the engine's 1e8 budget: allowed
+	// here, refused by Python's 100k floor — the documented tier gap (#69 边界).
+	got, err := evalMath(t, `$F.mod('%100000d', 1)`, map[string]any{})
+	require.NoError(t, err)
+	assert.Len(t, got.AsString(), 100000)
 }

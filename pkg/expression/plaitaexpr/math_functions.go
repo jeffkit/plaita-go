@@ -332,6 +332,27 @@ func abs(a any) (any, error) {
 	return nil, fmt.Errorf("$F.abs: bad operand type for abs(): '%s'", pyTypeName(a))
 }
 
+// pyFloatToInt guards a float→int64 conversion with CPython's float→int
+// semantics, shared by ceil/floor/trunc (via pyToInt): NaN and ±Inf are named
+// errors (CPython ValueError/OverflowError wording), and a finite float
+// outside int64 is refused — Python returns an arbitrary-precision int there,
+// which the engine's int64 value domain cannot represent (a declared
+// divergence, not a truncation; issue #70). Bounds compare against ±2^63
+// because float64(math.MaxInt64) rounds UP to 2^63: a `f > math.MaxInt64`
+// test lets f == 2^63 silently convert to MaxInt64.
+func pyFloatToInt(fn string, f float64) error {
+	if math.IsNaN(f) {
+		return fmt.Errorf("$F.%s: cannot convert float NaN to integer", fn)
+	}
+	if math.IsInf(f, 0) {
+		return fmt.Errorf("$F.%s: cannot convert float infinity to integer", fn)
+	}
+	if f >= 9223372036854775808.0 || f < -9223372036854775808.0 {
+		return fmt.Errorf("$F.%s: cannot convert float to integer", fn)
+	}
+	return nil
+}
+
 // pyToInt converts a numeric value to int64 for ceil/floor/trunc; non-numbers
 // are a Python TypeError.
 func pyToInt(fn string, a any) (int64, error) {
@@ -339,8 +360,8 @@ func pyToInt(fn string, a any) (int64, error) {
 		return i, nil
 	}
 	if f, ok := pyFloatValue(a); ok {
-		if math.IsNaN(f) || math.IsInf(f, 0) || f > math.MaxInt64 || f < math.MinInt64 {
-			return 0, fmt.Errorf("$F.%s: cannot convert float to integer", fn)
+		if err := pyFloatToInt(fn, f); err != nil {
+			return 0, err
 		}
 		return int64(f), nil
 	}
@@ -356,6 +377,11 @@ func ceil(a any) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("$F.ceil: bad operand type: '%s'", pyTypeName(a))
 	}
+	// Guard BEFORE rounding: pyToInt would truncate toward zero and turn
+	// ceil(2.3) into 2 where Python says 3.
+	if err := pyFloatToInt("ceil", f); err != nil {
+		return nil, err
+	}
 	return int64(math.Ceil(f)), nil
 }
 
@@ -367,6 +393,9 @@ func floor(a any) (any, error) {
 	f, ok := pyFloatValue(a)
 	if !ok {
 		return nil, fmt.Errorf("$F.floor: bad operand type: '%s'", pyTypeName(a))
+	}
+	if err := pyFloatToInt("floor", f); err != nil {
+		return nil, err
 	}
 	return int64(math.Floor(f)), nil
 }
