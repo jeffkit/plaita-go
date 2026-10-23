@@ -659,6 +659,17 @@ func (w *Worker) routeStartRedeliveryOnRunning(ctx context.Context, task *Task,
 			"execution_id", task.ExecutionID)
 		return nil
 	}
+	if body["type"] == "start" {
+		// #52 self-check: the conversion may only leave this route with a
+		// continue carrier. A start copy here means the state row vanished
+		// between the gate's read and the probe (the #52 self-feed loop's
+		// escape hatch) — re-enqueueing it would re-enter this route; poison
+		// ack instead, same disposition as the gate's flow-conflict branch.
+		w.logger.Error("start conversion produced a start copy on a running route; poison-acked",
+			"execution_id", task.ExecutionID, "carrier_flow", task.FlowID, "stored_flow", prev.FlowID)
+		w.metrics.IncCounter(MetricTaskDedupHitTotal, metricLabels("tenant", task.TenantID, "reason", "flow_conflict"))
+		return nil
+	}
 	if _, err := w.queue.Enqueue(ctx, body, task.EnvelopeSchemaVer); err != nil {
 		w.logger.Warn("recovery carrier enqueue failed; original left pending for reclaim",
 			"execution_id", task.ExecutionID, "error", err)
