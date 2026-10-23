@@ -85,6 +85,16 @@ func (p *Parallel) Execute(ctx context.Context) (*workflow.ExecuteResult, error)
 		return nil, err
 	}
 
+	// 嵌套挂起 v1 静态闸（rs 修正清单 #4）：分支图内含挂起型节点 = v1 不支持，
+	// 派发前同步具名拒绝——后台分支的动态拒绝是异步的，无法同步上抛。
+	for _, b := range branches {
+		if b.Flow != nil && flowContainsSuspending(b.Flow) {
+			return nil, &workflow.SuspendRejectedError{Message: fmt.Sprintf(
+				"parallel node %q branch %q contains a suspending node: suspension v1 does not "+
+					"support parallel frames (see docs/PROGRAM.md)", p.GetID(), b.Name)}
+		}
+	}
+
 	// plaita 语义（concurrent.py _split_branches）：只有显式列进 JoinBranches
 	// 的分支阻塞等待；JoinBranches 为空 = 全部后台 fire-and-forget，节点立即
 	// 返回空结果 {}——与"空列表=全部 join"的旧语义正好相反（issue #7）。
@@ -92,7 +102,10 @@ func (p *Parallel) Execute(ctx context.Context) (*workflow.ExecuteResult, error)
 
 	p.backgroundExecBranches(ctx, backgroundBranches)
 
-	results := p.execJoinBranches(ctx, joinBranches)
+	results, err := p.execJoinBranches(ctx, joinBranches)
+	if err != nil {
+		return nil, err
+	}
 	return &workflow.ExecuteResult{Result: results, NextNode: p.Next}, nil
 }
 
@@ -120,11 +133,12 @@ type branchOutcome struct {
 // 失败不让整个节点失败（concurrent.py _process_future_result）：该分支的槽位
 // 写入哨兵 {"__parallel_error__": <msg>, "__branch__": <name>}，下游一眼可
 // 识别（不像 nil 那样与合法返回混淆）；是否整体失败交由节点/流程 errorHandler
-// 决定。
-func (p *Parallel) execJoinBranches(ctx context.Context, joinBranches []*ParallelBranch) map[string]any {
+// 决定。例外：分支内的挂起作用域闸拒绝（SuspendRejectedError）让整个节点
+// 失败并具名上抛——错误哨兵会让流程带着未消费的挂起继续走（fail-open）。
+func (p *Parallel) execJoinBranches(ctx context.Context, joinBranches []*ParallelBranch) (map[string]any, error) {
 	execResult := make(map[string]any, len(joinBranches))
 	if len(joinBranches) == 0 {
-		return execResult
+		return execResult, nil
 	}
 
 	outcomes := make([]branchOutcome, len(joinBranches))
@@ -135,6 +149,11 @@ func (p *Parallel) execJoinBranches(ctx context.Context, joinBranches []*Paralle
 
 	for i, br := range joinBranches {
 		if outcomes[i].err != nil {
+			// 分支内挂起被闸拒绝（SuspendRejected）：整个 parallel 节点失败并
+			// 上抛，不落错误哨兵（fail-closed，rs join 路径特判同款）。
+			if workflow.IsSuspendRejected(outcomes[i].err) {
+				return nil, outcomes[i].err
+			}
 			log.Printf("parallel 节点 %q join 分支 %q 失败，结果置为错误哨兵: %v", p.GetID(), br.Name, outcomes[i].err)
 			execResult[br.Name] = map[string]any{
 				"__parallel_error__": outcomes[i].err.Error(),
@@ -144,7 +163,7 @@ func (p *Parallel) execJoinBranches(ctx context.Context, joinBranches []*Paralle
 		}
 		execResult[br.Name] = outcomes[i].result
 	}
-	return execResult
+	return execResult, nil
 }
 
 // execBranchFlow 解析分支输入并执行分支子流程，join 与 background 共用。
@@ -158,6 +177,11 @@ func (p *Parallel) execJoinBranches(ctx context.Context, joinBranches []*Paralle
 // 浅拷贝（节点列表共享只读），超时兜底落在拷贝上，避免并发 run 互相改写。
 func (p *Parallel) execBranchFlow(ctx context.Context, br *ParallelBranch) (any, error) {
 	branchCtx := runtime.CloneContext(ctx)
+	// 嵌套挂起 v1：分支帧标注（rs run_branch_flow 的 FrameKind::ParallelBranch
+	// 同形）——分支内的挂起被作用域闸在订阅注册前具名拒绝。
+	if branchRC := runtime.WorkflowRuntimeContext(branchCtx); branchRC != nil {
+		branchRC.FrameKind = runtime.FrameKindParallelBranch
+	}
 
 	var subWorkflowInput any
 	var err error
@@ -172,7 +196,16 @@ func (p *Parallel) execBranchFlow(ctx context.Context, br *ParallelBranch) (any,
 	}
 
 	subFlow := p.branchFlowView(br)
-	return subFlow.Execute(branchCtx, subWorkflowInput)
+	result, err := subFlow.Execute(branchCtx, subWorkflowInput)
+	if err != nil {
+		// 分支内挂起载体（静态闸的动态兜底）：具名拒绝上抛，不得被哨兵/日志
+		// 吞掉（fail-closed）；闸拒绝原样透传。
+		if susp := workflow.AsSuspend(err); susp != nil {
+			return nil, workflow.RejectSuspendedCarrier(ctx, susp, runtime.FrameKindParallelBranch)
+		}
+		return nil, err
+	}
+	return result, nil
 }
 
 // branchFlowView 返回本次分支执行用的子 Workflow 副本：Timeout 兜底写在副本

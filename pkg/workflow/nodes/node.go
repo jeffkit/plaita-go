@@ -91,6 +91,13 @@ func (n *BaseNode) NextNode() workflow.NodeID {
 	return n.Next
 }
 
+// GetOutputType returns the node's declared output schema (the nested-suspend
+// return step validates the child value against it — the read side of
+// workflow.childOutputTyper).
+func (n *BaseNode) GetOutputType() workflow.Property {
+	return n.OutputType
+}
+
 // Execute executes the node.
 func (n *BaseNode) Execute(_ context.Context) (*workflow.ExecuteResult, error) {
 	return &workflow.ExecuteResult{NextNode: n.NextNode()}, nil

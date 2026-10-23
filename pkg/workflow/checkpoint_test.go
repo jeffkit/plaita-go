@@ -351,7 +351,13 @@ func TestSuspendRefusesWithoutSubscriptionRegistry(t *testing.T) {
 	}
 }
 
-func TestSuspendInsideNestedFlowFailsClosed(t *testing.T) {
+func TestSuspendInParentLinkedContextSuspends(t *testing.T) {
+	// 嵌套挂起 v1 语义改写（原 TestSuspendInsideNestedFlowFailsClosed）：
+	// 作用域闸从「单层 parent 判定」改为「帧 kind 判定」——child/reference
+	// 调用链放行，仅迭代/分支帧具名拒。裸 Execute 携带父链 ctx 时本执行帧
+	// 仍是 Root kind（prepareExecutionRuntimeContext 为本流新建执行上下文），
+	// 挂起照常成立、无调用栈帧；真正的 child 链挂起/迭代帧拒/分支帧拒见
+	// nodes 包 nested_suspend_test.go（rs 对拍镜像测试集）。
 	f := newSuspendFixture(t)
 	// A child flow's runtime context carries the enclosing execution as its
 	// parent (child.go / CloneContext set ParentWorkflowContext).
@@ -360,13 +366,14 @@ func TestSuspendInsideNestedFlowFailsClosed(t *testing.T) {
 	nested := runtime.WithWorkflowRuntimeContext(context.Background(), parent)
 	nested = WithSuspendOptions(nested, f.opts)
 	_, err := f.flow.Execute(nested, nil)
-	if err == nil {
-		t.Fatal("expected nested suspension to fail")
+	susp := AsSuspend(err)
+	if susp == nil {
+		t.Fatalf("root-frame execution suspends regardless of parent linkage, got err = %v", err)
 	}
-	if AsSuspend(err) != nil {
-		t.Fatalf("nested suspension must not surface as a resumable suspend, got %v", err)
+	if len(susp.CallStack) != 0 {
+		t.Fatalf("bare Execute carries no call frames, got %d", len(susp.CallStack))
 	}
-	if !strings.Contains(err.Error(), "nested flow") {
-		t.Fatalf("error = %v, want a nested-flow message", err)
+	if susp.Flow != f.flow || susp.Ctx == nil {
+		t.Fatalf("carrier must hold the live frames: flow=%v ctx=%v", susp.Flow, susp.Ctx)
 	}
 }

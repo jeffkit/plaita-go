@@ -58,9 +58,20 @@ func (c *Child) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
 	childCtx := runtime.WithWorkflowRuntimeContext(ctx, &runtime.Context{
 		WorkflowInput:         cast.ToStringMap(input),
 		ParentWorkflowContext: ctx,
+		// 嵌套挂起 v1：子执行帧标注（作用域闸的链行走依据之一）。
+		FrameKind: runtime.FrameKindChildCall,
 	})
 	childFlowResult, err := c.ChildFlow.Execute(childCtx, input)
 	if err != nil {
+		// 嵌套挂起 v1 传播转换点（主闸，rs suspension_carrier_or_reject 同款）：
+		// 调用方帧 kind 是真实帧（不受 reference ambient 父链遮蔽影响）——
+		// 迭代/分支帧上的载体在此具名拒绝并注销已注册订阅；child/reference
+		// 调用链放行，载体原样上抛（executeNode 的拦截臂保证不进任何策略链）。
+		if susp := workflow.AsSuspend(err); susp != nil {
+			if rc := runtime.WorkflowRuntimeContext(ctx); !rc.FrameKind.AllowsSuspension() {
+				err = workflow.RejectSuspendedCarrier(ctx, susp, rc.FrameKind)
+			}
+		}
 		return nil, fmt.Errorf("failed to exec children workflow (%q) : %w", c.ChildFlow.ID, err)
 	}
 

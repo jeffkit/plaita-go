@@ -248,11 +248,18 @@ func retryVerdict(err error) (verdict, ok bool) {
 //
 //   - deterministic errors (NonRetryable, the bridged node-side types and
 //     everything self-classifying as non-retryable) never retry;
+//   - a nested-suspend carrier and a scope-gate rejection never retry
+//     (fail-closed — retrying would re-run the inner sub-flow and register
+//     another orphan subscription; the executeNode/flow-level interception
+//     arms fire first, this is the classifier's backstop);
 //   - node code 1001 (request generation = configuration/parameter error)
 //     never retries; 1002/1003 (send/processing = transient) retry;
 //   - every other unknown error keeps the historical behavior (retry).
 func IsRetryableError(err error) bool {
 	if err == nil {
+		return false
+	}
+	if AsSuspend(err) != nil || IsSuspendRejected(err) {
 		return false
 	}
 	var det *DeterministicError

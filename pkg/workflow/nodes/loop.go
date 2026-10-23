@@ -204,8 +204,15 @@ func (l *Loop) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
 		childResult, execErr := l.ChildFlow.Execute(runtime.WithWorkflowRuntimeContext(ctx, &runtime.Context{
 			WorkflowInput:         input,
 			ParentWorkflowContext: ctx,
+			// 嵌套挂起 v1：迭代帧标注（runCollectionChild 同款）。
+			FrameKind: runtime.FrameKindLoopIteration,
 		}), input)
 		if execErr != nil {
+			// 迭代帧边界（rs run_collection_child 同款）：挂起载体无条件具名
+			// 拒绝并注销订阅，不进普通错误链；闸拒绝原样透传。
+			if susp := workflow.AsSuspend(execErr); susp != nil {
+				return nil, workflow.RejectSuspendedCarrier(ctx, susp, runtime.FrameKindLoopIteration)
+			}
 			return nil, execErr
 		}
 

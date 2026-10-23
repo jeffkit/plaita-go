@@ -20,6 +20,52 @@ const (
 	workflowRuntimeContextContextKey contextKey = "workflowRuntimeContext"
 )
 
+// FrameKind is the execution frame type — the scope-gate input of nested
+// suspend v1 (rs FrameKind 同形). Suspension may only pierce Root / ChildCall /
+// ReferenceCall chains; a suspension on any LoopIteration / ParallelBranch
+// frame is named-rejected (its resume position needs iteration-state
+// snapshotting, a future milestone).
+type FrameKind int
+
+const (
+	// FrameKindRoot is the zero value: a root execution frame (also the
+	// default for contexts built before this field existed).
+	FrameKindRoot FrameKind = iota
+	// FrameKindChildCall is a child-node sub-flow execution frame.
+	FrameKindChildCall
+	// FrameKindReferenceCall is a reference-node sub-flow execution frame
+	// (isolated context).
+	FrameKindReferenceCall
+	// FrameKindLoopIteration is a loop/map/filter/find/reduce/while
+	// iteration-body frame.
+	FrameKindLoopIteration
+	// FrameKindParallelBranch is a parallel branch frame.
+	FrameKindParallelBranch
+)
+
+// String renders the frame kind the way the engine's rejection messages name
+// it (rs FrameKind::as_str alignment).
+func (k FrameKind) String() string {
+	switch k {
+	case FrameKindChildCall:
+		return "child"
+	case FrameKindReferenceCall:
+		return "reference"
+	case FrameKindLoopIteration:
+		return "loop-iteration"
+	case FrameKindParallelBranch:
+		return "parallel-branch"
+	default:
+		return "root"
+	}
+}
+
+// AllowsSuspension reports whether this frame may carry a suspension piercing
+// through it (the call-chain frames).
+func (k FrameKind) AllowsSuspension() bool {
+	return k == FrameKindRoot || k == FrameKindChildCall || k == FrameKindReferenceCall
+}
+
 // Context represents the context of workflow execution.
 //
 // Concurrency: a Context is shared between a flow and its background
@@ -60,6 +106,11 @@ type Context struct {
 	// node budget (plaita FLOW_ERROR vs NODE_ERROR); it is runtime bookkeeping
 	// and never serialized.
 	FlowDeadline time.Time `json:"-"`
+	// FrameKind is the execution frame type of this context (nested suspend
+	// v1 scope gate). Seeded by the sub-flow entrypoints (child/reference/
+	// collection iteration/parallel branch); a root execution keeps the zero
+	// value FrameKindRoot. Runtime bookkeeping, never serialized.
+	FrameKind FrameKind `json:"-"`
 }
 
 func newContext() *Context {
@@ -519,6 +570,11 @@ func NewExecutionRuntimeContext(ctx context.Context) *Context {
 	if !ok {
 		return fresh
 	}
+	// The frame kind travels with the execution (nested suspend v1): the
+	// sub-flow entrypoints (child/reference/collection iteration/parallel
+	// branch) annotate the seed context, and the fresh execution context built
+	// here IS that frame — the scope gate and the conversion points read it.
+	fresh.FrameKind = parent.FrameKind
 	if parent.ParentWorkflowContext != nil {
 		fresh.ParentWorkflowContext = parent.ParentWorkflowContext
 	}
@@ -578,6 +634,10 @@ func CloneContext(ctx context.Context) context.Context {
 	newRuntimeCtx.FlowDeadline = runtimeCtx.FlowDeadline
 	newRuntimeCtx.FlowID = runtimeCtx.FlowID
 	newRuntimeCtx.ExecutionID = runtimeCtx.ExecutionID
+	// The frame kind travels with the clone (the branch entrypoint overrides
+	// it to FrameKindParallelBranch; map's concurrent path relies on the copy
+	// before its iteration seed replaces the context).
+	newRuntimeCtx.FrameKind = runtimeCtx.FrameKind
 	runtimeCtx.mu.RUnlock()
 	newRuntimeCtx.ParentWorkflowContext = ctx
 	return WithWorkflowRuntimeContext(ctx, newRuntimeCtx)

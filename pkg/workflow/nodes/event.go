@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jeffkit/plaita-go/internal/runtime"
 	"github.com/jeffkit/plaita-go/internal/types"
 	"github.com/jeffkit/plaita-go/pkg/expression"
 	"github.com/jeffkit/plaita-go/pkg/workflow"
@@ -135,8 +136,21 @@ func (e *Event) SuspendSpec(ctx context.Context, result *workflow.ExecuteResult)
 
 // Resume applies a wake-up carrier to the suspended node (plaita
 // EventNode.resume polymorphic dispatch).
-func (e *Event) Resume(_ context.Context, resumeType string, data map[string]any) (*workflow.ExecuteResult, error) {
+//
+// 嵌套挂起 v1 对齐（rs resume_node_body 的「挂起态全量保留」契约——extended
+// 家族的 extendedResume 已有、裸 Event 节点补齐）：恢复后状态保留挂起期的
+// event_id/subscription_id/subscription_tenant，status 翻转 + event_data 落地。
+func (e *Event) Resume(ctx context.Context, resumeType string, data map[string]any) (*workflow.ExecuteResult, error) {
 	state := e.baseResult()
+	if rc := runtime.WorkflowRuntimeContext(ctx); rc != nil && rc.ExecuteNodeResults != nil {
+		if prev, ok := rc.ExecuteNodeResults[string(e.ID)].(map[string]any); ok {
+			for _, key := range []string{"event_id", "subscription_id", "subscription_tenant"} {
+				if v, ok := prev[key]; ok {
+					state[key] = v
+				}
+			}
+		}
+	}
 	switch resumeType {
 	case workflow.ResumeCancel:
 		state["status"] = EventStatusCancelled
