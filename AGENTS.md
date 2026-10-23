@@ -25,7 +25,9 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
                     orphan watch/resume 载体语义(A47-F2)/dispatch_ledger/DLQ replay+守卫恢复/drain 三态/节点级重试预算 +
                     checkpointstore.go（`{ns}:execution:checkpoint:{id}`）/eventbus.go（订阅/事件桥/超时检查器）
   cmd/plaita-worker/  worker 入口（env 配置，影子键前缀可覆写；-dlq-replay 单向回灌）
-  pkg/shadow/       M2 双跑对账 harness（Python sidecar / Go 节点轨迹+值比对 / 16 纯计算样本）
+  pkg/shadow/       M2/#317 双跑对账 harness（Python sidecar / Go 节点轨迹+值+尝试数比对 / 28 例四维度：纯计算
+                    01-16、错误分类×重试归属 17-22、结果形状 23-26、挂起恢复 27-28；driver 三态 fresh/event-resume/
+                    continue-after-error；声明分叉 load-refusal:go、replay-from-start:go；http 用例 hermetic 测试期守卫）
   cmd/shadow-compare/  对账 CLI（样本集或 -flow 单流程），一致率报告 docs/SHADOW_REPORT.md
   pkg/llm/          LLM provider 链（OpenAI/Anthropic 兼容）
   docs/WORKER_PROTOCOL.md  worker 协议权威文档（田野调查 + §9.4 M6 键名/语义，实现与影子对账的验收基准）
@@ -65,7 +67,7 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
 - **dispatch_ledger**（§6.3，ledger.go）：`{prefix}:dispatch:ledger` 只增 Stream，`payload` JSON + `schema_version`；`EnqueueWithLedger` 是入队+记账唯一入口（target 同源写入消息体与台账，结构上不可能分叉）；`Read`/`Parity` 读侧对坏行/故障不抛。TaskNotForThisWorker 完整交接（worker.go handleForeignTarget）：目标不在册/非 running → 剥 target 广播重投；在册 running → 按 `{ns}:execution:affinityhandover:{id}` 计数（INCR+7d），≤3 enqueue→ack，达限终态化 `AffinityHandoverExhausted` 并留 pending；计数不可用 fail-closed 留 pending；**全程不 DLQ**。
 - **DLQ replay + 守卫恢复**（§2.4/§9.2，dlqreplay.go）：`ReplayDeadLetter` 幂等标记 `{prefix}:dlq:replay:{dlq_key}:{id}`（SET NX 7d，force 覆盖）、源信封 schema_version 继承（超版本入队前拒绝）、无 id 的 start 用 uuid5 确定性铸造、墓碑拒复活、审计 `{prefix}:dlq:replay:audit`、DLQ 原条不删。死信守卫：schema 拒收/终态/墓碑放行不克隆；租约在/读失败跳过；running 且节点预算耗尽（noderetry max ≥ max_deliveries 或 noderefetch ≥100）→ 终态化 `node_retry_budget_exhausted`；其余非终态+租约空 → 克隆源 payload（继承信封版本）后再放行死信。
 - **drain 三态**（§9.3，drain.go）：`RequestDrain`（D1，幂等，注册表 draining 立即 flush 3 重试 + 有界定时器）→ `ForceStop`（D2，无条件停领取 + 取消在途 run + 打断重试退避）→ 信号只调 RequestDrain（D3，main.go 二次信号强退）。drain 后读到的消息不 dispatch/不 ack 留 PEL；D2 中止的步**不写终态**、留 pending（本 build 无硬中断，保住可续跑/可重投优先）。
-- **节点级重试预算**（§9.1，retry.go）：`noderetry:{id}:{node}`（预算=max_deliveries）/`noderefetch:{id}`（100）/`nofail:{id}`（12）三层，INCR+7d；可重试判据 = 有失败节点 + 非超时/取消 + `workflow.IsRetryableError`；放行则指数退避 `min(30s, 1s·2^(n-1))`（0.2s 分片可被 D2 打断）→ **重投载体查盘转换（#91，对齐 `_requeue_body_for_retry`）**：盘上有行 → resume/continue 载体（params 透传、不带 version；墓碑命中 ack 丢弃、读盘失败原样 start），失败边界快照 checkpoint（worker 侧 `SnapshotRuntimeContext`，best-effort）→ enqueue→ack。预算耗尽/兜底上限 → 终态化 `node_retry_budget_exhausted`（code=-520）。成功推进清节点键；整跑 completed 再清连续失败计数。**残余偏差（引擎面）**：Go 引擎尚无中途入口（`Workflow.Resume` 仅限挂起节点），continue 载体推进 running 执行时从 flow 起点重入引擎（已完成前序节点重放）；租约/指纹门/历史续接/checkpoint 生命周期均为 resume 路径语义，引擎补中途入口后收敛。
+- **节点级重试预算**（§9.1，retry.go）：`noderetry:{id}:{node}`（预算=max_deliveries）/`noderefetch:{id}`（100）/`nofail:{id}`（12）三层，INCR+7d；可重试判据 = 有失败节点 + 非超时/取消 + `workflow.IsRetryableError`；放行则指数退避 `min(30s, 1s·2^(n-1))`（0.2s 分片可被 D2 打断）→ **重投载体查盘转换（#91，对齐 `_requeue_body_for_retry`）**：盘上有行 → resume/continue 载体（params 透传、不带 version；墓碑命中 ack 丢弃、读盘失败原样 start），失败边界快照 checkpoint（worker 侧 `SnapshotRuntimeContext`，best-effort）→ enqueue→ack。预算耗尽/兜底上限 → 终态化 `node_retry_budget_exhausted`（code=-520）。成功推进清节点键；整跑 completed 再清连续失败计数。**残余偏差（引擎面·已声明行为分叉类 e）**：Go 引擎尚无中途入口（`Workflow.Resume` 仅限挂起节点），continue 载体推进 running 执行时从 flow 起点重入引擎（已完成前序节点重放）——对 http 回调/审批/agentrun 等副作用节点即重复执行；Python 自 checkpoint/last_node 步进不重放=权威方向。矩阵格=plaita `docs/governance/conformance-matrix.md` go 列 R2 行 `red-declared`（声明 `replay-from-start:go`，对拍样本 28 每夜红=分叉仍存证据，翻绿=收敛自动验收）；租约/指纹门/历史续接/checkpoint 生命周期均为 resume 路径语义，引擎补中途入口（Stage 1 单）后收敛。
 
 ## M6 checkpoint v1.5（2026-10-19，分支 feat/checkpoint-v15）
 
