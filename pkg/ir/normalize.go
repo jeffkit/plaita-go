@@ -1077,8 +1077,16 @@ func normalizeTimeout(v any) (string, error) {
 		if strings.HasPrefix(s, "P") {
 			// validate the ISO spelling here so a bad budget fails at load,
 			// not at execute
-			if _, err := duration.ParseISO8601(s); err != nil {
+			d, err := duration.ParseISO8601(s)
+			if err != nil {
 				return "", fmt.Errorf("timeout %q: %v", t, err)
+			}
+			// #57 belt-and-suspenders: ParseISO8601 now rejects
+			// unrepresentable budgets, but no declared spelling should ever
+			// yield a negative budget either — reject one explicitly so a
+			// future Duration producer cannot reintroduce the wrap.
+			if d.TimeDuration() < 0 {
+				return "", fmt.Errorf("timeout %q: parsed to a negative budget (%s)", t, d)
 			}
 			return s, nil
 		}

@@ -2,6 +2,7 @@ package duration
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -91,6 +92,52 @@ func TestMarshalRoundTrip(t *testing.T) {
 	}
 	if err := json.Unmarshal([]byte(`300`), &back); err == nil {
 		t.Fatal("engine JSON spells timeouts as ISO strings; a bare number must fail")
+	}
+}
+
+// #57: the int64-nanosecond synthesis has no natural overflow check —
+// declared budgets past time.Duration's ~292-year domain used to wrap:
+// negative (instant timeout), zero, or a silently shortened positive. All
+// shapes of the same overflow must fail closed with the named
+// representability error (same shape as plaita-rs duration.rs).
+func TestParseISO8601OverflowIsNamedError(t *testing.T) {
+	cases := []string{
+		"P106752D",              // wraps negative (issue probe: instant deadline)
+		"P281474976710656D",     // wraps to 0 (issue probe: reads as PT0S)
+		"P213504D",              // wraps to a shortened positive (~25min)
+		"P1317624576693539402W", // weeks*7 overflows int64 before the day fold
+		"PT9223372037S",         // seconds past the int64-ns domain (float->int wraps negative on amd64)
+		"P106751DT23H59M59S",    // every part in range, total over the domain
+	}
+	for _, in := range cases {
+		d, err := ParseISO8601(in)
+		if err == nil {
+			t.Errorf("ParseISO8601(%q) = %s, want the named not-representable error", in, d)
+			continue
+		}
+		if !strings.Contains(err.Error(), "not representable") {
+			t.Errorf("ParseISO8601(%q) error = %q, want it to name the unrepresentable value", in, err)
+		}
+	}
+	// the biggest day-grain budget that still fits int64 nanoseconds keeps
+	// parsing with a positive value
+	d, err := ParseISO8601("P106751D")
+	if err != nil || d.TimeDuration() <= 0 {
+		t.Errorf("ParseISO8601(P106751D) = %v, %v; want success with a positive duration", d, err)
+	}
+}
+
+// Every parseable duration must read as a non-negative budget — the wrapped
+// negative form is the regression red line (#57).
+func TestParseISO8601NeverNegative(t *testing.T) {
+	for _, in := range []string{"PT24H", "PT86400S", "PT0S", "PT", "P1D", "P1W", "P1DT0.5H", "P106751D", "PT0.3S", "PT9223372036S"} {
+		d, err := ParseISO8601(in)
+		if err != nil {
+			t.Fatalf("ParseISO8601(%q): %v", in, err)
+		}
+		if d.TimeDuration() < 0 {
+			t.Errorf("ParseISO8601(%q) = %s: a negative budget must be impossible", in, d)
+		}
 	}
 }
 
