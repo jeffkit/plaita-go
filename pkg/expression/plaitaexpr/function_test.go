@@ -31,11 +31,15 @@ func TestBuiltinFunctions(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 8.0, v)
 
-	require.Equal(t, "abc", concat("a", "b", "c"))
+	concatOut, err := concat("a", "b", "c")
+	require.NoError(t, err)
+	require.Equal(t, "abc", concatOut)
 	require.Equal(t, "bc", substring("abc", 1, 2))
 	require.Equal(t, "ABC", upper("abc"))
 	require.Equal(t, "abc", lower("ABC"))
 	require.Equal(t, "abc", strip(" abc "))
-	require.Equal(t, "ab", replace("abc", "c", ""))
+	replaceOut, err := replace("abc", "c", "")
+	require.NoError(t, err)
+	require.Equal(t, "ab", replaceOut)
 	require.Equal(t, true, between(1, 0, 2))
 }

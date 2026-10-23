@@ -21,6 +21,7 @@ package plaitaexpr
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -93,8 +94,53 @@ func rstrip(s string) string {
 	return strings.TrimRightFunc(s, unicode.IsSpace)
 }
 
-func replace(s, old, new string) string {
-	return strings.ReplaceAll(s, old, new)
+// replace is plaita $F.replace(a, b, c) — Python str.replace with the
+// result-size gate of _fn_replace (expression.py :2881-2889) run BEFORE the
+// allocation (#64): the hit count from strings.Count projects the result
+// length (empty pattern inserts between every character), and an
+// over-budget projection is a named refusal instead of a 100MB string.
+// Lengths are runes, matching Python's "chars".
+func replace(s, old, new string) (string, error) {
+	la := int64(utf8.RuneCountInString(s))
+	lb := int64(utf8.RuneCountInString(old))
+	lc := int64(utf8.RuneCountInString(new))
+	var hits, projected int64
+	if lb == 0 {
+		hits = la
+		projected = mulClamped(la, lc+1)
+		projected = addClamped(projected, lc)
+	} else {
+		hits = int64(strings.Count(s, old))
+		if lc > lb {
+			projected = addClamped(la, mulClamped(hits, lc-lb))
+		} else {
+			projected = la
+		}
+	}
+	if err := checkResultSize(
+		fmt.Sprintf("$F.replace(%d chars, %d hits)", la, hits),
+		projected, addClamped(addClamped(la, lb), lc), "chars"); err != nil {
+		return "", err
+	}
+	return strings.ReplaceAll(s, old, new), nil
+}
+
+// mulClamped/addClamped keep the projection arithmetic in int64 without
+// wrapping on absurd inputs (a wrapped projection could sneak past the gate).
+func mulClamped(a, b int64) int64 {
+	p, ok := intMulOverflow(a, b)
+	if ok {
+		return math.MaxInt64
+	}
+	return p
+}
+
+func addClamped(a, b int64) int64 {
+	s, ok := intAddOverflow(a, b)
+	if ok {
+		return math.MaxInt64
+	}
+	return s
 }
 
 // split is plaita $F.split(s, sep) — Python str.split: an empty separator is
@@ -139,13 +185,27 @@ func endswith(s, suffix string) bool {
 // `"".join(str(arg) for arg in args)`: every argument is rendered with
 // Python str() semantics (numbers keep their Python shape, None is "None"),
 // then concatenated. The typed (...string) variant panicked on
-// `$F.concat(1, 'a')` at the reflect boundary instead.
-func concat(args ...any) string {
+// `$F.concat(1, 'a')` at the reflect boundary instead. The render size is
+// bounded per argument BEFORE rendering (#64, _fn_concat's _render_size
+// shape): the projection equals the input size, so only the hard cap binds.
+func concat(args ...any) (string, error) {
+	total := int64(0)
+	for _, arg := range args {
+		bound, ok := pyRenderBound(arg)
+		if !ok {
+			return "", fmt.Errorf("$F.concat cannot bound the rendered size of %s. Refusing to build an unbounded result.",
+				pyTypeName(arg))
+		}
+		total = addClamped(total, bound)
+	}
+	if err := checkResultSize(fmt.Sprintf("$F.concat(%d args)", len(args)), total, total, "chars"); err != nil {
+		return "", err
+	}
 	parts := make([]string, len(args))
 	for i, arg := range args {
 		parts[i] = PyStr(arg)
 	}
-	return strings.Join(parts, "")
+	return strings.Join(parts, ""), nil
 }
 
 func isDigit(s string) bool {
