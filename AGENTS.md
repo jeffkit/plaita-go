@@ -213,7 +213,7 @@ GOPROXY=https://goproxy.cn,direct go test ./...
 make ci     # = ci.yml 同形：gofmt 检查 + vet + build + test（含 skip）+ node-parity + workflow 审计
 make node-parity   # #80：plaita NodeRegistry 权威清单 ↔ ir.SupportedNodeTypes() 差分（例外表见 pkg/ir/node_parity_test.go）
 make test   # 只跑测试；skip 清单与 CI 共用 scripts/ci-skip.txt
-make test-all   # 不带 skip（无出口网络时 http_request_info 会红，见「已知问题」）
+make test-all   # 不带 skip（当前只多跑 Test_now_today_eval，见「已知问题」）
 make lint   # gofmt 检查 + vet（golangci-lint 配置存在但未接线）
 ```
 
@@ -300,8 +300,8 @@ agentrun `workspace=` 分支从「拒载」改为「计划支持」。**对齐�
 
 ## 已知问题
 
-- ~~error_node 上游遗留红~~ **已修平（2026-10-19 audit wave，#12/#13 http 契约修复顺带解决）**。
-- `TestWorkflow_Execute` 两条子测试都打真实出网（`http://tencent.com`），红随出口状态翻转：`test_execute_workflow_with_http_request_info`（`$ERROR.http.Info.Request.Method` 取到 `[]`，end 按 string 校验报错）在 `scripts/ci-skip.txt` 内，**CI 与 `make test` 跳过，`make test-all` 复现**；`test_execute_workflow_with_error_node` 不在 skip 清单——2026-10-21 下午（第六十九轮）实测**出口可达（tencent.com 301）仍红、同 `[]` 签名**，stash 后 r68 基线复跑同红同签名：该红的现行形态与出口状态解耦（上游行为漂移），非本仓回归，同日 r68 台账行同记。
+- ~~error_node 上游遗留红~~ / ~~`TestWorkflow_Execute` 两子例出网红~~ **已 hermetic 化（2026-10-23，B4 r14）**：`test_execute_workflow_with_error_node` / `test_execute_workflow_with_http_request_info` 原打 `http://invalid-url` / `http://tencent.com`，红的真因不是出口浮动而是**席位 Mac 的 `HTTP_PROXY`**——代理对不可解析主机回 **502**，而 http 节点把 5xx 当值（#12）不写 `$ERROR.http` → `[]`（GH runner 无代理、DNS 直连失败走 1002，故 25/25 绿；AGENTS 旧条「出口可达仍红」正是代理形态）。现两子例改打「刚关闭的 loopback httptest 端口」（ECONNREFUSED → 1002 带 request 快照；loopback 永不经代理、与 NO_PROXY 无关），断言原文不动，`http_request_info` 已移出 ci-skip。**写 http 节点测试一律 httptest，禁打公网主机。**
+- ~~`cmd/plaita-worker` CI 随机 `exit status 130`（整包 0.2s 死、无 `--- FAIL` 行）~~ **已修（2026-10-23，B4 r14）**：main 近 25 run 的 4 红**全是它**（同轮 `pkg/workflow` 皆 ok）。根因=测试用 `syscall.Kill(getpid, SIGTERM)` 打真实进程信号，而 `runWorker` 从不 `signal.Stop`、二次信号走孤儿 goroutine `os.Exit(130)`；`os/signal` 分发是异步 goroutine，`signal.Reset` **不等在途信号排空**（只有 `Stop` 会 `signalWaitUntilIdle`），CI 多包争 CPU 时上一子测试的 SIGTERM 可晚到下一子测试 `Notify` 之后 → 误入 drain 并留下 130 goroutine → 吃掉下一枪。修法：`runWorker` `defer signal.Stop`，拆 `runWorkerUntil(..., sigCh)` 注入信号源（依赖 `drainableRunner` 三方法接口），二次信号改**返回** 130（main 仍 `os.Exit`），函数返回后零残留 goroutine；测试零进程信号，新增 Case D 用阻塞 Run 的脚本 runner 确定性钉 130（负控：旧形态下该例直接打死二进制）。**cmd 层测试禁用 `syscall.Kill` / `signal.Reset`。**
 - `Test_now_today_eval`：gomonkey `time.Now` 补丁在同一测试二进制内多次重放不稳（darwin/arm64 实测 `-count=3` 第 3 次起红），CI skip。`$F.now/$F.today` 的 CI 覆盖因此只剩 `Test_strftime_directives`（直接测 strftime 层）。`Test_today_eval`/`Test_now_eval` 已不存在，skip 清单与测试注释同步剔除。
 - `go vet ./...`：2026-10-21 复核 rc=0 无输出（旧条目里的 providers lock 值拷贝告警已不在）。
 
