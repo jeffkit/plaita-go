@@ -42,6 +42,7 @@ const (
 	DiffNodeID         = "node_id_mismatch"
 	DiffNodeType       = "node_type_mismatch"
 	DiffNodeError      = "node_error_mismatch"
+	DiffAttempts       = "node_attempts_mismatch"
 	DiffExecution      = "execution_mismatch"
 )
 

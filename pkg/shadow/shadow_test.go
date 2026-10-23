@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	neturl "net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -179,13 +180,23 @@ func TestLoadSamples(t *testing.T) {
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, len(samples), 10, "M2 requires at least 10 synthetic samples")
 
-	forbidden := map[string]bool{
-		"http": true, "redis": true, "agentrun": true, "code": true,
-		"git_publish": true, "github_comment": true, "writefile": true,
-		"notify": true, "feishu_webhook": true, "dingtalk_webhook": true,
+	// Nodes that touch the outside world are forbidden in every dimension.
+	forbiddenAlways := map[string]bool{
+		"redis": true, "agentrun": true, "git_publish": true, "github_comment": true,
+		"writefile": true, "notify": true, "feishu_webhook": true, "dingtalk_webhook": true,
 		"slack_webhook": true, "wecom_webhook": true, "generic_webhook": true,
 		"email_send": true, "api_request": true, "llm": true, "hitl": true,
 		"decision": true, "capture": true, "sql_query": true,
+	}
+	// The pure-computation dimension (M2) additionally forbids code (now that
+	// the harness opts the CodeNode in) and http. The #317 dimensions
+	// (error-classification / result-shape / suspend-resume) may use them
+	// under the hermeticity guard below: no public-network egress.
+	forbiddenPure := map[string]bool{
+		"http": true, "code": true,
+	}
+	for forbidden := range forbiddenAlways {
+		forbiddenPure[forbidden] = true
 	}
 	seen := map[string]bool{}
 	for _, sample := range samples {
@@ -196,14 +207,60 @@ func TestLoadSamples(t *testing.T) {
 		assert.NotEmpty(t, sample.Expect, "sample %s missing expect", sample.Name)
 		assert.NotEmpty(t, sample.Flow)
 
-		var flow map[string]any
-		require.NoError(t, json.Unmarshal(sample.Flow, &flow))
-		for _, nodeType := range collectNodeTypes(flow) {
+		dimension := sample.Dimension
+		if dimension == "" {
+			dimension = DimensionPure
+		}
+		forbidden := forbiddenPure
+		if dimension != DimensionPure {
+			forbidden = forbiddenAlways
+		}
+		for _, nodeType := range collectNodeTypes(sampleFlowMap(t, sample)) {
 			assert.False(t, forbidden[nodeType],
-				"sample %s uses side-effect node %q (M2 samples must be pure computation)",
-				sample.Name, nodeType)
+				"sample %s uses forbidden node %q for dimension %q",
+				sample.Name, nodeType, dimension)
+		}
+		assertHermeticHTTP(t, sample)
+	}
+}
+
+func sampleFlowMap(t *testing.T, sample Sample) map[string]any {
+	t.Helper()
+	var flow map[string]any
+	require.NoError(t, json.Unmarshal(sample.Flow, &flow))
+	return flow
+}
+
+// assertHermeticHTTP enforces the #317 hermeticity guard: an http node in a
+// non-pure sample must not be able to reach the public network — either its
+// scheme is not http/https (rejected before dialing) or its host is loopback.
+func assertHermeticHTTP(t *testing.T, sample Sample) {
+	t.Helper()
+	flow := sampleFlowMap(t, sample)
+	var walk func(nodes []any)
+	walk = func(nodes []any) {
+		for _, rawNode := range nodes {
+			node, ok := rawNode.(map[string]any)
+			if !ok {
+				continue
+			}
+			if node["type"] != "http" {
+				continue
+			}
+			url, _ := node["url"].(string)
+			assert.NotEmpty(t, url, "sample %s: http node %v without url", sample.Name, node["id"])
+			u, err := neturl.Parse(url)
+			require.NoError(t, err, "sample %s: http node url %q", sample.Name, url)
+			host := u.Hostname()
+			loopback := host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]"
+			noDial := u.Scheme != "http" && u.Scheme != "https"
+			assert.True(t, noDial || loopback,
+				"sample %s: http node targets a non-hermetic url %q (loopback or non-http scheme only)",
+				sample.Name, url)
 		}
 	}
+	nodes, _ := flow["nodes"].([]any)
+	walk(nodes)
 }
 
 func collectNodeTypes(flow map[string]any) []string {
@@ -238,12 +295,23 @@ func collectNodeTypes(flow map[string]any) []string {
 
 // TestSamplesRunGo always exercises the Go side; the Python comparison is
 // covered by TestSamplesAgainstPython (skipped without a local plaita repo).
+// Error-mode samples must fail, load-refusal samples must be refused at
+// load, and driver samples go through the driver entry.
 func TestSamplesRunGo(t *testing.T) {
 	samples, err := LoadSamples(filepath.Join("testdata", "samples"))
 	require.NoError(t, err)
 	for _, sample := range samples {
 		t.Run(sample.Name, func(t *testing.T) {
-			outcome := RunGo(t.Context(), sample.Flow, sample.Input)
+			outcome := RunGoDrive(t.Context(), sample.Flow, sample.Input, sample.Driver, sample.DriverOptions)
+			if sample.HasDeclaration(DeclaredLoadRefusal) {
+				require.False(t, outcome.OK, "declared load-refusal violated: go loaded the flow")
+				return
+			}
+			if sample.IsErrorMode() {
+				require.False(t, outcome.OK, "error-mode sample must fail in go: %s", outcome.Error)
+				assert.NotEmpty(t, outcome.Trace)
+				return
+			}
 			require.True(t, outcome.OK, "go run failed: %s", outcome.Error)
 			assert.NotEmpty(t, outcome.Trace)
 		})

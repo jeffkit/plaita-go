@@ -10,13 +10,42 @@ import (
 	"strings"
 )
 
-// Sample is one synthetic reconciliation case: a pure-computation flow plus
-// its input. Samples must not contain side-effect nodes (http, redis,
-// agentrun, git_publish, notify/webhook/email, ...).
+// Sample drivers. "" / "fresh" runs the flow once in each engine (M2
+// posture). The #317 execution-semantics cases need the resume entry points:
+//
+//   - event-resume: run to the suspending event node, resolve it with the
+//     resume carrier from DriverOptions, run to completion (plaita
+//     distributed resume + go Workflow.ResumeSuspension);
+//   - continue-after-error: let a node fail terminally, then redeliver the
+//     continue carrier (plaita run_distributed continue from the checkpoint;
+//     go worker posture = full re-entry from the flow start — the declared
+//     replay divergence).
+const (
+	DriverFresh              = "fresh"
+	DriverEventResume        = "event-resume"
+	DriverContinueAfterError = "continue-after-error"
+)
+
+// Sample dimensions (#317): what the case pins. "" means "pure" — the M2
+// pure-computation posture (no side-effect nodes at all).
+const (
+	DimensionPure                = "pure"
+	DimensionErrorClassification = "error-classification"
+	DimensionResultShape         = "result-shape"
+	DimensionSuspendResume       = "suspend-resume"
+)
+
+// Sample is one synthetic reconciliation case: a flow plus its input.
+// Pure-computation samples (dimension "" / "pure") must not contain
+// side-effect nodes (http, redis, agentrun, git_publish, notify/webhook/email,
+// ...). #317 cases (error-classification / result-shape / suspend-resume) may
+// use code and hermetic http nodes; the loader guard in shadow_test.go
+// enforces the boundary per dimension.
 //
 // Expect is the expected final output, checked against both engines. It is a
 // raw message so an explicit JSON null (sample 09: empty loop) is
-// distinguishable from a missing expectation.
+// distinguishable from a missing expectation. Samples that terminate in an
+// error instead set expectError (and keep expect null).
 type Sample struct {
 	Name                string          `json:"name"`
 	Description         string          `json:"description"`
@@ -24,6 +53,10 @@ type Sample struct {
 	Expect              json.RawMessage `json:"expect"`
 	Flow                json.RawMessage `json:"flow"`
 	DeclaredDivergences []string        `json:"declaredDivergences,omitempty"`
+	Dimension           string          `json:"dimension,omitempty"`
+	Driver              string          `json:"driver,omitempty"`
+	DriverOptions       map[string]any  `json:"driverOptions,omitempty"`
+	ExpectError         json.RawMessage `json:"expectError,omitempty"`
 	Path                string          `json:"-"`
 }
 
@@ -34,6 +67,10 @@ type rawSample struct {
 	Expect              json.RawMessage `json:"expect"`
 	Flow                json.RawMessage `json:"flow"`
 	DeclaredDivergences []string        `json:"declaredDivergences"`
+	Dimension           string          `json:"dimension"`
+	Driver              string          `json:"driver"`
+	DriverOptions       map[string]any  `json:"driverOptions"`
+	ExpectError         json.RawMessage `json:"expectError"`
 }
 
 // LoadSamples reads every *.json under dir, sorted by file name.
@@ -88,6 +125,16 @@ func parseSample(raw []byte) (*Sample, error) {
 	if rs.Input == nil {
 		rs.Input = map[string]any{}
 	}
+	switch rs.Driver {
+	case "", DriverFresh, DriverEventResume, DriverContinueAfterError:
+	default:
+		return nil, fmt.Errorf("unknown driver %q", rs.Driver)
+	}
+	switch rs.Dimension {
+	case "", DimensionPure, DimensionErrorClassification, DimensionResultShape, DimensionSuspendResume:
+	default:
+		return nil, fmt.Errorf("unknown dimension %q", rs.Dimension)
+	}
 	return &Sample{
 		Name:                rs.Name,
 		Description:         rs.Description,
@@ -95,8 +142,68 @@ func parseSample(raw []byte) (*Sample, error) {
 		Expect:              rs.Expect,
 		Flow:                rs.Flow,
 		DeclaredDivergences: rs.DeclaredDivergences,
+		Dimension:           rs.Dimension,
+		Driver:              rs.Driver,
+		DriverOptions:       rs.DriverOptions,
+		ExpectError:         rs.ExpectError,
 	}, nil
 }
+
+// ExpectErrorSpec is the terminal-error expectation of an error-mode sample.
+// Match, when non-empty, must appear in BOTH engines' terminal error strings
+// (the retry-attribution signal is the per-node attempt count carried on the
+// trace; the error text itself differs per engine by construction —
+// NodeExecutionError vs HandlerError wrappers).
+type ExpectErrorSpec struct {
+	Match string `json:"match"`
+}
+
+// ExpectedError decodes the sample's expectError block (empty = not an
+// error-mode sample).
+func (s Sample) ExpectedError() (ExpectErrorSpec, error) {
+	var spec ExpectErrorSpec
+	raw := bytes.TrimSpace(s.ExpectError)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return spec, nil
+	}
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		return spec, err
+	}
+	return spec, nil
+}
+
+// IsErrorMode reports whether the sample expects a terminal error in both
+// engines.
+func (s Sample) IsErrorMode() bool {
+	raw := bytes.TrimSpace(s.ExpectError)
+	return len(raw) > 0 && !bytes.Equal(raw, []byte("null"))
+}
+
+// HasDeclaration reports whether the sample declares the given divergence.
+func (s Sample) HasDeclaration(name string) bool {
+	for _, d := range s.DeclaredDivergences {
+		if d == name {
+			return true
+		}
+	}
+	return false
+}
+
+// Declared divergence vocabulary (#317). Entries live in the sample JSON's
+// declaredDivergences list; the comparator honors each with a specific,
+// narrow normalization — a declaration never disables result expectations.
+const (
+	// DeclaredReplayFromStart: the go worker re-enters a running execution
+	// from the flow start on a redelivered continue carrier (AGENTS.md
+	// §worker 二期, Stage-1 convergence pending), so already-completed
+	// prefix nodes reappear in the go trace. The comparator projects both
+	// traces to the first occurrence per node before comparing.
+	DeclaredReplayFromStart = "replay-from-start:go"
+	// DeclaredLoadRefusal: the go loader fail-closed rejects the construct
+	// (e.g. end resultType "nop") that the Python engine accepts. The case
+	// then pins the Python behavior via expect AND asserts the go refusal.
+	DeclaredLoadRefusal = "load-refusal:go"
+)
 
 // Expected decodes the sample's expected final output.
 func (s Sample) Expected() (any, error) {

@@ -12,12 +12,18 @@ import (
 // TraceEvent is one node-end observation. Both engines emit the same shape:
 // flow_id identifies the (embedded) flow, node_id/type the executed node and
 // result the node's output value (nil for start nodes and failed nodes).
+// Attempts is the execution's attempt count for the node (retries + 1): the
+// Go engine fires OnNodeEnd per attempt and the harness collapses those into
+// one event, while the Python sidecar counts the runner's retry warnings.
+// Since #317 the retry attribution (deterministic vs transient) is part of
+// the comparison signal.
 type TraceEvent struct {
-	FlowID string `json:"flow_id"`
-	NodeID string `json:"node_id"`
-	Type   string `json:"type"`
-	Result any    `json:"result"`
-	Error  string `json:"error,omitempty"`
+	FlowID   string `json:"flow_id"`
+	NodeID   string `json:"node_id"`
+	Type     string `json:"type"`
+	Result   any    `json:"result"`
+	Error    string `json:"error,omitempty"`
+	Attempts int    `json:"attempts,omitempty"`
 }
 
 // Outcome is the result of one engine execution.
@@ -126,14 +132,61 @@ func failedOutcome(out *Outcome, err error) *Outcome {
 }
 
 // normalizeTrace canonicalizes node results so they compare in the same JSON
-// value domain as Python's output.
+// value domain as Python's output, then collapses the per-attempt events the
+// Go engine emits into one event per node execution carrying the attempt
+// count (Python emits one event per node with the count from the runner's
+// retry warnings).
 func normalizeTrace(events []TraceEvent) []TraceEvent {
 	for i := range events {
 		if normalized, ok := canonical(events[i].Result); ok {
 			events[i].Result = normalized
 		}
 	}
-	return events
+	return collapseAttempts(events)
+}
+
+// collapseAttempts merges adjacent events of the same (flow_id, node_id) —
+// the retry loop re-runs exactly the same node back to back — keeping the
+// last event's result/error and summing the attempt count. A retryable node
+// that fails twice and then succeeds therefore compares as one successful
+// event with attempts=3, matching the Python sidecar's count.
+func collapseAttempts(events []TraceEvent) []TraceEvent {
+	out := events[:0:0]
+	for _, event := range events {
+		if n := len(out); n > 0 {
+			last := &out[n-1]
+			if last.FlowID == event.FlowID && last.NodeID == event.NodeID && last.Type == event.Type {
+				last.Result = event.Result
+				last.Error = event.Error
+				last.Attempts += maxInt(event.Attempts, 1)
+				continue
+			}
+		}
+		if event.Attempts < 1 {
+			event.Attempts = 1
+		}
+		out = append(out, event)
+	}
+	return out
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// TraceCompareOptions tunes the structural trace comparison.
+type TraceCompareOptions struct {
+	// IgnoreAttempts skips the per-node attempt-count check (retry
+	// attribution). Used under the declared replay-from-start divergence:
+	// the replayed prefix and the re-run failing node make raw attempt totals
+	// a posture artifact (the python drive merges its two passes into
+	// attempts=4 on the failing node while the go projection keeps the first
+	// occurrence at attempts=2 — physically both engines execute the node the
+	// same number of times).
+	IgnoreAttempts bool
 }
 
 // CompareTraces compares node traces grouped by flow_id, preserving the event
@@ -141,6 +194,12 @@ func normalizeTrace(events []TraceEvent) []TraceEvent {
 // while node order, node ids/types, node results and error presence are still
 // checked per flow.
 func CompareTraces(reference, actual []TraceEvent) []Difference {
+	return CompareTracesOpts(reference, actual, TraceCompareOptions{})
+}
+
+// CompareTracesOpts is CompareTraces with tuning options (see
+// TraceCompareOptions).
+func CompareTracesOpts(reference, actual []TraceEvent, opts TraceCompareOptions) []Difference {
 	refOrder, refGroups := groupTrace(reference)
 	actOrder, actGroups := groupTrace(actual)
 
@@ -155,7 +214,7 @@ func CompareTraces(reference, actual []TraceEvent) []Difference {
 			})
 			continue
 		}
-		compareTraceGroup(flowID, refGroups[flowID], actEvents, &diffs)
+		compareTraceGroup(flowID, refGroups[flowID], actEvents, &diffs, opts)
 	}
 	for _, flowID := range actOrder {
 		if _, found := refGroups[flowID]; !found {
@@ -169,7 +228,7 @@ func CompareTraces(reference, actual []TraceEvent) []Difference {
 	return diffs
 }
 
-func compareTraceGroup(flowID string, ref, act []TraceEvent, diffs *[]Difference) {
+func compareTraceGroup(flowID string, ref, act []TraceEvent, diffs *[]Difference, opts TraceCompareOptions) {
 	if len(ref) != len(act) {
 		*diffs = append(*diffs, Difference{
 			Path: fmt.Sprintf("trace[%q]", flowID), Kind: DiffTraceLength,
@@ -200,6 +259,14 @@ func compareTraceGroup(flowID string, ref, act []TraceEvent, diffs *[]Difference
 				Path: path + ".error", Kind: DiffNodeError,
 				Reference: ref[i].Error, Actual: act[i].Error,
 				Detail: "error presence differs",
+			})
+		}
+		if !opts.IgnoreAttempts && ref[i].Attempts != act[i].Attempts {
+			*diffs = append(*diffs, Difference{
+				Path: path + ".attempts", Kind: DiffAttempts,
+				Reference: ref[i].Attempts, Actual: act[i].Attempts,
+				Detail: fmt.Sprintf("node attempt count %d vs %d (retry attribution)",
+					ref[i].Attempts, act[i].Attempts),
 			})
 		}
 		compareValue(path+".result", ref[i].Result, act[i].Result, diffs)

@@ -69,19 +69,34 @@ func ensureBridgeFile() (string, error) {
 }
 
 type pythonRequest struct {
-	Flow  json.RawMessage `json:"flow"`
-	Input any             `json:"input"`
+	Flow          json.RawMessage `json:"flow"`
+	Input         any             `json:"input"`
+	Driver        string          `json:"driver,omitempty"`
+	DriverOptions map[string]any  `json:"driverOptions,omitempty"`
 }
 
 // Run executes one flow in the Python engine and returns its outcome.
 func (r *PythonRunner) Run(ctx context.Context, flowJSON []byte, input any) *Outcome {
+	return r.RunDrive(ctx, flowJSON, input, "", nil)
+}
+
+// RunDrive executes one flow with the given driver ("" / "fresh" = single
+// execute; see pybridge.py for the resume drivers).
+func (r *PythonRunner) RunDrive(ctx context.Context, flowJSON []byte, input any,
+	driver string, driverOptions map[string]any,
+) *Outcome {
 	out := &Outcome{Engine: "python"}
 	bridgePath, err := ensureBridgeFile()
 	if err != nil {
 		return failedPython(out, fmt.Errorf("prepare python bridge: %w", err))
 	}
 
-	payload, err := json.Marshal(pythonRequest{Flow: flowJSON, Input: input})
+	payload, err := json.Marshal(pythonRequest{
+		Flow:          flowJSON,
+		Input:         input,
+		Driver:        driver,
+		DriverOptions: driverOptions,
+	})
 	if err != nil {
 		return failedPython(out, fmt.Errorf("encode python request: %w", err))
 	}
