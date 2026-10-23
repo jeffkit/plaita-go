@@ -299,3 +299,73 @@ func Test_sqrt_eval(t *testing.T) {
 	_, err3 := evalMath(t, `$F.sqrt(-1)`, map[string]any{})
 	assert.ErrorContains(t, err3, "math domain error")
 }
+
+func Test_ceil_floor_float_to_int_guards(t *testing.T) {
+	// Issue #70: ceil/floor bypassed the NaN/Inf/range guard that pyToInt
+	// (trunc) already had — NaN silently became 0, ±Inf and finite
+	// beyond-int64 floats became ±MaxInt64. The guard aligns the three with
+	// CPython float→int semantics: NaN/±Inf are named errors and finite
+	// floats outside int64 are refused (Python returns an arbitrary-precision
+	// int; the engine's int64 value domain cannot — declared divergence).
+	// Bounds use ±2^63, NOT f > math.MaxInt64: float64(MaxInt64) rounds up
+	// to 2^63, so that comparison lets f == 2^63 slip through.
+	cases := []struct {
+		name    string
+		expr    string
+		input   any
+		wantErr string
+	}{
+		{name: "ceil +Inf", expr: `$F.ceil($F.mul(1e308, 10))`, wantErr: "cannot convert float infinity to integer"},
+		{name: "floor -Inf", expr: `$F.floor($F.mul(-1e308, 10))`, wantErr: "cannot convert float infinity to integer"},
+		{name: "ceil NaN (Inf-Inf)", expr: `$F.ceil($F.sub($F.mul(1e308, 10), $F.mul(1e308, 10)))`, wantErr: "cannot convert float NaN to integer"},
+		{name: "floor NaN (Inf-Inf)", expr: `$F.floor($F.sub($F.mul(1e308, 10), $F.mul(1e308, 10)))`, wantErr: "cannot convert float NaN to integer"},
+		{name: "ceil finite beyond int64", expr: `$F.ceil(1e308)`, wantErr: "cannot convert float to integer"},
+		{name: "ceil data-driven 1e308", expr: `$F.ceil($INPUT.x)`, input: map[string]any{"x": 1e308}, wantErr: "cannot convert float to integer"},
+		{name: "ceil data-driven 1e308*10 = +Inf", expr: `$F.ceil($F.mul($INPUT.x, 10))`, input: map[string]any{"x": 1e308}, wantErr: "cannot convert float infinity to integer"},
+		{name: "ceil 2^63 upper bound", expr: `$F.ceil(9223372036854775808.0)`, wantErr: "cannot convert float to integer"},
+		{name: "floor below -2^63", expr: `$F.floor(-9223372036854777856.0)`, wantErr: "cannot convert float to integer"},
+		// pyToInt now shares the guard: trunc's 2^63 hole (silent MaxInt64)
+		// closes — an intentional tightening, pinned here.
+		{name: "trunc 2^63 tightened", expr: `$F.trunc(9223372036854775808.0)`, wantErr: "cannot convert float to integer"},
+		{name: "trunc +Inf keeps erroring", expr: `$F.trunc($F.mul(1e308, 10))`, wantErr: "cannot convert float infinity to integer"},
+		{name: "trunc NaN keeps erroring", expr: `$F.trunc($F.sub($F.mul(1e308, 10), $F.mul(1e308, 10)))`, wantErr: "cannot convert float NaN to integer"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := evalMath(t, c.expr, c.input)
+			require.Error(t, err)
+			assert.ErrorContains(t, err, c.wantErr)
+		})
+	}
+}
+
+func Test_ceil_floor_boundaries_keep_working(t *testing.T) {
+	// Exact MinInt64 is representable — the guard must not over-reject it.
+	for _, fn := range []string{"ceil", "floor"} {
+		got, err := evalMath(t, "$F."+fn+"(-9223372036854775808.0)", map[string]any{})
+		require.NoError(t, err, fn)
+		assert.Equal(t, model.NewValue(int64(-9223372036854775808)), got, fn)
+	}
+	// Normal values unchanged (pre-fix behaviour, Python math.ceil/floor).
+	cases := []struct {
+		name string
+		expr string
+		want any
+	}{
+		{name: "ceil(2.3)", expr: `$F.ceil(2.3)`, want: int64(3)},
+		{name: "floor(-2.3)", expr: `$F.floor(-2.3)`, want: int64(-3)},
+		{name: "ceil(2) stays int", expr: `$F.ceil(2)`, want: int64(2)},
+		{name: "floor(2) stays int", expr: `$F.floor(2)`, want: int64(2)},
+		{name: "ceil(10.2)", expr: `$F.ceil(10.2)`, want: int64(11)},
+		{name: "floor(10.2)", expr: `$F.floor(10.2)`, want: int64(10)},
+		{name: "ceil(7.2) via input", expr: `$F.ceil($INPUT.a)`, want: int64(8)},
+		{name: "floor(7.2) via input", expr: `$F.floor($INPUT.a)`, want: int64(7)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := evalMath(t, c.expr, map[string]any{"a": 7.2})
+			require.NoError(t, err)
+			assert.Equal(t, model.NewValue(c.want), got)
+		})
+	}
+}
