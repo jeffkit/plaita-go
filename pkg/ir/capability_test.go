@@ -264,3 +264,61 @@ func TestLoadRejectsMalformedCollectionNodes(t *testing.T) {
 		})
 	}
 }
+
+// ---- 执行台阶对拍（2026-10-25 两级终版，plaita fb36f085 配套） ----
+
+// TestExecutionTierParityWithPythonLedger：Go 侧两级分类与 Python 账本锚逐项
+// 相等。锚取自 plaita/docs/governance/architecture.yaml gov.capability_matrix
+// （值=两值台阶字符串；导出/对账 scripts/export_capability_matrix.py --json，
+// nightly 由 ci-slow 对账）。Go=frozen：本测试是只读对拍，不改引擎行为——
+// Python 侧改声明 → 改本测试的锚并跑 ledger --check，两侧同 PR。
+func TestExecutionTierParityWithPythonLedger(t *testing.T) {
+	// Python 账本 managed 面（2026-10-25 实况）：七个挂起节点。
+	managed := map[string]bool{
+		"event": true, "hitl_await": true,
+		"delay": true, "approval": true, "http_callback": true,
+		"redis_queue": true, "kafka_queue": true,
+	}
+	// Python 账本 inline 锚（控制流/计算/出网代表）。
+	inline := map[string]bool{
+		"start": true, "end": true, "assignment": true, "case": true,
+		"calculate": true, "http": true, "parallel": true,
+		"loop": true, "child": true, "code": true,
+	}
+	for nodeType := range managed {
+		assert.Equal(t, ExecutionTierManaged, ExecutionTier(nodeType),
+			"node %q should be managed per python ledger", nodeType)
+	}
+	for nodeType := range inline {
+		// code 在 Go 侧是拒载（knownUnsupported），工厂缺席 → inline（未知
+		// 类型同 inline 的口径）；其余必须是真 inline。
+		assert.Equal(t, ExecutionTierInline, ExecutionTier(nodeType),
+			"node %q should be inline per python ledger", nodeType)
+	}
+}
+
+// TestWakeServiceNodeTypesMatchNodeDependencies：唤醒源集合单源 =
+// nodeDependencies keys——与 Python WAKE_SERVICE_NODE_TYPES / 节点 wake_service
+// 字段互为对拍锚（五族：delay/approval/http_callback/redis_queue/kafka_queue）。
+func TestWakeServiceNodeTypesMatchNodeDependencies(t *testing.T) {
+	wake := WakeServiceNodeTypes()
+	deps := NodeDependencies()
+	require.Len(t, wake, len(deps))
+	expected := []string{"approval", "delay", "http_callback", "kafka_queue", "redis_queue"}
+	assert.Equal(t, expected, wake)
+	for _, k := range expected {
+		assert.Contains(t, deps, k)
+		// 唤醒源节点必是 managed（台阶与接线自洽）
+		assert.Equal(t, ExecutionTierManaged, ExecutionTier(k))
+	}
+}
+
+// TestExecutionTierCoversAllSupportedTypes：supported 白名单每个类型都能归入
+// 恰好一级（词汇全覆盖，无第三态）。
+func TestExecutionTierCoversAllSupportedTypes(t *testing.T) {
+	for _, nodeType := range SupportedNodeTypes() {
+		tier := ExecutionTier(nodeType)
+		assert.True(t, tier == ExecutionTierInline || tier == ExecutionTierManaged,
+			"node %q returned unknown tier %q", nodeType, tier)
+	}
+}

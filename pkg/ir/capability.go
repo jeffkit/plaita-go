@@ -1,8 +1,24 @@
 package ir
 
-import "sort"
+import (
+	"context"
+	"sort"
+
+	"github.com/jeffkit/plaita-go/pkg/workflow"
+)
 
 // Capability contract（plaita#300 的 worker 能力清单数据源，#80 phase 1 ③）。
+//
+// 执行台阶对齐（2026-10-25，plaita Python 侧两级终版 fb36f085）：执行语义只有
+// 两级——inline（直跑，任何宿主）/ managed（托管，会挂起经事件总线恢复）。
+// 「挂起后靠哪个唤醒源」是接线元数据（Python 节点 wake_service 字段）不进
+// 模式词汇——Go 侧对应面即 :data:nodeDependencies（五族队列唤醒服务的部署期
+// 依赖标注），:func:WakeServiceNodeTypes 与 Python 的 WAKE_SERVICE_NODE_TYPES
+// 互为对拍锚（账本 plaita/docs/governance/architecture.yaml
+// gov.capability_matrix，值=两值台阶字符串；导出/对账
+// scripts/export_capability_matrix.py）。Go=frozen（ADR-001）：本包只提供
+// 只读分类函数（:func:ExecutionTier），不引入 Python 侧的入口闸机制——
+// Go worker 的挂起受理面维持现状。
 //
 // plaita#300 固定的 manifest JSON 结构：
 //
@@ -79,6 +95,49 @@ func NodeDependencies() map[string]string {
 	for k, v := range nodeDependencies {
 		out[k] = v
 	}
+	return out
+}
+
+// 执行台阶两级词汇（与 Python plaita.core.capabilities.EXECUTION_TIERS 同名
+// 同序；frozen 侧只读消费，不设闸）。
+const (
+	ExecutionTierInline  = "inline"
+	ExecutionTierManaged = "managed"
+)
+
+// ExecutionTier returns the execution tier of a node type（两级模型只读分类）：
+// 该类型的注册节点实现 workflow.Suspender（IsSuspending）⇒ "managed"，否则
+// "inline"（未知类型同 inline——Python 侧由注册闸/受理闸把关，Go 侧本函数
+// 只作 manifest/对拍用途，不做拒绝）。单一事实源 = 节点工厂的 IsSuspending
+// 实现，与 Python 侧「execution_tier ≠ inline ⇒ is_suspending 派生」同一
+// 语义方向（实现声明事实，词汇只读）。
+func ExecutionTier(nodeType string) string {
+	factory := workflow.GetNodeFactory(workflow.NodeType(nodeType))
+	if factory == nil {
+		return ExecutionTierInline
+	}
+	node := factory(context.Background())
+	if s, ok := node.(interface{ IsSuspending() bool }); ok && s.IsSuspending() {
+		return ExecutionTierManaged
+	}
+	return ExecutionTierInline
+}
+
+// WakeServiceNodeTypes returns the node types whose wakeup depends on a
+// dedicated companion service（= nodeDependencies keys，排序副本）——与
+// Python core WAKE_SERVICE_NODE_TYPES / 节点 wake_service 字段互为对拍锚。
+// 恢复链语义见 nodeDependencies 逐条注释。
+func WakeServiceNodeTypes() []string {
+	return NodeDependenciesKeys()
+}
+
+// NodeDependenciesKeys returns the sorted keys of nodeDependencies.
+func NodeDependenciesKeys() []string {
+	out := make([]string, 0, len(nodeDependencies))
+	for k := range nodeDependencies {
+		out = append(out, k)
+	}
+	sort.Strings(out)
 	return out
 }
 
