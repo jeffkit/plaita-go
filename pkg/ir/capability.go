@@ -16,9 +16,12 @@ import (
 // 依赖标注），:func:WakeServiceNodeTypes 与 Python 的 WAKE_SERVICE_NODE_TYPES
 // 互为对拍锚（账本 plaita/docs/governance/architecture.yaml
 // gov.capability_matrix，值=两值台阶字符串；导出/对账
-// scripts/export_capability_matrix.py）。Go=frozen（ADR-001）：本包只提供
-// 只读分类函数（:func:ExecutionTier），不引入 Python 侧的入口闸机制——
-// Go worker 的挂起受理面维持现状。
+// scripts/export_capability_matrix.py）。2026-10-27 起 Go 恢复生产可选
+// runtime（ADR-002 修订）：runtime=go 流程经 #300 能力门按本 manifest 把关
+// 节点覆盖面（accept-list 之外发布即 422），派发经 plaita:flow:queue:go；
+// 本包分类函数（:func:ExecutionTier / :func:WakeServiceNodeTypes）即为生产
+// manifest 与 Python 账本的对拍锚。入口闸机制仍在 Python console 侧
+// （点名/台阶闸），Go worker 的挂起受理面维持现状。
 //
 // plaita#300 固定的 manifest JSON 结构：
 //
