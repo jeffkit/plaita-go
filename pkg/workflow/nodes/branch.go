@@ -602,7 +602,7 @@ func (c *Condition) MatchContext(ctx context.Context) (bool, *MatchInfo, error) 
 	case conditionTypeExpression:
 		return matchExpression(ctx, c.ConditionExpression)
 	default:
-		return false, nil, fmt.Errorf("unsupported condition type: %q", c.ConditionType)
+		return false, nil, fmt.Errorf("unsupported condition type: %v", c.ConditionType)
 	}
 }
 
