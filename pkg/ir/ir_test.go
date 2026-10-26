@@ -209,7 +209,11 @@ func TestLoadRejects(t *testing.T) {
 			// by the plaita-rs diffcheck load/branches-str case.
 			name: "switch branches mistyped string",
 			doc:  `{"flow_id":"probe","nodes":[{"id":"s","type":"start","next":"sw"},{"id":"sw","type":"switch","next":"e","branches":"oops"},{"id":"e","type":"end"}]}`,
-			want: "cannot unmarshal string into Go struct field Workflow.nodes.branches",
+			// encoding/json 的字段路径文案随工具链变（Workflow.nodes.branches
+			// 或内层 Switch.branches 形态都实测出现过，#87）——断言锚在两种
+			// 形态的公共子串上，拒载语义（require.Error + unmarshal string）
+			// 不变。
+			want: "branches of type []*nodes.Branch",
 		},
 		{
 			// A1 r132 card G-3: a non-string next slips past unmarshal but
