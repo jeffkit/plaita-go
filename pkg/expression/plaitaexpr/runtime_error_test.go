@@ -49,7 +49,9 @@ func TestIntegerDivModZeroNamedError(t *testing.T) {
 			if !errors.Is(err, ErrExpressionRuntime) {
 				t.Fatalf("Eval(%q) error = %v, want errors.Is(err, ErrExpressionRuntime)", tc.expr, err)
 			}
-			if !strings.Contains(err.Error(), "integer divide by zero") {
+			// goval ≥1.6 wording: "math error: cannot divide by zero" (was the
+			// runtime panic text "integer divide by zero") — both contain this.
+			if !strings.Contains(err.Error(), "divide by zero") {
 				t.Fatalf("Eval(%q) error = %q, want the original runtime text preserved", tc.expr, err.Error())
 			}
 		})

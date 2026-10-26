@@ -132,7 +132,23 @@ func evalGoval(statement string, execArgs map[string]any) (result any, err error
 		}
 		panic(r)
 	}()
-	return goval.NewEvaluator().Evaluate(statement, execArgs, AllFunctions())
+	result, err = goval.NewEvaluator().Evaluate(statement, execArgs, AllFunctions())
+	if err != nil && isGovalArithmeticError(err) {
+		// goval ≥1.6 turns integer divide/modulo by zero into a plain
+		// returned error — its parser utils panic(errors.New("math error: …"))
+		// which its own recover converts to a return, no longer re-panicking
+		// runtime.Error through the defer above. Same untrusted-input runtime
+		// failure as #56: classify it identically or it escapes the
+		// named-error contract and the engine's deterministic bridge.
+		err = &RuntimeError{Err: err}
+	}
+	return result, err
+}
+
+// isGovalArithmeticError anchors on goval's own "math error: " prefix —
+// bare errors.New with no exported sentinel (parserUtils.go:209/228 in 1.6).
+func isGovalArithmeticError(err error) bool {
+	return strings.HasPrefix(err.Error(), "math error: ")
 }
 
 // mutatorFuncs are the $F functions Python's expression.py registers with

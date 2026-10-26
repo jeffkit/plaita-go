@@ -488,6 +488,10 @@ func TestListExecutionsOutOfBoundsPageShortCircuits(t *testing.T) {
 	// response shape (executions=[], total=ZCARD, truncated=false). Pre-fix
 	// red signature: 3002 redis commands (1 ZCARD + 1 ZREVRANGE + 3000
 	// GETs) for an empty page.
+	// Warm the connection pool: go-redis ≥9.23 issues its per-connection
+	// CLIENT SETINFO handshakes on the first request, which would otherwise
+	// land in the command count below (observed +2 on the first query only).
+	h.getJSON(t, "/executions?page=1&size=1", nil)
 	for _, q := range []string{"?page=16&size=200", "?page=9999&size=200"} {
 		before := h.mr.CommandCount()
 		code, body := h.getJSON(t, "/executions"+q, nil)

@@ -40,7 +40,9 @@ func TestExpressionDivZeroLandsNamedErrorTerminal(t *testing.T) {
 		t.Fatalf("status = %s error = %v, want a named error terminal (#56: the panic must "+
 			"never escape the engine and kill the worker)", state.Status, state.Error)
 	}
-	if msg, _ := state.Error["message"].(string); !strings.Contains(msg, "integer divide by zero") {
+	// goval ≥1.6 wording: "math error: cannot divide by zero" (was the runtime
+	// panic text "integer divide by zero") — both contain this.
+	if msg, _ := state.Error["message"].(string); !strings.Contains(msg, "divide by zero") {
 		t.Fatalf("terminal message %q, want the original runtime text preserved", msg)
 	}
 	if state.Error["error_type"] != "RuntimeError" {
