@@ -29,13 +29,16 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Source delay is the first implemented wake source (the sleeping-death
-// core). approval/http_callback/redis_queue follow the same skeleton; see
-// pkg/wake README in AGENTS.md for the family roadmap.
-const SourceDelay = "delay"
+// Wake source identities (registry key segments = {prefix}:{source}:queue
+// subtypes the worker dispatches to).
+const (
+	SourceDelay      = "delay"
+	SourceApproval   = "approval"
+	SourceRedisQueue = "redis_queue"
+)
 
 // Sources returns the implemented wake sources.
-func Sources() []string { return []string{SourceDelay} }
+func Sources() []string { return []string{SourceDelay, SourceApproval, SourceRedisQueue} }
 
 // Service is one wake source's runtime face.
 type Service interface {
@@ -54,6 +57,10 @@ func NewService(source string, cfg *Config, rdb *redis.Client) (Service, error) 
 	switch source {
 	case SourceDelay:
 		return NewDelayService(cfg, rdb)
+	case SourceApproval:
+		return NewApprovalSource(cfg, rdb)
+	case SourceRedisQueue:
+		return NewRedisQueueSource(cfg, rdb)
 	default:
 		return nil, fmt.Errorf("unknown wake source %q (implemented: %s)", source, strings.Join(Sources(), ","))
 	}

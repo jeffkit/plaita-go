@@ -43,9 +43,20 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
                     双写（SETEX event:events + ZADD event:types + PUBLISH {ns}:events:{type}，
                     与 Python 服务/Go worker 字节兼容，混编舰队共用一份 Redis）；注册键
                     `{prefix}:registry:delay:{instance}`（TTL 30s/心跳 10s/stopped 墓碑 5s）
-                    = 集群档受理点名判据数据源。**已实现 delay**；approval/http_callback/
-                    redis_queue 同骨架待续（approval intake/trigger 两段式是接口硬约束）
-  cmd/plaita-wake/  wake 进程入口（`-sources delay`；env 与 worker 同族：PLAITA_KEY_PREFIX/
+                    = 集群档受理点名判据数据源。**已实现 delay / approval / redis_queue**
+                    （2026-10-28，共享 listSource 消费骨架=Python WakeConsumeMixin 同构：
+                    LRANGE 批读/确认才 LREM/触发失败与停机留排程/坏条目丢弃；
+                    approval=记录 `{prefix}:approval:pending:{id}` 7d TTL + SET NX 决策锁
+                    〔compare-and-del 释放〕+ any/all/majority 三策略 + 终局删记录，
+                    决策入口=导出 API SubmitApprovalDecision，记录形状与 Python 字节
+                    兼容〔混编下 Python console 决策可直写〕；redis_queue=任务派发桥
+                    + 用户 Redis 三类监听〔list BLPOP/stream XREAD $/pubsub〕，
+                    task_complete 键 + 处理后空闲窗〔缺省 10s〕收尾，Python 的
+                    订阅存储提前收尾检查未实现〔无 correlation 索引，行为等价仅慢〕；
+                    发布失败决策不持久化——持久化会把重试挡在「已经审批过」上，
+                    Python 语义逐字）。**余量：http_callback（需 HTTP ingress 设计）、
+                    kafka_queue（需 broker 客户端）**
+  cmd/plaita-wake/  wake 进程入口（`-sources delay,approval,redis_queue`；env 与 worker 同族：PLAITA_KEY_PREFIX/
                     PLAITA_REDIS_URL/PLAITA_DELAY_QUEUE〔空值具名拒，B2R31-03〕；D3 停机：
                     首信号优雅停〔在途触发落地或留排程〕，二信号立即退）
   pkg/llm/          LLM provider 链（OpenAI/Anthropic 兼容）
