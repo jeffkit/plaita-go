@@ -35,6 +35,19 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
                     01-16、错误分类×重试归属 17-22、结果形状 23-26、挂起恢复 27-28；driver 三态 fresh/event-resume/
                     continue-after-error；声明分叉 load-refusal:go、replay-from-start:go；http 用例 hermetic 测试期守卫）
   cmd/shadow-compare/  对账 CLI（样本集或 -flow 单流程），一致率报告 docs/SHADOW_REPORT.md
+  pkg/wake/         wake 值班室（2026-10-28 起）：挂起族配套服务的 Go 原生消费者——语义权威
+                    Python DelayService（list→ZSET 两段式搬运〔先 ZADD 后 LREM，member 幂等〕/
+                    到期轮询/触发确认才出队 at-least-once/发布失败留排程 + attempts hash
+                    指数退避〔1s·2^(n-1) cap 30s〕超限转 `{queue}:dead` 死信〔rpush 先于 zrem
+                    宁重不丢〕+ service_error 广播）；resume 事件复用 worker.EventPublisher
+                    双写（SETEX event:events + ZADD event:types + PUBLISH {ns}:events:{type}，
+                    与 Python 服务/Go worker 字节兼容，混编舰队共用一份 Redis）；注册键
+                    `{prefix}:registry:delay:{instance}`（TTL 30s/心跳 10s/stopped 墓碑 5s）
+                    = 集群档受理点名判据数据源。**已实现 delay**；approval/http_callback/
+                    redis_queue 同骨架待续（approval intake/trigger 两段式是接口硬约束）
+  cmd/plaita-wake/  wake 进程入口（`-sources delay`；env 与 worker 同族：PLAITA_KEY_PREFIX/
+                    PLAITA_REDIS_URL/PLAITA_DELAY_QUEUE〔空值具名拒，B2R31-03〕；D3 停机：
+                    首信号优雅停〔在途触发落地或留排程〕，二信号立即退）
   pkg/llm/          LLM provider 链（OpenAI/Anthropic 兼容）
   docs/WORKER_PROTOCOL.md  worker 协议权威文档（田野调查 + §9.4 M6 键名/语义，实现与影子对账的验收基准）
 规划中：
@@ -171,7 +184,7 @@ plaita 侧权威语义：`plaita/core/deadline.py` + `core/strategies.py`（#267
 - **节点语义要点**：delay 时长 = 数值+单位枚举换算 ms（`$` 表达式解析失败/非数值**静默回退 60 秒**；非 $ 数值串 float 解析，Python ValueError 文案逐字对拍）；approval 审批人列表逐元素 `$` 解析、list 结果摊平；kafka bootstrap_servers 串按逗号切分+trim（list/None 原样透传）；http_callback 的 callback_path/auth_token 按 Python 真值判伪（nil/**空串**都走自动生成——自动路径 `/callback/{flow_id}/{node_id}/{execution_id}`、凭据 uuid hex）、full_url 硬编码 `http://localhost:8080` 前缀照搬、Q5 统一失败响应属 service 层（Go 侧无 callback service，`httpcb_wrong_token` 用例钉「凭据错→无事件→保持挂起」的节点面）。
 - **worker 首派（§5.2 写侧补齐）**：persistSuspended 把挂起节点 service_config 写成 `dispatch_pending` 凭据（与 suspended 行同次落盘，#233）→ RPUSH `{prefix}:{subtype}:queue`（体 = service_config+execution_id+tenant_id，空租户归一 default）→ 成功清凭据（再落一次盘）；RPUSH 失败不 ack——凭据在，补派路径（start 幂等门 / suspended+continue 短路，二期既有）负责重派；派发 at-least-once（清凭据落盘失败→下一条载体重派→队列可重复），同 Python 消费端幂等假设。event/hitl_await 无 service_config 不派发。负控先红后绿（stash 写侧实测：队列空 redis:nil 红 → post 绿）。
 - **capability contract（#300 形状演进）**：supported += 五类（白名单自动生成不变）；manifest 增第六键 `node_dependencies`（部署依赖标注：五节点的恢复都依赖外部 service 消费队列+发布事件，无消费者则停留 suspended——订阅超时兜底除外；additive 键，只读 #300 五键的 consumer 不受影响）；ContractVersion bump **"2026-10-22.3"**。
-- **已知残差（记录不修）**：①delay/approval/redis_queue/kafka_queue/http_callback 的 **service 层 Go 实装不存在**（队列消费者/延迟排程/审批记录/回调 ingress 都是部署侧设施——Python plaita worker 或控制面承担；capability node_dependencies 如实标注）；②`$NODE.<id>.event_data` 里 service 发布的易变时间戳在 golden 规范化层剔键（两侧同款 denylist+32hex/13位ms 打码）；③Python plain-run 分布式 resume 不续跑后继图（worker 下一跳载体驱动），Go 一步到位——runtime 编排差异，节点状态面无分歧。
+- **已知残差**：①delay/approval/redis_queue/kafka_queue/http_callback 的 service 层——**delay 已由 `pkg/wake` 补齐（2026-10-28，见结构树）**，approval/redis_queue/kafka_queue/http_callback 仍无 Go 消费者（审批记录/回调 ingress/队列桥是部署侧设施——纯 Go 部署用 plaita-wake，混编可用 Python 服务进程；capability node_dependencies 如实标注）；②`$NODE.<id>.event_data` 里 service 发布的易变时间戳在 golden 规范化层剔键（两侧同款 denylist+32hex/13位ms 打码）；③Python plain-run 分布式 resume 不续跑后继图（worker 下一跳载体驱动），Go 一步到位——runtime 编排差异，节点状态面无分歧。
 
 ## flow 定义指纹对齐（#60，2026-10-22，r81，分支 fix/hash-alignment）
 
