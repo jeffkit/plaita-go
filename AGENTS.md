@@ -25,6 +25,12 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
                     orphan watch/resume 载体语义(A47-F2)/dispatch_ledger/DLQ replay+守卫恢复/drain 三态/节点级重试预算 +
                     checkpointstore.go（`{ns}:execution:checkpoint:{id}`）/eventbus.go（订阅/事件桥/超时检查器）
   cmd/plaita-worker/  worker 入口（env 配置，影子键前缀可覆写；-dlq-replay 单向回灌）
+  cmd/plaita/         inline 直跑入口（run/validate；**inline 台阶闸** stage=entry——挂起族具名拒
+                      `error_type=suspend_not_executable` + 逐节点点名〔nodes.FlowSuspendingNodes，
+                      含 child/reference/collection/parallel 嵌套〕；内联执行预算
+                      `PLAITA_EXECUTION_DEADLINE_SECONDS` 缺省 1800s〔与 worker 同 env 同缺省〕、
+                      到期 `execution_deadline_exceeded` 具名终态。与 Python Flow.run /
+                      RS plaita-cli 同轴（2026-10-28）；托管面仍在 plaita-worker，本入口不触 Redis）
   pkg/shadow/       M2/#317 双跑对账 harness（Python sidecar / Go 节点轨迹+值+尝试数比对 / 28 例四维度：纯计算
                     01-16、错误分类×重试归属 17-22、结果形状 23-26、挂起恢复 27-28；driver 三态 fresh/event-resume/
                     continue-after-error；声明分叉 load-refusal:go、replay-from-start:go；http 用例 hermetic 测试期守卫）
@@ -32,9 +38,11 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
   pkg/llm/          LLM provider 链（OpenAI/Anthropic 兼容）
   docs/WORKER_PROTOCOL.md  worker 协议权威文档（田野调查 + §9.4 M6 键名/语义，实现与影子对账的验收基准）
 规划中：
-  worker 三期      task age gate/租户配额/dedup/每步 checkpoint（M6 v1.5 只做挂起边界 checkpoint）
-  server/       console BFF 契约只读子集（execution 查询/事件流）
+  worker 三期      ~~task age gate/租户配额/dedup~~ 已落地（phase3_*：agegate.go/quota.go +
+                    metrics.go 具名指标接口）；余：每步 checkpoint（M6 v1.5 只做挂起边界 checkpoint）
   沙箱           Docker driver 优先 + AGS HTTP API（lease 与 worker 租约同族设计）
+已落位更正（2026-10-28）：console BFF 只读子集在 `pkg/server/`（execution 三条只读路由，
+形状对齐 plaita-console，非「规划中」）。
 ```
 
 ## IR 契约层（pkg/ir，已落地 2026-10-19）
