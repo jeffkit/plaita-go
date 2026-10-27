@@ -54,8 +54,17 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
                     task_complete 键 + 处理后空闲窗〔缺省 10s〕收尾，Python 的
                     订阅存储提前收尾检查未实现〔无 correlation 索引，行为等价仅慢〕；
                     发布失败决策不持久化——持久化会把重试挡在「已经审批过」上，
-                    Python 语义逐字）。**余量：http_callback（需 HTTP ingress 设计）、
-                    kafka_queue（需 broker 客户端）**
+                    Python 语义逐字）。http_callback=注册记录 + **内置 HTTP ingress**
+                    （PLAITA_HTTP_CALLBACK_ADDR 缺省 :8080=节点 full_url 指向；
+                    Python 侧 handle_callback_request 只是进程内 API、服务端无路由
+                    ——纯 Go 部署的前门由 plaita-wake 提供）：POST 注册路径 →
+                    只读记录 → 凭据校验（token/bearer、basic、HMAC-SHA256 签名
+                    〔payload=`{unix秒}.{CanonicalJSON}`，复用 worker 规范编码器；
+                    X-Plaita-* 头；容差 300s〕先于认领 #113）→ Lua 两阶段认领
+                    （GET+SET NX PX 30s；发布成功删记录+占位〔先记录后备位，
+                    崩溃不双 resume〕/失败只释占位可重试 #188）→ http_callback
+                    resume 事件；Q5 统一失败响应「回调路径未注册」防 path 存在性
+                    oracle（细节只进日志）。**余量：kafka_queue（需 broker 客户端）**
   cmd/plaita-wake/  wake 进程入口（`-sources delay,approval,redis_queue`；env 与 worker 同族：PLAITA_KEY_PREFIX/
                     PLAITA_REDIS_URL/PLAITA_DELAY_QUEUE〔空值具名拒，B2R31-03〕；D3 停机：
                     首信号优雅停〔在途触发落地或留排程〕，二信号立即退）

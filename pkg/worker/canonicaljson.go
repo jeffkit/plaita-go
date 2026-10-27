@@ -39,6 +39,20 @@ import (
 // str but its hash chain refuses the definition at .encode("utf-8") —
 // decoding them here would fold both sides to U+FFFD and happily hash a
 // definition the Python pool can never hash (A1 r132 card G-1).
+// CanonicalJSON renders v with the CPython json.dumps(sort_keys=True,
+// separators=(",", ":"), ensure_ascii=False) rules — the shared canonical
+// text form across runtimes. Consumers: the flow-definition fingerprint
+// (canonicalFlowDefinitionJSON wraps the strict raw-bytes variant) and the
+// http_callback HMAC signature payload (pkg/wake), which must recompute
+// byte-identical text from an already-parsed body.
+func CanonicalJSON(v any) ([]byte, error) {
+	var b []byte
+	if err := appendCanonical(&b, v); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
 func canonicalFlowDefinitionJSON(raw []byte) ([]byte, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()

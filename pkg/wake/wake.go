@@ -34,11 +34,14 @@ import (
 const (
 	SourceDelay      = "delay"
 	SourceApproval   = "approval"
-	SourceRedisQueue = "redis_queue"
+	SourceRedisQueue   = "redis_queue"
+	SourceHTTPCallback = "http_callback"
 )
 
 // Sources returns the implemented wake sources.
-func Sources() []string { return []string{SourceDelay, SourceApproval, SourceRedisQueue} }
+func Sources() []string {
+	return []string{SourceDelay, SourceApproval, SourceRedisQueue, SourceHTTPCallback}
+}
 
 // Service is one wake source's runtime face.
 type Service interface {
@@ -61,6 +64,8 @@ func NewService(source string, cfg *Config, rdb *redis.Client) (Service, error) 
 		return NewApprovalSource(cfg, rdb)
 	case SourceRedisQueue:
 		return NewRedisQueueSource(cfg, rdb)
+	case SourceHTTPCallback:
+		return NewHttpCallbackSource(cfg, rdb)
 	default:
 		return nil, fmt.Errorf("unknown wake source %q (implemented: %s)", source, strings.Join(Sources(), ","))
 	}
