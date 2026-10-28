@@ -187,6 +187,15 @@ func TestDueTaskPublishesResumeEvent(t *testing.T) {
 		t.Fatalf("timestamps missing: %+v", ev.Data)
 	}
 	// Confirmed publish ⇒ dequeued; double-write storage present.
+	// 生产方顺序是 publish 确认后才 ZREM（delay.go publishFn→ZRem）——订阅方
+	// 收到事件 ≠ ZREM 已落，即刻断言在慢 CI 上跟生产 goroutine 赛跑，改有界等待。
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if zcard(t, client, svc.scheduledKey) == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	if got := zcard(t, client, svc.scheduledKey); got != 0 {
 		t.Fatalf("confirmed trigger must ZREM: scheduled=%d", got)
 	}
