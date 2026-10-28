@@ -244,7 +244,7 @@ func (s *HttpCallbackSource) HandleCallbackRequest(ctx context.Context, path str
 		EventID:       uuid.NewString(),
 		EventType:     str(taskCfg["event_type"]),
 		Data:          eventData,
-		Timestamp:     float64(now),
+		Timestamp:     float64(now) / 1000.0, // epoch seconds (Python Event.timestamp convention)
 		CorrelationID: executionID,
 		TenantID:      tenant,
 	}

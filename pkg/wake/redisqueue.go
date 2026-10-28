@@ -373,7 +373,7 @@ func (s *RedisQueueSource) buildMessageEvent(task map[string]any, data map[strin
 		EventID:       uuid.NewString(),
 		EventType:     str(task["event_type"]),
 		Data:          data,
-		Timestamp:     float64(now),
+		Timestamp:     float64(now) / 1000.0, // epoch seconds (Python Event.timestamp convention)
 		CorrelationID: executionID,
 		TenantID:      tenant,
 	}

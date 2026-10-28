@@ -241,7 +241,7 @@ func (s *ApprovalSource) SubmitApprovalDecision(ctx context.Context, approvalID,
 		EventID:       uuid.NewString(),
 		EventType:     str(taskCfg["event_type"]),
 		Data:          eventData,
-		Timestamp:     float64(time.Now().UnixMilli()),
+		Timestamp:     float64(time.Now().UnixNano()) / 1e9, // epoch seconds (Python Event.timestamp convention)
 		CorrelationID: str(taskCfg["execution_id"]),
 		TenantID:      tenant,
 	}

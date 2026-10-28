@@ -327,7 +327,7 @@ func (s *DelayService) buildResumeEvent(task map[string]any, nowMs int64) *worke
 		EventID:       uuid.NewString(),
 		EventType:     str(task["event_type"]),
 		Data:          data,
-		Timestamp:     float64(nowMs),
+		Timestamp:     float64(nowMs) / 1000.0, // wire/storage convention: Python Event.timestamp = time.time() (epoch seconds); the type-index ZADD score shares the unit (RS reconcile scans seconds windows)
 		CorrelationID: executionID,
 		TenantID:      tenant,
 	}
@@ -394,7 +394,7 @@ func (s *DelayService) publishDeadLetterEvent(member string, attempts int) {
 			"service_type":  SourceDelay,
 			"timestamp":     time.Now().UnixMilli(),
 		},
-		Timestamp:     float64(time.Now().UnixMilli()),
+		Timestamp:     float64(time.Now().UnixNano()) / 1e9, // epoch seconds (Python Event.timestamp convention)
 		CorrelationID: str(task["execution_id"]),
 		TenantID:      tenant,
 	}
