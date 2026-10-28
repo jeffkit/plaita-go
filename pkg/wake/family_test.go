@@ -63,7 +63,8 @@ func subscribeFor(t *testing.T, client *redis.Client, channel string) chan strin
 
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	// 10s：CI 慢载（同包前后台 goroutine 累积）下 3s 窗口会被调度延迟击穿
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
@@ -260,11 +261,16 @@ func TestApprovalDecisionAllNeedsAll(t *testing.T) {
 	if res.Status != "success" || res.FinalDecision != "approve" {
 		t.Fatalf("second decision must complete: %+v", res)
 	}
-	select {
-	case <-ch:
-	default:
-		t.Fatal("completion event missing")
-	}
+	// 完成事件经 pubsub relay goroutine 转发，非阻塞 select 会和调度赛跑
+	// （CI 慢机必踩）——改有界等待；事件真缺失时照样在 3s 后失败。
+	waitFor(t, "completion event", func() bool {
+		select {
+		case <-ch:
+			return true
+		default:
+			return false
+		}
+	})
 }
 
 func TestApprovalDecisionPermissionAndDuplicate(t *testing.T) {
@@ -436,12 +442,13 @@ func TestRedisQueueStreamEndToEnd(t *testing.T) {
 	}
 	ch := subscribeFor(t, client, "plaita:events:redis_message")
 	svc.cycleOnce(ctx)
-	time.Sleep(300 * time.Millisecond) // XREAD from "$" only sees new entries
-	if _, err := client.XAdd(ctx, &redis.XAddArgs{Stream: "user:stream", Values: map[string]any{"data": `{"x":1}`}}).Result(); err != nil {
-		t.Fatal(err)
-	}
 	var payload string
+	// XREAD 从 "$" 起读、只见监听起来后的新条目：XAdd 抢在监听起来前会被静默
+	// 跳过（慢 CI 上裸 sleep 兜不住）——窗口内重投，直到事件到达。
 	waitFor(t, "stream redis_message event", func() bool {
+		if _, err := client.XAdd(ctx, &redis.XAddArgs{Stream: "user:stream", Values: map[string]any{"data": `{"x":1}`}}).Result(); err != nil {
+			t.Fatal(err)
+		}
 		select {
 		case payload = <-ch:
 			return true
@@ -481,12 +488,13 @@ func TestRedisQueuePubsubEndToEnd(t *testing.T) {
 	}
 	ch := subscribeFor(t, client, "plaita:events:redis_message")
 	svc.cycleOnce(ctx)
-	time.Sleep(200 * time.Millisecond) // let the listener subscribe
-	if err := client.Publish(ctx, "user:chan", "hello").Err(); err != nil {
-		t.Fatal(err)
-	}
 	var payload string
+	// 订阅建立前的 Publish 会静默丢失（pubsub 无留存），且监听 goroutine 到位
+	// 的耗时在慢 CI 上超过裸 sleep 能兜的范围——窗口内重发，直到事件到达。
 	waitFor(t, "pubsub redis_message event", func() bool {
+		if err := client.Publish(ctx, "user:chan", "hello").Err(); err != nil {
+			t.Fatal(err)
+		}
 		select {
 		case payload = <-ch:
 			return true
