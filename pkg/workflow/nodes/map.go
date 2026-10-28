@@ -82,7 +82,7 @@ func (m *Map) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
 			if err := checkCollectionItem(m.Collection, m.ItemType, "map", item); err != nil {
 				return nil, err
 			}
-			res, execErr := runCollectionChild(ctx, m.ChildFlow, map[string]any{"item": item, "index": index})
+			res, execErr := runCollectionChild(ctx, m.ChildFlow, map[string]any{"item": item, "index": index}, string(m.GetID()), index)
 			if execErr != nil {
 				return nil, execErr
 			}
@@ -151,7 +151,7 @@ func (m *Map) executeConcurrent(ctx context.Context, collection []any, results [
 				errs[i] = err
 				return
 			}
-			res, err := runCollectionChild(runtime.CloneContext(ctx), flow, map[string]any{"item": it, "index": i})
+			res, err := runCollectionChild(runtime.CloneContext(ctx), flow, map[string]any{"item": it, "index": i}, string(m.GetID()), i)
 			if err != nil {
 				errs[i] = err
 				return

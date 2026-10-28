@@ -181,6 +181,9 @@ func (p *Parallel) execBranchFlow(ctx context.Context, br *ParallelBranch) (any,
 	// 同形）——分支内的挂起被作用域闸在订阅注册前具名拒绝。
 	if branchRC := runtime.WorkflowRuntimeContext(branchCtx); branchRC != nil {
 		branchRC.FrameKind = runtime.FrameKindParallelBranch
+		// span 模型：分支帧 = 分支名限定（plaita#344）。
+		branchRC.FramePath = workflow.ExtendFramePath(ctx, string(p.GetID()))
+		branchRC.FrameKey = br.Name
 	}
 
 	var subWorkflowInput any

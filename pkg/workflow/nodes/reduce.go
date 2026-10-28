@@ -99,7 +99,7 @@ func (r *Reduce) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
 		if arrayInput {
 			input = []any{acc, item}
 		}
-		if acc, err = runCollectionChild(ctx, r.ChildFlow, input); err != nil {
+		if acc, err = runCollectionChild(ctx, r.ChildFlow, input, string(r.GetID()), nil); err != nil {
 			return nil, err
 		}
 	}

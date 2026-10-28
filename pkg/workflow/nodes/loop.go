@@ -206,6 +206,9 @@ func (l *Loop) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
 			ParentWorkflowContext: ctx,
 			// 嵌套挂起 v1：迭代帧标注（runCollectionChild 同款）。
 			FrameKind: runtime.FrameKindLoopIteration,
+			// span 模型：帧路径延长 + 迭代限定符（plaita#344）。
+			FramePath: workflow.ExtendFramePath(ctx, string(l.GetID())),
+			FrameKey:  index,
 		}), input)
 		if execErr != nil {
 			// 迭代帧边界（rs run_collection_child 同款）：挂起载体无条件具名

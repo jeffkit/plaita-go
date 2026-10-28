@@ -20,12 +20,15 @@ import (
 // {item, index} / {first, second} / positional array) and the calling flow as
 // $PARENT. Mirrors loop.go's child seeding; input validation is skipped the
 // same way (loop injects synthetic shapes the child's inputType doesn't name).
-func runCollectionChild(ctx context.Context, childFlow *workflow.Workflow, input any) (any, error) {
+func runCollectionChild(ctx context.Context, childFlow *workflow.Workflow, input any, frameNodeID string, frameKey any) (any, error) {
 	childCtx := runtime.WithWorkflowRuntimeContext(ctx, &runtime.Context{
 		WorkflowInput:         input,
 		ParentWorkflowContext: ctx,
 		// 嵌套挂起 v1：迭代帧标注（作用域闸的链行走依据之一）。
 		FrameKind: runtime.FrameKindLoopIteration,
+		// span 模型：帧路径延长 + 迭代限定符（plaita#344）。
+		FramePath: workflow.ExtendFramePath(ctx, frameNodeID),
+		FrameKey:  frameKey,
 	})
 	result, err := childFlow.Execute(childCtx, input)
 	if err != nil {

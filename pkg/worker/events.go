@@ -303,9 +303,17 @@ func (r *executionRun) snapshotNodeTimings() map[string]any {
 	return out
 }
 
+// spanOccurrenceCap — per-node occurrence details cap (#344 对应物: the
+// per-span明细 rides on the aggregate; past the cap new occurrences are
+// counted but not appended — observability never blocks execution).
+const spanOccurrenceCap = 200
+
 // beginNode records a node start: the first attempt writes started_at; retry
-// attempts only bump the counters. Returns the timeline event.
-func (r *executionRun) beginNode(nodeID, nodeType, name string) map[string]any {
+// attempts only bump the counters. span, when present (nil on the resume
+// leg), opens one occurrence under the aggregate and stamps the timeline
+// event with the span identity — loop rounds and concurrent frames of the
+// same node_id no longer overwrite each other's timings.
+func (r *executionRun) beginNode(nodeID, nodeType, name string, span *workflow.NodeSpan) map[string]any {
 	if r == nil {
 		return nil
 	}
@@ -334,14 +342,37 @@ func (r *executionRun) beginNode(nodeID, nodeType, name string) map[string]any {
 	if n := toInt(entry["attempts"]); n > 1 {
 		r.nodeRetries = n - 1
 	}
-	return r.recordTimelineLocked("node_start", map[string]any{
+	var occurrence map[string]any
+	if span != nil {
+		occurrence = map[string]any{
+			"span_id":    span.SpanID,
+			"started_at": now,
+			"started_ms": ms,
+			"ended_at":   "",
+			"ended_ms":   nil,
+		}
+		occs, _ := entry["occurrences"].([]map[string]any)
+		if len(occs) < spanOccurrenceCap {
+			occs = append(occs, occurrence)
+			entry["occurrences"] = occs
+		}
+	}
+	extra := map[string]any{
 		"node_id": nodeID, "node_type": nodeType, "name": name,
-	})
+	}
+	if span != nil {
+		extra["span_id"] = span.SpanID
+		extra["parent_span_id"] = span.ParentSpanID
+		extra["frame_path"] = span.ToDict()["frame_path"]
+		extra["iteration"] = span.Iteration
+	}
+	return r.recordTimelineLocked("node_start", extra)
 }
 
-// endNode records a node end (§5.1 node_timings field set). Returns the
-// timeline event.
-func (r *executionRun) endNode(nodeID, nodeType, name string, failed bool) map[string]any {
+// endNode records a node end (§5.1 node_timings field set). The span (nil on
+// the resume leg) closes its occurrence — per-round/concurrent duration
+//明细 — and stamps the timeline event.
+func (r *executionRun) endNode(nodeID, nodeType, name string, failed bool, span *workflow.NodeSpan) map[string]any {
 	if r == nil {
 		return nil
 	}
@@ -363,6 +394,21 @@ func (r *executionRun) endNode(nodeID, nodeType, name string, failed bool) map[s
 		entry["total_duration_ms"] = ms - int64(started)
 	}
 	entry["failed"] = failed
+	if span != nil {
+		occs, _ := entry["occurrences"].([]map[string]any)
+		for i := len(occs) - 1; i >= 0; i-- {
+			if occs[i]["span_id"] == span.SpanID {
+				occs[i]["ended_at"] = now
+				occs[i]["ended_ms"] = ms
+				if started, ok := toFloat(occs[i]["started_ms"]); ok {
+					occs[i]["duration_ms"] = ms - int64(started)
+				}
+				occs[i]["iteration"] = span.Iteration
+				occs[i]["frame_path"] = span.ToDict()["frame_path"]
+				break
+			}
+		}
+	}
 	if failed {
 		r.failedNode = nodeID
 	} else {
@@ -376,9 +422,16 @@ func (r *executionRun) endNode(nodeID, nodeType, name string, failed bool) map[s
 			r.failedNode = ""
 		}
 	}
-	return r.recordTimelineLocked("node_end", map[string]any{
+	extra := map[string]any{
 		"node_id": nodeID, "node_type": nodeType, "name": name, "failed": failed,
-	})
+	}
+	if span != nil {
+		extra["span_id"] = span.SpanID
+		extra["parent_span_id"] = span.ParentSpanID
+		extra["frame_path"] = span.ToDict()["frame_path"]
+		extra["iteration"] = span.Iteration
+	}
+	return r.recordTimelineLocked("node_end", extra)
 }
 
 func (r *executionRun) recordTimelineLocked(typ string, extra map[string]any) map[string]any {

@@ -114,6 +114,8 @@ func (r *Reference) referenceChildContext(ctx context.Context) context.Context {
 		// 嵌套挂起 v1：reference 帧标注。ambient 保持 Root kind（rs 同款——
 		// 链行走因此对 loop→reference 组合失明，主闸在 reference.go 的转换点）。
 		FrameKind: runtime.FrameKindReferenceCall,
+		// span 模型：帧路径延长（reference 帧无迭代限定符，plaita#344）。
+		FramePath: workflow.ExtendFramePath(ctx, string(r.GetID())),
 	}
 	return runtime.WithWorkflowRuntimeContext(ambientCtx, seed)
 }

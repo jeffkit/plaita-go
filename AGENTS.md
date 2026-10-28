@@ -68,6 +68,17 @@ engine 侧（现 pkg/，内核自前身引擎清理）：
   cmd/plaita-wake/  wake 进程入口（`-sources delay,approval,redis_queue`；env 与 worker 同族：PLAITA_KEY_PREFIX/
                     PLAITA_REDIS_URL/PLAITA_DELAY_QUEUE〔空值具名拒，B2R31-03〕；D3 停机：
                     首信号优雅停〔在途触发落地或留排程〕，二信号立即退）
+  pkg/workflow/span.go span 模型（plaita#344 对应物，2026-10-28）：NodeSpan
+                      {span_id,parent_span_id,frame_path,iteration,node_id}——节点执行
+                      实例身份，executeNode 在 retry 循环前生成盖章进 ctx（监听器经
+                      SpanFromContext 读；Go 位置签名无 kwarg，ctx 戳即 span= 的对位），
+                      一次实例一个 span 重试共享；帧态=runtime.Context 新增
+                      FramePath/FrameKey（loop/while/collection/parallel/child/reference
+                      六帧入口延长+限定，NewExecutionRuntimeContext 随 FrameKind 同途
+                      继承）；resume 收尾腿无 start 可配对维持无 span 回退。worker 侧
+                      beginNode/endNode 配 span：timeline 事件带 span 身份
+                      （frame_path 渲染列表），node_timings 加 occurrences 逐轮明细
+                      （cap 200 截断可观测，聚合语义不变）
   pkg/llm/          LLM provider 链（OpenAI/Anthropic 兼容）
   docs/WORKER_PROTOCOL.md  worker 协议权威文档（田野调查 + §9.4 M6 键名/语义，实现与影子对账的验收基准）
 规划中：

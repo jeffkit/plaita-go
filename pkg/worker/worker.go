@@ -203,7 +203,7 @@ func (w *Worker) registerEngineListeners() {
 		if run == nil || run.owner != w {
 			return
 		}
-		ev := run.beginNode(string(node.GetID()), string(node.GetType()), node.GetName())
+		ev := run.beginNode(string(node.GetID()), string(node.GetType()), node.GetName(), workflow.SpanFromContext(ctx))
 		w.publishExecutionEvent(ctx, run.executionID, ev)
 	})
 	workflow.OnNodeEnd(func(ctx context.Context, flow *workflow.Workflow, node workflow.Node,
@@ -212,7 +212,7 @@ func (w *Worker) registerEngineListeners() {
 		if run == nil || run.owner != w {
 			return
 		}
-		ev := run.endNode(string(node.GetID()), string(node.GetType()), node.GetName(), err != nil)
+		ev := run.endNode(string(node.GetID()), string(node.GetType()), node.GetName(), err != nil, workflow.SpanFromContext(ctx))
 		w.publishExecutionEvent(ctx, run.executionID, ev)
 	})
 	workflow.OnFlowStart(func(ctx context.Context, flow *workflow.Workflow) {

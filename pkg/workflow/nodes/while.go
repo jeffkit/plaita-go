@@ -101,7 +101,7 @@ func (w *While) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
 		if !matched {
 			break
 		}
-		result, err = runCollectionChild(ctx, w.ChildFlow, map[string]any{"item": result, "index": index})
+		result, err = runCollectionChild(ctx, w.ChildFlow, map[string]any{"item": result, "index": index}, string(w.GetID()), index)
 		if err != nil {
 			return nil, err
 		}

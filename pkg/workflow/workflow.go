@@ -499,6 +499,10 @@ func (f *Workflow) SetGlobalVariable(key string, value any) {
 }
 
 func (f *Workflow) executeNode(ctx context.Context, node Node) (result *ExecuteResult, err error) {
+	// span 模型（plaita#344 对应物）：节点执行实例身份——retry 循环前生成
+	// （一次实例一个 span，重试共享），盖章进 ctx 供监听器读
+	// （SpanFromContext；resume 收尾腿无 start 可配对，维持无 span 回退）。
+	ctx = WithSpan(ctx, BuildNodeSpan(ctx, node))
 	if nodeTimeout := node.GetTimeout(); !nodeTimeout.IsZero() {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, nodeTimeout.TimeDuration())

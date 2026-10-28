@@ -111,6 +111,13 @@ type Context struct {
 	// collection iteration/parallel branch); a root execution keeps the zero
 	// value FrameKindRoot. Runtime bookkeeping, never serialized.
 	FrameKind FrameKind `json:"-"`
+	// FramePath / FrameKey carry the span-model frame state (plaita#344):
+	// the frame node-id chain root→leaf and the in-frame qualifier
+	// (loop-family iteration index / parallel branch name; nil at the root
+	// and for child/reference frames). Seeded alongside FrameKind by the
+	// same entrypoints. Runtime bookkeeping, never serialized.
+	FramePath []string `json:"-"`
+	FrameKey  any      `json:"-"`
 }
 
 func newContext() *Context {
@@ -575,6 +582,11 @@ func NewExecutionRuntimeContext(ctx context.Context) *Context {
 	// branch) annotate the seed context, and the fresh execution context built
 	// here IS that frame — the scope gate and the conversion points read it.
 	fresh.FrameKind = parent.FrameKind
+	// The span-model frame state travels the same way (plaita#344): the
+	// entrypoint already extended the path and set the iteration key — the
+	// fresh execution context is that frame, so its nodes' spans carry them.
+	fresh.FramePath = append([]string(nil), parent.FramePath...)
+	fresh.FrameKey = parent.FrameKey
 	if parent.ParentWorkflowContext != nil {
 		fresh.ParentWorkflowContext = parent.ParentWorkflowContext
 	}
@@ -638,6 +650,11 @@ func CloneContext(ctx context.Context) context.Context {
 	// it to FrameKindParallelBranch; map's concurrent path relies on the copy
 	// before its iteration seed replaces the context).
 	newRuntimeCtx.FrameKind = runtimeCtx.FrameKind
+	// The frame state travels with the clone: a parallel branch (the only
+	// CloneContext consumer) is a frame — its entrypoint overrides the key
+	// and extends the path with the branch node's id.
+	newRuntimeCtx.FramePath = append([]string(nil), runtimeCtx.FramePath...)
+	newRuntimeCtx.FrameKey = runtimeCtx.FrameKey
 	runtimeCtx.mu.RUnlock()
 	newRuntimeCtx.ParentWorkflowContext = ctx
 	return WithWorkflowRuntimeContext(ctx, newRuntimeCtx)

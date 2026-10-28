@@ -60,6 +60,8 @@ func (c *Child) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
 		ParentWorkflowContext: ctx,
 		// 嵌套挂起 v1：子执行帧标注（作用域闸的链行走依据之一）。
 		FrameKind: runtime.FrameKindChildCall,
+		// span 模型：帧路径延长（child 帧无迭代限定符，plaita#344）。
+		FramePath: workflow.ExtendFramePath(ctx, string(c.GetID())),
 	})
 	childFlowResult, err := c.ChildFlow.Execute(childCtx, input)
 	if err != nil {

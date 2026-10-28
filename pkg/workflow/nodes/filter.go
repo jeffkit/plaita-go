@@ -67,7 +67,7 @@ func (f *Filter) Execute(ctx context.Context) (*workflow.ExecuteResult, error) {
 		if err := checkCollectionItem(f.Collection, f.ItemType, "filter", item); err != nil {
 			return nil, err
 		}
-		res, execErr := runCollectionChild(ctx, f.ChildFlow, map[string]any{"item": item, "index": index})
+		res, execErr := runCollectionChild(ctx, f.ChildFlow, map[string]any{"item": item, "index": index}, string(f.GetID()), index)
 		if execErr != nil {
 			return nil, execErr
 		}
