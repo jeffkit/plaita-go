@@ -371,7 +371,7 @@ func (r *executionRun) beginNode(nodeID, nodeType, name string, span *workflow.N
 
 // endNode records a node end (§5.1 node_timings field set). The span (nil on
 // the resume leg) closes its occurrence — per-round/concurrent duration
-//明细 — and stamps the timeline event.
+// 明细 — and stamps the timeline event.
 func (r *executionRun) endNode(nodeID, nodeType, name string, failed bool, span *workflow.NodeSpan) map[string]any {
 	if r == nil {
 		return nil

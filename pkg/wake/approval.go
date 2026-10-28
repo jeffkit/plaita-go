@@ -125,13 +125,13 @@ func (s *ApprovalSource) handleIntake(ctx context.Context, raw string, task map[
 	}
 	approvers, _ := approverCfg["approvers"].([]any)
 	record := map[string]any{
-		"approval_id":       id,
-		"task_config":       task,
-		"created_time":      time.Now().UnixMilli(),
-		"status":            "pending",
-		"approvals":         []any{},
+		"approval_id":        id,
+		"task_config":        task,
+		"created_time":       time.Now().UnixMilli(),
+		"status":             "pending",
+		"approvals":          []any{},
 		"required_approvers": approvers,
-		"strategy":          strategy,
+		"strategy":           strategy,
 	}
 	blob, err := json.Marshal(record)
 	if err != nil {

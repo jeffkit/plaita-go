@@ -41,11 +41,11 @@ import (
 //
 // Request handling mirrors Python handle_callback_request exactly:
 //
-//	1) read the record (no delete) → 2) verify credentials (auth_config from
-//	the registration) → 3) atomic two-phase claim (Lua GET + SET NX PX) →
-//	4) publish the resume event → 5) confirmed ⇒ DEL record + claim;
-//	publish failure ⇒ DEL claim only (the record stays claimable, external
-//	retries are NOT answered as unregistered — plaita#188/#35 family).
+//  1. read the record (no delete) → 2) verify credentials (auth_config from
+//     the registration) → 3) atomic two-phase claim (Lua GET + SET NX PX) →
+//  4. publish the resume event → 5) confirmed ⇒ DEL record + claim;
+//     publish failure ⇒ DEL claim only (the record stays claimable, external
+//     retries are NOT answered as unregistered — plaita#188/#35 family).
 //
 // Q5: unauthenticated callers get ONE response body for "unknown path",
 // "claim race loser" and "bad credentials" (`回调路径未注册`) — three
@@ -80,16 +80,16 @@ return v
 func NewHttpCallbackSource(cfg *Config, rdb *redis.Client) (*HttpCallbackSource, error) {
 	core := newListSource(SourceHTTPCallback, cfg, rdb)
 	s := &HttpCallbackSource{
-		listSource:    core,
-		cfg:           cfg,
-		pub:           worker.NewEventPublisher(rdb, &worker.Config{KeyPrefix: cfg.KeyPrefix, DefaultTenantID: cfg.DefaultTenantID, EventTTLSeconds: cfg.EventTTLSeconds}),
-		recordPrefix:  cfg.KeyPrefix + ":http_callback:registered:",
-		claimPrefix:   cfg.KeyPrefix + ":http_callback:claim:",
-		recordTTL:     7 * 24 * time.Hour,
-		claimTTL:      30 * time.Second,
-		sigTolerance:  300 * time.Second,
-		failureBody:   map[string]any{"status": "error", "message": "回调路径未注册"},
-		addr:          callbackAddr(),
+		listSource:   core,
+		cfg:          cfg,
+		pub:          worker.NewEventPublisher(rdb, &worker.Config{KeyPrefix: cfg.KeyPrefix, DefaultTenantID: cfg.DefaultTenantID, EventTTLSeconds: cfg.EventTTLSeconds}),
+		recordPrefix: cfg.KeyPrefix + ":http_callback:registered:",
+		claimPrefix:  cfg.KeyPrefix + ":http_callback:claim:",
+		recordTTL:    7 * 24 * time.Hour,
+		claimTTL:     30 * time.Second,
+		sigTolerance: 300 * time.Second,
+		failureBody:  map[string]any{"status": "error", "message": "回调路径未注册"},
+		addr:         callbackAddr(),
 	}
 	s.publishFn = s.pub.Publish
 	core.validate = func(task map[string]any) bool {

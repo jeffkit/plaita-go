@@ -53,11 +53,11 @@ func (s *NodeSpan) ToDict() map[string]any {
 		framePath = append(framePath, id)
 	}
 	return map[string]any{
-		"span_id":         s.SpanID,
-		"parent_span_id":  s.ParentSpanID,
-		"frame_path":      framePath,
-		"iteration":       s.Iteration,
-		"node_id":         s.NodeID,
+		"span_id":        s.SpanID,
+		"parent_span_id": s.ParentSpanID,
+		"frame_path":     framePath,
+		"iteration":      s.Iteration,
+		"node_id":        s.NodeID,
 	}
 }
 

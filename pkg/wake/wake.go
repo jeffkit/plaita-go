@@ -32,8 +32,8 @@ import (
 // Wake source identities (registry key segments = {prefix}:{source}:queue
 // subtypes the worker dispatches to).
 const (
-	SourceDelay      = "delay"
-	SourceApproval   = "approval"
+	SourceDelay        = "delay"
+	SourceApproval     = "approval"
 	SourceRedisQueue   = "redis_queue"
 	SourceHTTPCallback = "http_callback"
 )

@@ -382,8 +382,8 @@ func (s *DelayService) publishDeadLetterEvent(member string, attempts int) {
 		tenant = s.cfg.DefaultTenantID
 	}
 	ev := &worker.Event{
-		EventID:       uuid.NewString(),
-		EventType:     "service_error",
+		EventID:   uuid.NewString(),
+		EventType: "service_error",
 		Data: map[string]any{
 			"node_id":       task["node_id"],
 			"execution_id":  task["execution_id"],
