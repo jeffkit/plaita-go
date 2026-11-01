@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/Masterminds/semver/v3 v3.5.0
-	github.com/agiledragon/gomonkey/v2 v2.14.3
+	github.com/agiledragon/gomonkey/v2 v2.14.4
 	github.com/alicebob/miniredis/v2 v2.40.0
 	github.com/dop251/goja v0.0.0-20241009100908-5f46f2705ca3
 	github.com/fatih/structs v1.1.0
